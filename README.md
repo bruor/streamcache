@@ -1,5 +1,5 @@
 # **Disclaimer**
-This solution was created using copilot via prompt engineering and bug fixing.  It leverages nginx and lua via a docker container, its goal is to allow a player to request a stream which transparently kicks off a background process to download the resulting file into configurable cache on disk.  Open to refinements from the community!
+This solution was created using copilot via prompt engineering and bug fixing.  It leverages nginx and lua via a docker container, its goal is to allow a player to request a stream which transparently kicks off a background process to download the resulting file into configurable cache on disk.  Open to enhancements from the community!
 Cache maintenance functionality is untested, I haven't yet tested whether or not the worker threads properly manage the cache size yet. 
 
 ## **Functional Overview**
