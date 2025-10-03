@@ -30,7 +30,7 @@ RUN apk add --no-cache perl curl ca-certificates && update-ca-certificates
 RUN /usr/local/openresty/bin/opm get ledgetech/lua-resty-http
 ```
 
-###**docker-compose.yml**
+### **docker-compose.yml**
 ```
 # ~/streamcache/docker-compose.yml
 services:
@@ -56,7 +56,7 @@ services:
     command: ["/usr/local/openresty/bin/openresty", "-g", "daemon off;"]
 ```
 
-###**conf/nginx.conf**
+### **conf/nginx.conf**
 ```
 # ~/streamcache/conf/nginx.conf
 
@@ -228,7 +228,7 @@ http {
 }
 ```
 
-###**conf/streamcache.conf**
+### **conf/streamcache.conf**
 ```
 server {
     listen 8080;
@@ -617,7 +617,7 @@ server {
 }
 ```
 
-##**Build the docker and start it **
+## **Build the docker and start it **
 ```
 docker compose build --no-cache
 docker compose up -d 
