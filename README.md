@@ -1,8 +1,8 @@
-#**Disclaimer**
+# **Disclaimer**
 This solution was created using copilot via prompt engineering and bug fixing.  It leverages nginx and lua via a docker container, its goal is to allow a player to request a stream source which kicks off a background process to download the resulting file into configurable cache on disk.  Open to refinements from the community!
 Cache maintenance functionality is untested, I haven't yet tested whether or not the worker threads properly manage the cache size yet. 
 
-##**Functional Overview**
+## **Functional Overview**
 Map whatever port number you want into the container, it will listen for incoming requests in the following format: 
 ```
 http://<hostname_or_ip>:<port>/u/<base64_encoded_url>
@@ -14,11 +14,11 @@ The back-end process follows redirects to the content.  If an HTTP error occurs,
 Every CACHE_JANITOR_INTERVAL, the system will check the size of the cache, if it is above CACHE_MAX_BYTES it will evict files that have the oldest last-accessed timestamps until the cache size drops below CACHE_LOW_WATERMARK_BYTES.
 
 
-#**Deployment and Config**
+# **Deployment and Config**
 
-##**Docker folder setup**
+## **Docker folder setup**
 
-###**Dockerfile**
+### **Dockerfile**
 ```
 # ~/streamcache/Dockerfile
 FROM openresty/openresty:alpine
