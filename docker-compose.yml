@@ -18,6 +18,7 @@ services:
       ALLOWED_HOSTS: ""
       DISABLE_SSL_VERIFY: "0"
       LOG_VERBOSE: "1"                       # <-- set to "0" to reduce log noise
+      RESOLVE_TTL: "600"                #defaults to 60 sec if not defined, how long proxy will wait before re-resolving CDN location      
     volumes:
       - ./conf/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
       - ./conf/streamcache.conf:/etc/openresty/conf.d/streamcache.conf:ro
