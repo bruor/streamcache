@@ -13,6 +13,11 @@ The back-end process follows redirects to the content.  If an HTTP error occurs,
 
 Every CACHE_JANITOR_INTERVAL, the system will check the size of the cache, if it is above CACHE_MAX_BYTES it will evict files that have the oldest last-accessed timestamps until the cache size drops below CACHE_LOW_WATERMARK_BYTES.
 
+To control how tee behavior works, use these environment variables in your docker-compose.yml
+RANGE_TEE_THRESHOLD: "1048576"   # 1 MiB near-start window, if an initial request is within this window, start a full download and service client request from in-flight cache
+PROGRESS_FLUSH_BYTES: "262144"   # writer flush/report cadence, when this much data is received from the upstream server, flush it to the file on disk
+FOLLOWER_WAIT_MAX: "60"          # seconds the follower will wait for bytes, maximum time that the proxy will wait for a range request to be fulfilled before it is abandoned.
+FOLLOWER_POLL_MS: "50"           # follower poll interval (ms), how often follower thread polls the disk cache for new data to respond to range requests. 
 
 # **Deployment and Config**
 
