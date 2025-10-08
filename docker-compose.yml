@@ -1,0 +1,22 @@
+# ~/streamcache/docker-compose.yml
+services:
+  streamcache:
+    build: .
+    image: streamcache:latest
+    container_name: streamcache
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    environment:
+      CACHE_MAX_BYTES: "536870912000"        # 500 GB
+      CACHE_LOW_WATERMARK_BYTES: "483183820800"  # 450 GB
+      CACHE_JANITOR_INTERVAL: "300" #5mins
+      ALLOWED_HOSTS: ""
+      DISABLE_SSL_VERIFY: "0"
+      LOG_VERBOSE: "1"                       # <-- set to "0" to reduce log noise
+    volumes:
+      - ./conf/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./conf/streamcache.conf:/etc/openresty/conf.d/streamcache.conf:ro
+      #- ./cache:/var/cache/streamcache
+      - /mnt/data/streamcache:/var/cache/streamcache
+    command: ["/usr/local/openresty/bin/openresty", "-g", "daemon off;"]
