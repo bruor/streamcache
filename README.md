@@ -17,11 +17,12 @@ Every CACHE_JANITOR_INTERVAL, the system will check the size of the cache, if it
 # **Deployment and Config**
 
 ## **Docker folder setup**
-
-### **Dockerfile**
-### **docker-compose.yml**
-### **conf/nginx.conf**
-### **conf/streamcache.conf**
+```Docker/
+├── Dockerfile
+├── docker-compose.yml
+└── conf/
+    ├── nginx.conf
+```
 
 
 ## **Build the docker and start it **
