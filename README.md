@@ -22,6 +22,7 @@ Every CACHE_JANITOR_INTERVAL, the system will check the size of the cache, if it
 ├── docker-compose.yml
 └── conf/
     ├── nginx.conf
+    ├── streamcache.conf
 ```
 
 
