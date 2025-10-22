@@ -27,6 +27,7 @@ FOLLOWER_POLL_MS: "50"           # follower poll interval (ms), how often follow
 └── conf/
     ├── nginx.conf
     ├── streamcache.conf
+    ├── streamcache.lua
 ```
 
 
