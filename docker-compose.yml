@@ -10,7 +10,7 @@ services:
     environment:
       CACHE_MAX_BYTES: "536870912000"        # 500 GB
       CACHE_LOW_WATERMARK_BYTES: "531801402880"  # 495 GB
-      RANGE_TEE_THRESHOLD: "5242880"   # 5 MiB near-start window (VLC jumps to like 4MB by default)
+      RANGE_TEE_THRESHOLD: "20971520"   # 20 MiB near-start window (VLC jumps to like 4MB by default)
       PROGRESS_FLUSH_BYTES: "262144"   # writer flush/report cadence
       FOLLOWER_WAIT_MAX: "60"          # seconds the follower will wait for bytes
       FOLLOWER_POLL_MS: "50"           # follower poll interval (ms)
