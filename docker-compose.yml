@@ -22,6 +22,10 @@ services:
       LOG_VERBOSE: "1"                           # <-- set to "0" to reduce log noise
       RESOLVE_TTL: "600"                         # defaults to 60 sec if not defined, how long proxy will wait before re-resolving CDN location
       TOTALS_TTL_SECS: "14400"                   # default 4h download total TTL
+    #deploy:
+    #  resources:
+    #    limits:
+    #      memory: 12g                            # limit container ram consumption, beware, this includes container file page cache, in-progress downloads count against RAM
     volumes:
       - ./conf/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
       - ./conf/streamcache.conf:/etc/openresty/conf.d/streamcache.conf:ro
