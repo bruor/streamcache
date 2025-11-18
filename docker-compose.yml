@@ -8,17 +8,24 @@ services:
       - "8080:8080"
     restart: unless-stopped
     environment:
-      CACHE_MAX_BYTES: "536870912000"        # 500 GB
+      CACHE_MAX_BYTES: "536870912000"            # 500 GB
       CACHE_LOW_WATERMARK_BYTES: "531801402880"  # 495 GB
-      RANGE_TEE_THRESHOLD: "20971520"   # 20 MiB near-start window (VLC jumps to like 4MB by default)
-      PROGRESS_FLUSH_BYTES: "262144"   # writer flush/report cadence
-      FOLLOWER_WAIT_MAX: "60"          # seconds the follower will wait for bytes
-      FOLLOWER_POLL_MS: "50"           # follower poll interval (ms)
+      RANGE_TEE_THRESHOLD: "41943040"            # 40 MiB near-start window (VLC jumps to like 4MB by default)
+      PROGRESS_FLUSH_BYTES: "5242880"            # 5 MiB writer flush/report cadence
+      CLIENT_FLUSH_BYTES: "5242880"              # 5 MiB client buffer flush cadence
+      FOLLOWER_START_WAIT_MS: "1500"             # 1.5 sec backoff if cache file doesn't exist when first attempting to service client (copilot recommends 500-1500)
+      FOLLOWER_WAIT_MAX: "60"                    # seconds the follower will wait for bytes
+      FOLLOWER_POLL_MS: "50"                     # follower poll interval (ms)
       CACHE_JANITOR_INTERVAL: "300"
       ALLOWED_HOSTS: ""
       DISABLE_SSL_VERIFY: "0"
-      LOG_VERBOSE: "1"                       # <-- set to "0" to reduce log noise
-      RESOLVE_TTL: "600"                #defaults to 60 sec if not defined, how long proxy will wait before re-resolving CDN location
+      LOG_VERBOSE: "1"                           # <-- set to "0" to reduce log noise
+      RESOLVE_TTL: "600"                         # defaults to 60 sec if not defined, how long proxy will wait before re-resolving CDN location
+      TOTALS_TTL_SECS: "14400"                   # default 4h download total TTL
+    #deploy:
+    #  resources:
+    #    limits:
+    #      memory: 12g                            # limit container ram consumption, beware, this includes container file page cache, in-progress downloads count against RAM
     volumes:
       - ./conf/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
       - ./conf/streamcache.conf:/etc/openresty/conf.d/streamcache.conf:ro
