@@ -17,6 +17,7 @@ services:
       FOLLOWER_MIN_BYTES: "262144"               # 256kb
       FOLLOWER_WAIT_MAX: "60"                    # seconds the follower will wait for bytes
       FOLLOWER_POLL_MS: "50"                     # follower poll interval (ms)
+      SUFFIX_EXT_ENABLED: "1"                    # enable file extension data
       CACHE_JANITOR_INTERVAL: "300"
       ALLOWED_HOSTS: ""
       DISABLE_SSL_VERIFY: "0"
