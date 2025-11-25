@@ -14,6 +14,7 @@ services:
       PROGRESS_FLUSH_BYTES: "5242880"            # 5 MiB writer flush/report cadence
       CLIENT_FLUSH_BYTES: "5242880"              # 5 MiB client buffer flush cadence
       FOLLOWER_START_WAIT_MS: "1500"             # 1.5 sec backoff if cache file doesn't exist when first attempting to service client (copilot recommends 500-1500)
+      FOLLOWER_MIN_BYTES: "262144"               # 256kb
       FOLLOWER_WAIT_MAX: "60"                    # seconds the follower will wait for bytes
       FOLLOWER_POLL_MS: "50"                     # follower poll interval (ms)
       CACHE_JANITOR_INTERVAL: "300"
