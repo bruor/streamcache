@@ -16,6 +16,26 @@ local function set_var_safe(name, value)
 end
 
 -- ===================== Config (via env) =====================
+local SUFFIX_EXT_ENABLED = (os.getenv("SUFFIX_EXT_ENABLED") == "1")
+-- Extension helpers
+local function ext_from_url(u)
+  if not u then return nil end
+  local path = u:match("^https?://[^/]+(/[^?]*)") or "/"
+  local last = path:match("/([^/?#]+)$") or ""
+  local ext = last:match("%.([A-Za-z0-9]+)$")
+  return ext and ext:lower() or nil
+end
+local function known_ext_for_key(key)
+  local p = io.popen("ls -1 /var/cache/streamcache/files/" .. key .. ".* 2>/dev/null")
+  if p then
+    for name in p:lines() do
+      local ext = name:match("^.*/" .. key .. "%.([A-Za-z0-9]+)$")
+      if ext then p:close(); return ext end
+    end
+    p:close()
+  end
+  return nil
+end
 local VERBOSE               = (os.getenv("LOG_VERBOSE") == "1")
 local RANGE_TEE_THRESHOLD   = tonumber(os.getenv("RANGE_TEE_THRESHOLD")   or "") or (5 * 1024 * 1024) -- 5 MiB
 local PROGRESS_FLUSH_BYTES  = tonumber(os.getenv("PROGRESS_FLUSH_BYTES")  or "") or 262144            -- 256 KiB
@@ -457,7 +477,10 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
 
   -- Open temp file & tee (with no-cache fallback)
   os.execute("mkdir -p /var/cache/streamcache/tmp")
-  local tmp = "/var/cache/streamcache/tmp/" .. key .. ".part"
+  local ext_final = SUFFIX_EXT_ENABLED and ext_from_url(final_url) or nil
+local phys_key_w = (ext_final and (key .. "." .. ext_final)) or key
+local tmp = "/var/cache/streamcache/tmp/" .. phys_key_w .. ".part"
+local dest_path = files_dir .. "/" .. phys_key_w
   os.remove(tmp) -- best-effort cleanup from prior crashes
   local f = io.open(tmp, "wb")
   if not f then
@@ -666,7 +689,10 @@ local function tee_stream_range_window(final_url, dest_path, key, client_start, 
 
   -- Open temp & stream windowed slice while caching full body (with no-cache fallback)
   os.execute("mkdir -p /var/cache/streamcache/tmp")
-  local tmp = "/var/cache/streamcache/tmp/" .. key .. ".part"
+  local ext_final = SUFFIX_EXT_ENABLED and ext_from_url(final_url) or nil
+local phys_key_w = (ext_final and (key .. "." .. ext_final)) or key
+local tmp = "/var/cache/streamcache/tmp/" .. phys_key_w .. ".part"
+local dest_path = files_dir .. "/" .. phys_key_w
   os.remove(tmp)
   local f = io.open(tmp, "wb")
   if not f then
@@ -803,11 +829,16 @@ end
 -- ===================== Follower (serve from .part) =====================
 local function serve_from_part(final_url, key, req_start, req_end)
   local files_dir = "/var/cache/streamcache/files"
-  local tmp = "/var/cache/streamcache/tmp/" .. key .. ".part"
-  if file_exists(files_dir .. "/" .. key) then
+  local ext_final = SUFFIX_EXT_ENABLED and ext_from_url(final_url) or nil
+local phys_key_w = (ext_final and (key .. "." .. ext_final)) or key
+local tmp = "/var/cache/streamcache/tmp/" .. phys_key_w .. ".part"
+local dest_path = files_dir .. "/" .. phys_key_w
+  local ext_known = SUFFIX_EXT_ENABLED and known_ext_for_key(key) or nil
+local phys_key = (ext_known and (key .. "." .. ext_known)) or key
+if file_exists(files_dir .. "/" .. phys_key) then
     ngx.header["X-Cache"] = "HIT"
     set_var_safe("sc_decision", "HIT")
-    return ngx.exec("/cache/" .. key)
+    return ngx.exec("/cache/" .. phys_key)
   end
   local f = io.open(tmp, "rb")
   if not f then return nil, "no_part" end
@@ -926,6 +957,14 @@ local function update_last_access()
 end
 
 -- HIT (with zero-byte guard)
+local ext_known = SUFFIX_EXT_ENABLED and known_ext_for_key(key) or nil
+local phys_key = (ext_known and (key .. "." .. ext_known)) or key
+local final_path = files_dir .. "/" .. phys_key
+local uri = ngx.var.uri or ""
+local client_has_ext = uri:match("^/u/[-_A-Za-z0-9=]+%.[A-Za-z0-9._-]+$") ~= nil
+if SUFFIX_EXT_ENABLED and (not client_has_ext) and ext_known then
+  return ngx.redirect("/u/" .. ngx.var.b64 .. "." .. ext_known, ngx.HTTP_MOVED_TEMPORARILY)
+end
 if file_exists(final_path) then
   local sz = file_size(final_path)
   if sz <= 0 then
@@ -935,7 +974,7 @@ if file_exists(final_path) then
     if VERBOSE then ngx.log(ngx.INFO,"[streamcache] HIT key=", key, " size=", b2human(sz)) end
     ngx.var.sc_decision = "HIT"
     update_last_access()
-    return ngx.exec("/cache/" .. key)
+    return ngx.exec("/cache/" .. phys_key)
   end
 end
 
