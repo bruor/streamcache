@@ -23,6 +23,7 @@ local FOLLOWER_WAIT_MAX     = tonumber(os.getenv("FOLLOWER_WAIT_MAX")     or "")
 local FOLLOWER_POLL_MS      = tonumber(os.getenv("FOLLOWER_POLL_MS")      or "") or 50               -- ms
 -- New: short startup wait for followers so we don't open a duplicate upstream
 local FOLLOWER_START_WAIT_MS= tonumber(os.getenv("FOLLOWER_START_WAIT_MS")or "") or 750              -- ms
+local FOLLOWER_MIN_BYTES       = tonumber(os.getenv("FOLLOWER_MIN_BYTES") or "") or 65536 -- 64 KiB default
 -- New: batch client flushes to reduce syscall and allocator pressure
 local CLIENT_FLUSH_BYTES    = tonumber(os.getenv("CLIENT_FLUSH_BYTES")    or "") or (1 * 1024 * 1024) -- 1 MiB
 -- New: how long to retain the known TOTAL size (refresh while downloading)
@@ -836,6 +837,11 @@ local function serve_from_part(final_url, key, req_start, req_end)
   ngx.send_headers()
 
   local deadline = ngx.now() + FOLLOWER_WAIT_MAX
+    -- New logic: wait until at least FOLLOWER_MIN_BYTES are available or timeout
+    local waited_bytes = 0
+    while (progress:get(key) or 0) < FOLLOWER_MIN_BYTES and ngx.now() < deadline do
+        ngx.sleep(FOLLOWER_POLL_MS / 1000)
+    end
   local sent, needed, current_offset = 0, (stop - start + 1), start
   f:seek("set", start)
   local function available_bytes()
