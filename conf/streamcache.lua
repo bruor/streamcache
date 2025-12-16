@@ -529,8 +529,6 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
       local chunk, cerr = res.body_reader(32768)
       if cerr then ngx.log(ngx.WARN,"[streamcache] tee read error: ",tostring(cerr)); f:close(); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, tmp, send_to_client) end
       if not chunk then break end
-
-      if not chunk then break end
       total = total + #chunk
       local okw, errw = f:write(chunk)
       if not okw then ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID); f:close(); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, tmp, send_to_client) end
