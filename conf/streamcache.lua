@@ -516,7 +516,7 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
   local f = io.open(tmp, "wb")
   if not f then
     ngx.log(ngx.ERR,"[streamcache] tee cannot open temp: ", tmp, " ; falling back")
-    httpc:close(); inflight:delete(key); return
+    return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client)
   end
 
   local total = 0
