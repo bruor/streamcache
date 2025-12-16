@@ -127,6 +127,24 @@ local function build_client_like_headers(host_header, orig_url)
   return h
 end
 
+-- Probe expected total size using HEAD (preferred) or 0-0 GET fallback.
+-- Returns: total_size (number or nil), accept_ranges (boolean)
+local function probe_total_with_head(final_url, hdrs)
+  -- Reuse existing helper that already tries HEAD then GET bytes=0-0
+  local oh = fetch_origin_headers(final_url, hdrs or {})
+  local total, accept_ranges = nil, false
+  if oh["content-range"] then
+    local s0, e0, t0 = oh["content-range"]:match("^bytes%s+(%d+)%-(%d+)/(%d+)$")
+    if t0 then total = tonumber(t0) end
+  elseif oh["content-length"] then
+    total = tonumber(oh["content-length"])
+  end
+  if oh["accept-ranges"] == "bytes" then
+    accept_ranges = true
+  end
+  return total, accept_ranges
+end
+
 -- Fetch a few headers (for follower friendliness)
 local function fetch_origin_headers(final_url, hdrs)
   local scheme, host, port, path, host_header = parse_url(final_url)
@@ -404,6 +422,16 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
       headers["Range"] = nil
       res:read_body()
       httpc:close()
+      -- NEW: Probe expected size via HEAD/0-0 just before retrying GET
+      local probe_hdrs = build_client_like_headers(host_header, orig_url_for_ref)
+      local expected_head, ranges_ok = probe_total_with_head(final_url, probe_hdrs)
+      if expected_head and expected_head > 0 then
+        totals:set(key, expected_head, TOTALS_TTL_SECS)
+        if VERBOSE then ngx.log(ngx.INFO, "[streamcache] fallback expected=", tostring(expected_head), " (", b2human(expected_head), ") ranges=", tostring(ranges_ok)) end
+      else
+        totals:delete(key)
+        if VERBOSE then ngx.log(ngx.INFO, "[streamcache] fallback could not determine expected size; will stream but not commit") end
+      end
       if not connect_to(host, port, scheme) then httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
       res, rerr = httpc:request{ method = "GET", path = path, headers = headers }
     end
@@ -610,6 +638,16 @@ local function tee_stream_range_window(final_url, dest_path, key, client_start, 
       headers["Range"] = nil
       res:read_body()
       httpc:close()
+      -- NEW: Probe expected size via HEAD/0-0 before fallback GET
+      local probe_hdrs = build_client_like_headers(host_header, orig_url_for_ref)
+      local expected_head, ranges_ok = probe_total_with_head(final_url, probe_hdrs)
+      if expected_head and expected_head > 0 then
+        totals:set(key, expected_head, TOTALS_TTL_SECS)
+        if VERBOSE then ngx.log(ngx.INFO, "[streamcache] window fallback expected=", tostring(expected_head), " (", b2human(expected_head), ") ranges=", tostring(ranges_ok)) end
+      else
+        totals:delete(key)
+        if VERBOSE then ngx.log(ngx.INFO, "[streamcache] window fallback could not determine expected size; will stream but not commit") end
+      end
       if not connect_to(host, port, scheme) then httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
       res, rerr = httpc:request{ method = "GET", path = path, headers = headers }
     end
