@@ -181,6 +181,30 @@ local function refresh_totals(key, size)
   totals:set(key, size, TOTALS_TTL_SECS) -- set() refreshes TTL
 end
 
+
+-- ===================== Timer-safe cleanup & exit helpers =====================
+-- Clean up resources safely in both request and timer contexts.
+local function cleanup_writer(httpc, key, tmp)
+  -- close upstream connection
+  pcall(function() if httpc then httpc:close() end end)
+  -- remove temp file if present
+  if tmp and tmp ~= "" then pcall(os.remove, tmp) end
+  -- clear inflight flag
+  if key then inflight:delete(key) end
+end
+
+-- Unified failure handler:
+-- In request context (send_to_client=true) -> ngx.exit(code)
+-- In timer context (send_to_client=false)  -> just return after cleanup
+local function fail_exit(code, httpc, key, tmp, send_to_client)
+  cleanup_writer(httpc, key, tmp)
+  if send_to_client then
+    return ngx.exit(code)
+  else
+    return  -- timer context: no ngx.exit
+  end
+end
+
 -- ===================== No-cache streamer (far-seek passthrough & HEAD) =====================
 local function stream_no_cache(url, normalize_200_when_no_client_range)
   set_var_safe("sc_decision", (ngx.var.sc_decision ~= "" and ngx.var.sc_decision) or "MISS_NO_CACHE")
@@ -361,14 +385,14 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
   set_var_safe("sc_decision", "MISS_TEE")
   final_url = (final_url or ""):gsub("^%s+", ""):gsub("[%s\r\n]+$", "")
   local scheme, host, port, path, host_header = parse_url(final_url)
-  if not scheme then ngx.log(ngx.WARN,"[streamcache] tee parse failed url=",tostring(final_url)); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+  if not scheme then ngx.log(ngx.WARN,"[streamcache] tee parse failed url=",tostring(final_url)); return fail_exit(ngx.HTTP_BAD_GATEWAY, nil, key, nil, send_to_client) end
 
   local httpc = http.new()
   httpc:set_timeouts(5000, 5000, 0)
 
   local function connect_to(h, p, sch)
     local ok, err = httpc:connect(h, p)
-    if not ok then ngx.log(ngx.WARN,"[streamcache] tee connect failed: ",tostring(err)); return nil end
+    if not ok then ngx.log(ngx.WARN,"[streamcache] tee connect failed: ",tostring(err)); return nil end    
     if sch == "https" then
       local ok2, err2 = httpc:ssl_handshake(nil, h, SSL_VERIFY)
       if not ok2 then ngx.log(ngx.WARN,"[streamcache] tee TLS failed: ",tostring(err2)); return nil end
@@ -376,7 +400,7 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
     return true
   end
 
-  if not connect_to(host, port, scheme) then httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+  if not connect_to(host, port, scheme) then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
 
   local headers
   if send_to_client then
@@ -398,17 +422,18 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
   local hops, res, rerr = 0, nil, nil
   while true do
     res, rerr = httpc:request{ method = "GET", path = path, headers = headers }
-    if not res then ngx.log(ngx.WARN,"[streamcache] tee request failed: ",tostring(rerr)); httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+    if not res then ngx.log(ngx.WARN,"[streamcache] tee request failed: ",tostring(rerr)); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
     if (res.status == 301 or res.status == 302 or res.status == 303 or res.status == 307 or res.status == 308) then
-      if hops >= 5 then ngx.log(ngx.WARN,"[streamcache] tee too many redirects"); httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if hops >= 5 then ngx.log(ngx.WARN,"[streamcache] tee too many redirects"); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
       local loc = res.headers and (res.headers["Location"] or res.headers["location"])
       httpc:close()
       local next_url = resolve_location(final_url, scheme, host_header, loc)
-      if not next_url then inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if not next_url then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
       final_url = next_url
       scheme, host, port, path, host_header = parse_url(final_url)
-      if not scheme then inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
-      if not connect_to(host, port, scheme) then httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if not scheme then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
+      if not connect_to(host, port, scheme) then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
+
       headers["Host"] = host_header
       hops = hops + 1
     else
@@ -432,13 +457,14 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
         totals:delete(key)
         if VERBOSE then ngx.log(ngx.INFO, "[streamcache] fallback could not determine expected size; will stream but not commit") end
       end
-      if not connect_to(host, port, scheme) then httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if not connect_to(host, port, scheme) then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
       res, rerr = httpc:request{ method = "GET", path = path, headers = headers }
     end
     if not res or not (res.status == 200 or res.status == 206) then
       ngx.log(ngx.WARN,"[streamcache] tee status not OK: ", res and res.status or tostring(rerr))
-      httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY)
+      return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client)
     end
+
   end
 
   -- Parse totals (size hint)
@@ -501,15 +527,13 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
   if res.body_reader then
     while true do
       local chunk, cerr = res.body_reader(32768)
-      if cerr then ngx.log(ngx.WARN,"[streamcache] tee read error: ",tostring(cerr)); f:close(); os.remove(tmp); httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if cerr then ngx.log(ngx.WARN,"[streamcache] tee read error: ",tostring(cerr)); f:close(); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, tmp, send_to_client) end
+      if not chunk then break end
+
       if not chunk then break end
       total = total + #chunk
       local okw, errw = f:write(chunk)
-      if not okw then
-        ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID)
-        f:close(); os.remove(tmp); httpc:close(); inflight:delete(key)
-        return ngx.exit(ngx.HTTP_BAD_GATEWAY)
-      end
+      if not okw then ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID); f:close(); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, tmp, send_to_client) end
       if (total - last_report) >= PROGRESS_FLUSH_BYTES then
         local okf, errf = pcall(function() return f:flush() end)
         if not okf then ngx.log(ngx.WARN,"[streamcache] flush failed: ", tostring(errf)) end
@@ -529,11 +553,7 @@ local function tee_stream(final_url, dest_path, key, use_range_0, orig_url_for_r
   elseif res.body then
     total = #res.body
     local okw, errw = f:write(res.body)
-    if not okw then
-      ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID)
-      f:close(); os.remove(tmp); httpc:close(); inflight:delete(key)
-      return ngx.exit(ngx.HTTP_BAD_GATEWAY)
-    end
+    if not okw then ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID); f:close(); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, tmp, send_to_client) end
     local okf, errf = pcall(function() return f:flush() end)
     if not okf then ngx.log(ngx.WARN,"[streamcache] flush failed: ", tostring(errf)) end
     progress:set(key, total, 900)
@@ -590,7 +610,7 @@ local function tee_stream_range_window(final_url, dest_path, key, client_start, 
   set_var_safe("sc_decision", "MISS_TEE_WINDOW")
   final_url = (final_url or ""):gsub("^%s+", ""):gsub("[%s\r\n]+$", "")
   local scheme, host, port, path, host_header = parse_url(final_url)
-  if not scheme then ngx.log(ngx.WARN,"[streamcache] tee-window parse failed url=",tostring(final_url)); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+  if not scheme then ngx.log(ngx.WARN,"[streamcache] tee-window parse failed url=",tostring(final_url)); return fail_exit(ngx.HTTP_BAD_GATEWAY, nil, key, nil, send_to_client) end
 
   local httpc = http.new()
   httpc:set_timeouts(5000, 5000, 0)
@@ -605,7 +625,7 @@ local function tee_stream_range_window(final_url, dest_path, key, client_start, 
     return true
   end
 
-  if not connect_to(host, port, scheme) then httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+  if not connect_to(host, port, scheme) then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
 
   local ch = ngx.req.get_headers()
   local headers = build_client_like_headers(host_header, orig_url_for_ref)
@@ -614,17 +634,17 @@ local function tee_stream_range_window(final_url, dest_path, key, client_start, 
   local hops, res, rerr = 0, nil, nil
   while true do
     res, rerr = httpc:request{ method = "GET", path = path, headers = headers }
-    if not res then ngx.log(ngx.WARN,"[streamcache] tee-window request failed: ",tostring(rerr)); httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+    if not res then ngx.log(ngx.WARN,"[streamcache] tee-window request failed: ",tostring(rerr)); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
     if (res.status == 301 or res.status == 302 or res.status == 303 or res.status == 307 or res.status == 308) then
-      if hops >= 5 then ngx.log(ngx.WARN,"[streamcache] tee-window too many redirects"); httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if hops >= 5 then ngx.log(ngx.WARN,"[streamcache] tee-window too many redirects"); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
       local loc = res.headers and (res.headers["Location"] or res.headers["location"])
       httpc:close()
       local next_url = resolve_location(final_url, scheme, host_header, loc)
-      if not next_url then inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if not next_url then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
       final_url = next_url
       scheme, host, port, path, host_header = parse_url(final_url)
-      if not scheme then inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
-      if not connect_to(host, port, scheme) then httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if not scheme then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
+      if not connect_to(host, port, scheme) then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
       headers["Host"] = host_header
       hops = hops + 1
     else
@@ -648,13 +668,14 @@ local function tee_stream_range_window(final_url, dest_path, key, client_start, 
         totals:delete(key)
         if VERBOSE then ngx.log(ngx.INFO, "[streamcache] window fallback could not determine expected size; will stream but not commit") end
       end
-      if not connect_to(host, port, scheme) then httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if not connect_to(host, port, scheme) then return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client) end
       res, rerr = httpc:request{ method = "GET", path = path, headers = headers }
     end
     if not res or not (res.status == 200 or res.status == 206) then
       ngx.log(ngx.WARN,"[streamcache] tee-window status not OK: ", res and res.status or tostring(rerr))
-      httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY)
+      return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, send_to_client)
     end
+
   end
 
   -- Determine total size
@@ -756,15 +777,11 @@ local function tee_stream_range_window(final_url, dest_path, key, client_start, 
   if res.body_reader then
     while true do
       local chunk, cerr = res.body_reader(32768)
-      if cerr then ngx.log(ngx.WARN,"[streamcache] tee-window read error: ",tostring(cerr)); f:close(); os.remove(tmp); httpc:close(); inflight:delete(key); return ngx.exit(ngx.HTTP_BAD_GATEWAY) end
+      if cerr then ngx.log(ngx.WARN,"[streamcache] tee-window read error: ",tostring(cerr)); f:close(); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, tmp, send_to_client) end
       if not chunk then break end
       total_written = total_written + #chunk
       local okw, errw = f:write(chunk)
-      if not okw then
-        ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID)
-        f:close(); os.remove(tmp); httpc:close(); inflight:delete(key)
-        return ngx.exit(ngx.HTTP_BAD_GATEWAY)
-      end
+      if not okw then ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID); f:close(); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, tmp, send_to_client) end
       if (total_written - last_report) >= PROGRESS_FLUSH_BYTES then
         local okf, errf = pcall(function() return f:flush() end)
         if not okf then ngx.log(ngx.WARN,"[streamcache] flush failed: ", tostring(errf)) end
@@ -783,11 +800,7 @@ local function tee_stream_range_window(final_url, dest_path, key, client_start, 
     local chunk = res.body
     total_written = #chunk
     local okw, errw = f:write(chunk)
-    if not okw then
-      ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID)
-      f:close(); os.remove(tmp); httpc:close(); inflight:delete(key)
-      return ngx.exit(ngx.HTTP_BAD_GATEWAY)
-    end
+    if not okw then ngx.log(ngx.ERR,"[streamcache] write failed: ", tostring(errw), " rid=", RID); f:close(); return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, tmp, send_to_client) end
     local okf, errf = pcall(function() return f:flush() end)
     if not okf then ngx.log(ngx.WARN,"[streamcache] flush failed: ", tostring(errf)) end
     progress:set(key, total_written, 900)
