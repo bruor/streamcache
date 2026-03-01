@@ -20,7 +20,7 @@ FOLLOWER_POLL_MS: "50"           # follower poll interval (ms), how often follow
 
 # **Deployment and Config**
 
-## **Docker folder setup**
+## **Docker folder setup **  
 ```Docker/
 ├── Dockerfile
 ├── docker-compose.yml
@@ -28,6 +28,14 @@ FOLLOWER_POLL_MS: "50"           # follower poll interval (ms), how often follow
     ├── nginx.conf
     ├── streamcache.conf
     ├── streamcache.lua
+    └── lib/
+        ├── sc_config.lua
+        ├── sc_file.lua
+        ├── sc_follower.lua
+        ├── sc_nocache.lua
+        ├── sc_tee.lua
+        ├── sc_upstream.lua
+        └── sc_utils.lua
 ```
 
 
