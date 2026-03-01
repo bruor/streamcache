@@ -1,5 +1,5 @@
 # **Disclaimer**
-This solution was created using copilot via prompt engineering and bug fixing.  It leverages nginx and lua via a docker container, its goal is to allow a player to request a stream which transparently kicks off a background process to download the resulting file into configurable cache on disk.  Open to enhancements from the community!
+This solution was aims to allow a player to request a stream which transparently kicks off a background process to download the resulting file into configurable cache on disk.  Open to enhancements from the community!
 
 ## **Functional Overview**
 Map whatever port number you want into the container, it will listen for incoming requests in the following format: 
