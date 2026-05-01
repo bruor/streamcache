@@ -23,6 +23,12 @@ services:
       LOG_VERBOSE: "1"                           # <-- set to "0" to reduce log noise
       RESOLVE_TTL: "600"                         # defaults to 60 sec if not defined, how long proxy will wait before re-resolving CDN location
       TOTALS_TTL_SECS: "14400"                   # default 4h download total TTL
+      CACHE_STALE_CHECK_SECS: "43200"            # 12h — probe origin for size changes on cache HITs older than this
+      CACHE_REVALIDATE_INTERVAL: "12h"           # default: probe origin for size changes on cache HITs older than 12h
+                                                 # Accepts s|m|h|d suffix (e.g., "12h", "30m", "7200s") or bare seconds.      
+      UPSTREAM_READ_TIMEOUT_MS: "30000"          # 30s default for streaming reads
+                                                 # try 15000 if your provider stalls during streaming reads. Aborts truly stalled reads quickly.
+ 
     #deploy:
     #  resources:
     #    limits:

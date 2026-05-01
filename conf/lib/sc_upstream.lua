@@ -98,9 +98,11 @@ end
 
 -- ======================== Low-Level Connection ========================
 
-local function connect_raw(host, port, scheme, ssl_verify)
+local function connect_raw(host, port, scheme, ssl_verify, read_timeout_ms)
   local httpc = http.new()
-  httpc:set_timeouts(5000, 5000, 0) -- 5s connect/send, infinite read (streaming)
+  -- 5s connect/send. Read timeout: configurable for streaming reads.
+  -- 0 = no timeout (legacy behavior).
+  httpc:set_timeouts(5000, 5000, read_timeout_ms or 0)
   local ok, err = httpc:connect(host, port)
   if not ok then return nil, "connect_failed: " .. tostring(err) end
   if scheme == "https" then
@@ -120,11 +122,14 @@ end
 --
 -- The caller MUST close httpc when done (after consuming body).
 -- This eliminates duplicated redirect loops across nocache/tee/head paths.
+--
+-- options.read_timeout_ms: per-request socket read timeout (ms). 0 = no timeout.
 function Upstream.request(url, options)
   options = options or {}
   local method        = options.method or "GET"
   local max_redirects = options.max_redirects or 5
   local ssl_verify    = (options.ssl_verify ~= false)
+  local read_timeout  = options.read_timeout_ms or 0
 
   local current_url = url
   local hops = 0
@@ -134,7 +139,7 @@ function Upstream.request(url, options)
     local scheme, host, port, path, host_header = Upstream.parse_url(current_url)
     if not scheme then return nil, "invalid_url_parse", nil end
 
-    httpc, err = connect_raw(host, port, scheme, ssl_verify)
+    httpc, err = connect_raw(host, port, scheme, ssl_verify, read_timeout)
     if not httpc then return nil, err, nil end
 
     -- Prepare headers: clone to avoid mutation, set Host per-hop
@@ -170,56 +175,159 @@ function Upstream.request(url, options)
   return nil, "too_many_redirects", nil
 end
 
--- ======================== Header Probing ========================
+-- ======================== Probe Origin (with persistent per-host method cache) ========================
 
--- Fetch origin response headers via HEAD (falls back to GET 0-0 if HEAD
--- returns 405). Used by followers to get Content-Type, ETag, etc.
--- Returns a table of lowercased header keys → values.
-function Upstream.fetch_origin_headers(url, hdrs, ssl_verify)
-  local scheme, host, port, path, host_header = Upstream.parse_url(url)
-  if not scheme then return {} end
+-- Parse the metadata fields we care about from a probe response.
+-- Returns a table with: size, content_type, etag, last_modified (any may be nil).
+local function parse_probe_response(res)
+  local meta = {}
+  local hl = {}
+  for k, v in pairs(res.headers or {}) do hl[string.lower(k)] = v end
 
-  local httpc = http.new()
-  httpc:set_timeouts(3000, 3000, 3000)
-  local ok = httpc:connect(host, port)
-  if not ok then return {} end
-  if scheme == "https" then
-    local ok2 = httpc:ssl_handshake(nil, host, ssl_verify ~= false)
-    if not ok2 then httpc:close(); return {} end
+  -- Size: prefer Content-Range total (from 206 to a Range request),
+  -- fall back to Content-Length only when status is 200 (full body).
+  -- For 206 responses without Content-Range, we don't extract size to
+  -- avoid using the partial-byte length as the file size.
+  if hl["content-range"] then
+    local t = hl["content-range"]:match("/(%d+)$")
+    if t then meta.size = tonumber(t) end
+  end
+  if not meta.size and res.status == 200 and hl["content-length"] then
+    meta.size = tonumber(hl["content-length"])
   end
 
-  local headers = Utils.tclone(hdrs or {})
-  headers["Host"] = host_header
-  if not headers["User-Agent"] then
-    headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-  end
-
-  local res = select(1, httpc:request{ method = "HEAD", path = path, headers = headers })
-  if (not res) or res.status == 405 then
-    headers["Range"] = headers["Range"] or "bytes=0-0"
-    res = select(1, httpc:request{ method = "GET", path = path, headers = headers })
-  end
-  if not res then httpc:close(); return {} end
-
-  local out = {}
-  for k, v in pairs(res.headers or {}) do out[string.lower(k)] = v end
-  httpc:close()
-  return out
+  meta.content_type  = hl["content-type"]
+  meta.etag          = hl["etag"]
+  meta.last_modified = hl["last-modified"]
+  return meta
 end
 
--- Probe expected total size using HEAD (preferred) or 0-0 GET fallback.
--- Returns: total_size (number or nil), accept_ranges (boolean)
-function Upstream.probe_total_with_head(url, hdrs, ssl_verify)
-  local oh = Upstream.fetch_origin_headers(url, hdrs, ssl_verify)
-  local total, accept_ranges = nil, false
-  if oh["content-range"] then
-    local t0 = oh["content-range"]:match("/(%d+)$")
-    if t0 then total = tonumber(t0) end
-  elseif oh["content-length"] then
-    total = tonumber(oh["content-length"])
+-- Probe origin for media metadata, using a persistent per-provider-host
+-- method cache stored in `dict` (a lua_shared_dict, typically `probe_methods`).
+--
+-- Algorithm:
+--   1. Look up cached method for the URL's host.
+--   2. If cached as "GET_RANGE", skip HEAD; go straight to GET 0-0.
+--   3. Otherwise (cached as "HEAD" or absent), try HEAD first.
+--      On 2xx → return metadata. Cache "HEAD" if we hadn't seen this
+--      provider before.
+--   4. If HEAD failed (non-2xx, network error, redirect-chain failure),
+--      try GET 0-0. On 2xx → return metadata. Update cache to "GET_RANGE"
+--      (logs PROBE_METHOD_LEARNED if first time, PROBE_METHOD_CHANGED if
+--      transitioning from HEAD→GET_RANGE).
+--   5. If both methods fail end-to-end → log ERROR PROBE_FAILED and return
+--      { ok = false }.
+--
+-- The cache uses exptime=0 (no expiry) so entries persist for container
+-- lifetime. Container restart triggers re-discovery. Adaptive recovery is
+-- automatic: a previously-cached HEAD that stops working will silently
+-- transition to GET_RANGE on the next probe.
+--
+-- dict: optional lua_shared_dict for caching. If nil, no caching is done
+--   (HEAD-then-GET fallback still works, just without persistence).
+function Upstream.probe_origin(url, hdrs, ssl_verify, dict)
+  local scheme, host, port = Upstream.parse_url(url)
+  if not scheme then
+    ngx.log(ngx.ERR, "[streamcache] PROBE_FAILED: invalid_url ", tostring(url))
+    return { ok = false, reason = "invalid_url" }
   end
-  if oh["accept-ranges"] == "bytes" then accept_ranges = true end
-  return total, accept_ranges
+
+  local probe_key = "pm:" .. host .. ":" .. tostring(port)
+  local cached = nil
+  if dict then cached = dict:get(probe_key) end
+
+  -- Helper: issue a probe with a given method/range and return:
+  --   true, meta_table  on 2xx success
+  --   false, nil        on non-2xx, network error, or invalid response
+  -- Always closes httpc before returning (we don't consume the body).
+  local function attempt_probe(method, range_value)
+    local h = {}
+    if hdrs then for k, v in pairs(hdrs) do h[k] = v end end
+    if range_value then h["Range"] = range_value end
+
+    local res, httpc, _ = Upstream.request(url, {
+      method     = method,
+      headers    = h,
+      ssl_verify = ssl_verify,
+      -- Probes are short; the default 0 (no read timeout) suffices.
+      -- Connect/send timeouts in connect_raw still apply (5s each).
+    })
+
+    if not res then return false, nil end
+
+    -- Probes don't consume the response body; close the connection now.
+    pcall(function() if httpc then httpc:close() end end)
+
+    if res.status >= 200 and res.status < 300 then
+      return true, parse_probe_response(res)
+    end
+    return false, nil
+  end
+
+  -- Step 1+3: try HEAD unless we already know provider rejects it.
+  if cached ~= "GET_RANGE" then
+    local ok, meta = attempt_probe("HEAD", nil)
+    if ok then
+      if dict and cached == nil then
+        dict:set(probe_key, "HEAD", 0)  -- exptime=0: persists for container lifetime
+        ngx.log(ngx.INFO, "[streamcache] PROBE_METHOD_LEARNED: ",
+                host, ":", port, " = HEAD")
+      end
+      meta.ok = true
+      return meta
+    end
+    -- HEAD failed end-to-end; fall through to GET 0-0
+  end
+
+  -- Step 4: try GET 0-0 (works for providers that block HEAD).
+  local ok, meta = attempt_probe("GET", "bytes=0-0")
+  if ok then
+    if dict and cached ~= "GET_RANGE" then
+      dict:set(probe_key, "GET_RANGE", 0)
+      if cached == nil then
+        ngx.log(ngx.INFO, "[streamcache] PROBE_METHOD_LEARNED: ",
+                host, ":", port, " = GET_RANGE")
+      else
+        ngx.log(ngx.INFO, "[streamcache] PROBE_METHOD_CHANGED: ",
+                host, ":", port, " HEAD -> GET_RANGE")
+      end
+    end
+    meta.ok = true
+    return meta
+  end
+
+  -- Step 5: both methods failed.
+  ngx.log(ngx.ERR, "[streamcache] PROBE_FAILED: ", host, ":", port,
+          " all methods exhausted")
+  return { ok = false, reason = "probe_failed" }
+end
+
+-- Ensure the probe method for this URL's host is discovered. Used at MISS
+-- time to populate the cache before the first stale check ever fires.
+-- No-op if already cached. Discards the metadata (we just want the side
+-- effect of the dict being populated).
+function Upstream.ensure_method_known(url, hdrs, ssl_verify, dict)
+  if not dict then return end
+  local scheme, host, port = Upstream.parse_url(url)
+  if not scheme then return end
+  local probe_key = "pm:" .. host .. ":" .. tostring(port)
+  if dict:get(probe_key) ~= nil then return end
+  -- Run discovery (probe_origin populates dict as a side effect)
+  Upstream.probe_origin(url, hdrs, ssl_verify, dict)
+end
+
+-- ======================== Header Probing (legacy shim) ========================
+
+-- Probe expected total size using HEAD or GET 0-0 with adaptive caching.
+-- Returns: total_size (number or nil), accept_ranges (boolean)
+-- Now backed by Upstream.probe_origin so all probe paths share the
+-- per-host method cache.
+function Upstream.probe_total_with_head(url, hdrs, ssl_verify, dict)
+  local meta = Upstream.probe_origin(url, hdrs, ssl_verify, dict)
+  if not meta.ok then return nil, false end
+  -- We got a 2xx response; any modern origin that supports our probe
+  -- method also supports byte-range requests, so accept_ranges=true.
+  return meta.size, true
 end
 
 return Upstream

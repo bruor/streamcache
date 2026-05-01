@@ -6,12 +6,15 @@
 --   - Reads cached origin headers from `resolved` shared dict (no extra HEAD)
 --   - Reads .part via FFI fd + fadvise(DONTNEED) to prevent re-caching
 --     pages the writer already dropped from page cache
+--   - Registers ngx.on_abort BEFORE doing any yield-prone work and BEFORE
+--     opening the FFI file descriptor, with a cleanup callback that closes
+--     the fd. Eliminates the FD-leak window during pre-streaming yields
+--     (totals wait, send_headers).
 
 local ngx      = ngx
 local math     = math
 local Utils    = require "sc_utils"
 local File     = require "sc_file"
-local Upstream = require "sc_upstream"
 
 local Follower = {}
 
@@ -44,7 +47,7 @@ function Follower.serve(ctx, final_url, req_start, req_end)
   if File.exists(final_path) then
     ngx.header["X-Cache"] = "HIT"
     Utils.set_var_safe("sc_decision", "HIT")
-    return ngx.exec("/cache/" .. key)
+    return File.serve_cached(final_path, key, cfg)
   end
 
   -- Open .part via FFI (gives us fd for fadvise after reads)
@@ -52,15 +55,36 @@ function Follower.serve(ctx, final_url, req_start, req_end)
   local fd = File.open_read_fd(tmp)
   if not fd then return nil, "no_part" end
 
+  -- Idempotent fd close. on_abort callback and all exit paths route
+  -- through this; the fd_closed flag prevents double-close.
+  local fd_closed = false
+  local function cleanup_fd()
+    if not fd_closed then
+      fd_closed = true
+      File.close_fd(fd)
+    end
+  end
+
+  -- Register abort detection IMMEDIATELY after opening fd, BEFORE any
+  -- yield-prone operations (sleep loops, send_headers). Without this, a
+  -- client disconnect during the pre-streaming wait would terminate the
+  -- request without running any cleanup, leaking the fd.
+  local aborted = false
+  pcall(ngx.on_abort, function()
+    aborted = true
+    cleanup_fd()
+  end)
+
   -- Wait for total size to become available (writer sets it early)
   local total_size = totals:get(key)
   local waited = 0
-  while not total_size and waited < 2000 do
+  while not total_size and waited < 2000 and not aborted do
     ngx.sleep(0.05)
     waited = waited + 50
     total_size = totals:get(key)
   end
-  if not total_size then File.close_fd(fd); return nil, "no_total" end
+  if aborted then cleanup_fd(); return nil, "aborted" end
+  if not total_size then cleanup_fd(); return nil, "no_total" end
   total_size = tonumber(total_size)
 
   -- Compute range bounds
@@ -68,21 +92,19 @@ function Follower.serve(ctx, final_url, req_start, req_end)
   local stop  = (req_end and req_end ~= "") and tonumber(req_end) or (total_size - 1)
   if stop > (total_size - 1) then stop = total_size - 1 end
   if start > stop or start > total_size - 1 then
-    File.close_fd(fd)
+    cleanup_fd()
     ngx.header["Content-Range"] = string.format("bytes */%d", total_size)
     return ngx.exit(ngx.HTTP_REQUESTED_RANGE_NOT_SATISFIABLE)
   end
 
-  -- Get origin headers: try cached first, fall back to HEAD probe
+  -- Origin headers come from the writer's cache in `resolved` dict.
+  -- The writer populates this immediately upon receiving its upstream
+  -- response, BEFORE writing any bytes to .part. By the time the
+  -- follower has seen total_size set, those headers should be present.
+  -- The follower deliberately does NOT make its own HEAD probe — that
+  -- was a redundant origin call that contributed to memory pressure
+  -- during rapid-seek scenarios.
   local ct, et, lm, cd = get_cached_headers(resolved, key)
-  if not ct then
-    local oh = Upstream.fetch_origin_headers(final_url,
-      Upstream.build_client_like_headers(nil, final_url), cfg.SSL_VERIFY)
-    ct = oh["content-type"]
-    et = oh["etag"]
-    lm = oh["last-modified"]
-    cd = oh["content-disposition"]
-  end
 
   -- Determine whether client actually sent a Range header.
   -- If not, respond with 200 OK (not 206) to satisfy browsers like Chrome.
@@ -92,10 +114,13 @@ function Follower.serve(ctx, final_url, req_start, req_end)
   ngx.header["X-Cache"]       = "FOLLOW"
   Utils.set_var_safe("sc_decision", "FOLLOW")
   ngx.header["Accept-Ranges"] = "bytes"
-  if ct then ngx.header["Content-Type"]        = ct end
+  -- Content-Type fallback: octet-stream when no cached header is available.
+  -- This avoids serving with no Content-Type when the writer's response
+  -- hasn't yet been cached (rare race) or the origin omitted the header.
+  ngx.header["Content-Type"]  = ct or "application/octet-stream"
   if et then ngx.header["ETag"]                = et end
   if lm then ngx.header["Last-Modified"]       = lm end
-  if cd then ngx.header["Content-Disposition"]  = cd end
+  if cd then ngx.header["Content-Disposition"] = cd end
 
   if client_sent_range then
     -- Client asked for a range: send 206 with Content-Range
@@ -108,12 +133,6 @@ function Follower.serve(ctx, final_url, req_start, req_end)
     ngx.header["Content-Length"] = tostring(total_size)
   end
   ngx.send_headers()
-
-  -- Register abort handler: when the client disconnects, ngx.on_abort
-  -- fires in a separate light thread and sets our flag. This works
-  -- because lua_check_client_abort is on for this location.
-  local aborted = false
-  local ok_abort = pcall(ngx.on_abort, function() aborted = true end)
 
   -- Streaming loop: read from .part file as writer produces data
   local deadline = ngx.now() + cfg.FOLLOWER_WAIT_MAX
@@ -145,8 +164,10 @@ function Follower.serve(ctx, final_url, req_start, req_end)
       local chunk = File.read_fd(fd, chunk_sz)
       if not chunk then
         -- File read returned nothing; writer may not have flushed yet
+        if aborted then break end
         ngx.sleep(poll_sec)
       else
+        if aborted then break end
         -- Send to client; detect disconnect via both print and flush
         local okp = pcall(ngx.print, chunk)
         if not okp then break end
@@ -169,20 +190,21 @@ function Follower.serve(ctx, final_url, req_start, req_end)
         if current_offset > last_drop then
           File.drop_read_cache(fd, last_drop, current_offset - last_drop)
         end
-        File.close_fd(fd)
-        ngx.log(ngx.WARN, "[streamcache] follower timeout key=", key,
-          " offset=", tostring(current_offset))
+        cleanup_fd()
+        Utils.log_event(ngx.WARN, "FOLLOW_TIMEOUT", "url: " .. final_url .. " | offset: " .. tostring(current_offset))
         return ngx.exit(ngx.HTTP_OK)
       end
       ngx.sleep(poll_sec)
     end
   end
 
-  -- Cleanup: drop any remaining read pages and close fd
   if current_offset > last_drop then
     File.drop_read_cache(fd, last_drop, current_offset - last_drop)
   end
-  File.close_fd(fd)
+  cleanup_fd()
+  if aborted then
+    Utils.log_event(ngx.INFO, "DISCONNECT", "url: " .. final_url .. " | range: " .. tostring(req_start) .. "-" .. tostring(req_end or ""))
+  end
   return true
 end
 
@@ -194,6 +216,10 @@ function Follower.try_follow_with_wait(ctx, final_url, start, stop)
   while true do
     local ok, err = Follower.serve(ctx, final_url, start, stop)
     if ok then return true end
+    -- If client aborted, don't keep retrying. The on_abort handler
+    -- already ran cleanup; pretend we succeeded so caller doesn't
+    -- attempt further fallback paths against a disconnected client.
+    if err == "aborted" then return true end
     if ngx.now() >= deadline then return false, err end
     if err ~= "no_part" and err ~= "no_total" then return false, err end
     ngx.sleep(0.05)
