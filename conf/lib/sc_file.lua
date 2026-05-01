@@ -70,15 +70,73 @@ function File.remove(path)
   end
 end
 
--- Write cache metadata (size + last-access timestamp).
--- Uses standard io for small files; safe in any context.
-function File.write_meta(key, size, last, meta_dir)
+-- Write cache metadata as a full replacement.
+-- meta is a table with any of these fields:
+--   size            (number)  required-ish; defaults to 0
+--   last_access     (number)  defaults to ngx.now()
+--   last_validated  (number)  optional; epoch of last successful origin probe
+--   content_length  (number)  optional; origin Content-Length at commit
+--   content_type    (string)  optional; origin Content-Type at commit
+--   etag            (string)  optional; origin ETag at commit
+--   last_modified   (string)  optional; origin Last-Modified at commit
+-- Backward-compatible: janitor's parse_meta only reads `size` and `last_access`,
+-- so it ignores any extra fields.
+function File.write_meta(key, meta, meta_dir)
   meta_dir = meta_dir or "/var/cache/streamcache/meta"
   local f = io.open(meta_dir .. "/" .. key .. ".meta", "wb")
   if not f then return end
-  f:write("size=" .. tostring(size or 0) .. "\n")
-  f:write("last_access=" .. tostring(last or ngx.now()) .. "\n")
+  meta = meta or {}
+  f:write("size=" .. tostring(meta.size or 0) .. "\n")
+  f:write("last_access=" .. tostring(meta.last_access or ngx.now()) .. "\n")
+  if meta.last_validated then
+    f:write("last_validated=" .. tostring(meta.last_validated) .. "\n")
+  end
+  if meta.content_length then
+    f:write("content_length=" .. tostring(meta.content_length) .. "\n")
+  end
+  if meta.content_type and meta.content_type ~= "" then
+    f:write("content_type=" .. tostring(meta.content_type) .. "\n")
+  end
+  if meta.etag and meta.etag ~= "" then
+    f:write("etag=" .. tostring(meta.etag) .. "\n")
+  end
+  if meta.last_modified and meta.last_modified ~= "" then
+    f:write("last_modified=" .. tostring(meta.last_modified) .. "\n")
+  end
   f:close()
+end
+
+-- Read cache metadata. Returns a table with present fields, or nil if no
+-- meta file exists. Numeric fields are converted; string fields are kept as-is.
+function File.read_meta(key, meta_dir)
+  meta_dir = meta_dir or "/var/cache/streamcache/meta"
+  local f = io.open(meta_dir .. "/" .. key .. ".meta", "rb")
+  if not f then return nil end
+  local meta = {}
+  for line in f:lines() do
+    local k, v = line:match("^([a-z_]+)=(.+)$")
+    if k and v then
+      if k == "size" or k == "last_access" or k == "last_validated"
+         or k == "content_length" then
+        meta[k] = tonumber(v)
+      else
+        meta[k] = v
+      end
+    end
+  end
+  f:close()
+  return meta
+end
+
+-- Read existing meta, merge updates, write back. Lossless for fields not
+-- mentioned in `updates`. Used to bump last_access or last_validated without
+-- losing content_type/etag/last_modified.
+function File.update_meta(key, updates, meta_dir)
+  local existing = File.read_meta(key, meta_dir) or {}
+  for k, v in pairs(updates or {}) do
+    existing[k] = v
+  end
+  File.write_meta(key, existing, meta_dir)
 end
 
 -- Create directories. Accepts a table of paths or a single string.
@@ -198,6 +256,98 @@ function File.read_fd(fd, size)
   local n = ffi.C.read(fd, read_buf, size)
   if n <= 0 then return nil end
   return ffi.string(read_buf, n)
+end
+
+function File.serve_cached(path, key, cfg)
+  local total_size = File.size(path)
+  if total_size <= 0 then return nil, "empty_file" end
+
+  local req_range = ngx.req.get_headers()["Range"]
+  local start_byte = 0
+  local stop_byte  = total_size - 1
+  local client_sent_range = (req_range ~= nil and req_range ~= "")
+
+  if client_sent_range then
+    local s, e = req_range:match("^bytes=(%d+)%-([%d]*)$")
+    if s then
+      start_byte = tonumber(s) or 0
+      stop_byte  = (e and e ~= "") and tonumber(e) or (total_size - 1)
+    end
+    if stop_byte > (total_size - 1) then stop_byte = total_size - 1 end
+    if start_byte >= total_size then
+      ngx.header["Content-Range"] = string.format("bytes */%d", total_size)
+      return ngx.exit(ngx.HTTP_REQUESTED_RANGE_NOT_SATISFIABLE)
+    end
+  end
+
+  local send_len = stop_byte - start_byte + 1
+
+  local fd = File.open_read_fd(path)
+  if not fd then return nil, "open_error" end
+
+  -- Read meta for origin headers (Content-Type, ETag, Last-Modified).
+  -- Falls back to safe defaults when fields are absent (old meta files
+  -- written before the extended format, or origin didn't send the header).
+  local meta = (key and cfg and cfg.META_DIR) and File.read_meta(key, cfg.META_DIR) or nil
+
+  ngx.header["X-Cache"]       = "HIT"
+  ngx.header["Accept-Ranges"] = "bytes"
+  ngx.header["Content-Type"]  = (meta and meta.content_type) or "application/octet-stream"
+  if meta then
+    if meta.etag          then ngx.header["ETag"]          = meta.etag end
+    if meta.last_modified then ngx.header["Last-Modified"] = meta.last_modified end
+  end
+
+  if client_sent_range then
+    ngx.status = ngx.HTTP_PARTIAL_CONTENT
+    ngx.header["Content-Range"]  = string.format("bytes %d-%d/%d", start_byte, stop_byte, total_size)
+    ngx.header["Content-Length"] = tostring(send_len)
+  else
+    ngx.status = ngx.HTTP_OK
+    ngx.header["Content-Length"] = tostring(total_size)
+  end
+  ngx.send_headers()
+
+  File.seek_fd(fd, start_byte)
+
+  local FADVISE_CHUNK = 2 * 1024 * 1024
+  local sent = 0
+  local needed = send_len
+  local cur_offset = start_byte
+  local last_drop = start_byte
+  local flush_acc = 0
+  local CLIENT_FLUSH = (cfg and cfg.CLIENT_FLUSH_BYTES) or (1 * 1024 * 1024)
+
+  while sent < needed do
+    local chunk_sz = math.min(8192, needed - sent)
+    local chunk = File.read_fd(fd, chunk_sz)
+    if not chunk then break end
+
+    local okp = pcall(ngx.print, chunk)
+    if not okp then break end
+
+    sent = sent + #chunk
+    cur_offset = cur_offset + #chunk
+    flush_acc = flush_acc + #chunk
+
+    if flush_acc >= CLIENT_FLUSH then
+      pcall(ngx.flush, true)
+      flush_acc = 0
+    end
+
+    if (cur_offset - last_drop) >= FADVISE_CHUNK then
+      File.drop_read_cache(fd, last_drop, cur_offset - last_drop)
+      last_drop = cur_offset
+    end
+  end
+
+  if cur_offset > last_drop then
+    File.drop_read_cache(fd, last_drop, cur_offset - last_drop)
+  end
+
+  pcall(ngx.flush, true)
+  File.close_fd(fd)
+  return true
 end
 
 -- ======================== Page Cache Management ========================
