@@ -77,9 +77,9 @@ end
 
 -- Try a range-hostile retry: drop Range header, probe size via HEAD first.
 -- Returns new res, httpc or nil.
-local function range_hostile_retry(url, options, totals, key, cfg, orig_url, client_headers)
+local function range_hostile_retry(url, options, totals, key, cfg, orig_url, client_headers, probe_methods)
   local probe_hdrs = Upstream.build_client_like_headers(nil, orig_url, client_headers)
-  local expected_head, _ = Upstream.probe_total_with_head(url, probe_hdrs, cfg.SSL_VERIFY)
+  local expected_head, _ = Upstream.probe_total_with_head(url, probe_hdrs, cfg.SSL_VERIFY, probe_methods)
   if expected_head and expected_head > 0 then
     totals:set(key, expected_head, cfg.TOTALS_TTL_SECS)
   else
@@ -89,6 +89,7 @@ local function range_hostile_retry(url, options, totals, key, cfg, orig_url, cli
   local retry_opts = Utils.tclone(options)
   retry_opts.headers = Utils.tclone(options.headers or {})
   retry_opts.headers["Range"] = nil
+  retry_opts.read_timeout_ms = retry_opts.read_timeout_ms or cfg.UPSTREAM_READ_TIMEOUT_MS
   return Upstream.request(url, retry_opts)
 end
 
@@ -152,7 +153,7 @@ local function write_loop(ctx, res, httpc, fd, tmp, send_to_client, client_opts)
     while true do
       local chunk, cerr = res.body_reader(32768)
       if cerr then
-        ngx.log(ngx.WARN, "[streamcache] tee read error: ", tostring(cerr))
+        Utils.log_event(ngx.WARN, "TEE_READ_ERR", "upstream read error: " .. tostring(cerr))
         return 0, 0, "upstream_read_fail"
       end
       if not chunk then break end
@@ -160,7 +161,7 @@ local function write_loop(ctx, res, httpc, fd, tmp, send_to_client, client_opts)
       -- 1. Write to disk via FFI
       local written, errw = File.write_fd(fd, chunk)
       if not written or written ~= #chunk then
-        ngx.log(ngx.ERR, "[streamcache] write failed: ", tostring(errw), " rid=", rid)
+        Utils.log_event(ngx.ERR, "TEE_WRITE_ERR", "disk write failed: " .. tostring(errw))
         return total_written, sent, "disk_write_fail"
       end
       total_written = total_written + #chunk
@@ -213,7 +214,7 @@ local function write_loop(ctx, res, httpc, fd, tmp, send_to_client, client_opts)
     total_written = #chunk
     local written, errw = File.write_fd(fd, chunk)
     if not written or written ~= #chunk then
-      ngx.log(ngx.ERR, "[streamcache] write failed: ", tostring(errw), " rid=", rid)
+      Utils.log_event(ngx.ERR, "TEE_WRITE_ERR", "disk write failed: " .. tostring(errw))
       return total_written, sent, "disk_write_fail"
     end
     progress:set(key, total_written, cfg.INFLIGHT_TTL)
@@ -245,44 +246,65 @@ end
 -- ======================== Strict Commit ========================
 -- Only commits (renames .part → final) if written bytes exactly match
 -- expected size. Uses chunked copy fallback + post-commit verification.
-local function strict_commit(ctx, tmp, dest_path, total_written, rid)
+-- On commit, persists origin response headers (Content-Type, ETag,
+-- Last-Modified, Content-Length) to .meta along with last_validated=now
+-- so cache HIT serves can return correct headers and stale-check has
+-- a baseline for comparison.
+local function strict_commit(ctx, tmp, dest_path, total_written, rid, origin_headers)
   local totals  = ctx.shared.totals
   local access  = ctx.shared.access
   local cfg     = ctx.config
   local key     = ctx.key
+
+  -- Lowercase the origin headers once for lookup
+  local oh = {}
+  for k, v in pairs(origin_headers or {}) do oh[string.lower(k)] = v end
 
   local expected = tonumber(totals:get(key) or 0)
   if expected > 0 then
     if total_written == expected then
       local okr, errr = File.rename(tmp, dest_path, expected)
       if not okr then
-        ngx.log(ngx.ERR, "[streamcache] commit failed: ", tostring(errr),
-          " tmp=", tmp, " dest=", dest_path, " rid=", rid)
+        Utils.log_event(ngx.ERR, "TEE_COMMIT_ERR", "commit failed: " .. tostring(errr))
         File.remove(tmp)
         return false, "commit_fail"
       end
       local ts = ngx.now()
-      File.write_meta(key, total_written, ts, cfg.META_DIR)
+      -- Compute content_length: prefer Content-Range total, fall back to Content-Length
+      local content_length = nil
+      if oh["content-range"] then
+        local t = oh["content-range"]:match("/(%d+)$")
+        if t then content_length = tonumber(t) end
+      end
+      if not content_length and oh["content-length"] then
+        content_length = tonumber(oh["content-length"])
+      end
+      File.write_meta(key, {
+        size           = total_written,
+        last_access    = ts,
+        last_validated = ts,
+        content_length = content_length,
+        content_type   = oh["content-type"],
+        etag           = oh["etag"],
+        last_modified  = oh["last-modified"],
+      }, cfg.META_DIR)
       access:set(key, ts)
       if cfg.VERBOSE then
-        Utils.jlog(ngx.NOTICE, "tee_complete",
-          {size = Utils.b2human(total_written), expected = tostring(expected)}, rid, true)
+        Utils.log_request(ngx.NOTICE, {
+          label  = "COMPLETE",
+          size   = Utils.b2human(total_written),
+          action = "cached to disk",
+        })
       end
       return true, nil
     else
       File.remove(tmp)
-      ngx.log(ngx.WARN, "[streamcache] not committing (truncated): written=",
-        tostring(total_written), " expected=", tostring(expected), " key=", key)
+      Utils.log_event(ngx.WARN, "TEE_TRUNCATED", "written " .. tostring(total_written) .. " expected " .. tostring(expected))
       return false, "size_mismatch"
     end
   else
     File.remove(tmp)
-    if total_written > 0 then
-      ngx.log(ngx.WARN, "[streamcache] not committing (unknown total size); key=", key,
-        " written=", tostring(total_written))
-    else
-      ngx.log(ngx.WARN, "[streamcache] tee produced 0 bytes; not committing key=", key)
-    end
+    Utils.log_event(ngx.WARN, "TEE_NO_SIZE", "unknown total size, written " .. tostring(total_written))
     return false, "unknown_size"
   end
 end
@@ -321,20 +343,22 @@ function Tee.tee_stream(ctx, url, dest_path, use_range_0, client_headers, send_t
   end
 
   local res, httpc, final_url = Upstream.request(url, {
-    method     = "GET",
-    headers    = headers,
-    ssl_verify = cfg.SSL_VERIFY,
+    method          = "GET",
+    headers         = headers,
+    ssl_verify      = cfg.SSL_VERIFY,
+    read_timeout_ms = cfg.UPSTREAM_READ_TIMEOUT_MS,
   })
   if not res then
     return fail_exit(ngx.HTTP_BAD_GATEWAY, nil, key, nil, inflight, send_to_client)
   end
 
-  -- Range-hostile fallback: retry without Range on 416/400/403
   if not (res.status == 200 or res.status == 206) then
     if headers["Range"] and (res.status == 416 or res.status == 400 or res.status == 403) then
       httpc:close()
+      Utils.log_event(ngx.INFO, "RANGE_RETRY", "retrying without Range header")
       local res2, httpc2, url2 = range_hostile_retry(
-        url, {ssl_verify = cfg.SSL_VERIFY}, totals, key, cfg, url, ch)
+        url, {ssl_verify = cfg.SSL_VERIFY, read_timeout_ms = cfg.UPSTREAM_READ_TIMEOUT_MS},
+        totals, key, cfg, url, ch, ctx.shared.probe_methods)
       if res2 and (res2.status == 200 or res2.status == 206) then
         res, httpc, final_url = res2, httpc2, url2
       else
@@ -342,12 +366,11 @@ function Tee.tee_stream(ctx, url, dest_path, use_range_0, client_headers, send_t
         return fail_exit(ngx.HTTP_BAD_GATEWAY, nil, key, nil, inflight, send_to_client)
       end
     else
-      ngx.log(ngx.WARN, "[streamcache] tee status not OK: ", res.status)
+      Utils.log_event(ngx.WARN, "UPSTREAM_ERR", "status " .. tostring(res.status))
       return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, inflight, send_to_client)
     end
   end
 
-  -- Parse total size
   local total_size, hl = parse_total_size(res)
   if total_size and total_size > 0 then
     refresh_totals(totals, key, total_size, cfg.TOTALS_TTL_SECS)
@@ -355,6 +378,10 @@ function Tee.tee_stream(ctx, url, dest_path, use_range_0, client_headers, send_t
 
   -- Cache origin headers for followers
   cache_origin_headers(ctx.shared.resolved, key, res.headers)
+
+  -- Snapshot origin response headers for the eventual strict_commit so
+  -- they get persisted into .meta (Content-Type, ETag, Last-Modified).
+  local origin_headers_snapshot = res.headers
 
   -- Send response headers to client
   if send_to_client then
@@ -382,11 +409,10 @@ function Tee.tee_stream(ctx, url, dest_path, use_range_0, client_headers, send_t
   File.remove(tmp)
   local fd, err_open = File.open_fd(tmp)
   if not fd then
-    ngx.log(ngx.ERR, "[streamcache] tee cannot open temp (fd): ", tmp, " err=", tostring(err_open))
+    Utils.log_event(ngx.ERR, "TEE_WRITE_ERR", "disk write failed: cannot open temp file " .. tmp .. ": " .. tostring(err_open))
     return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, inflight, send_to_client)
   end
 
-  -- Stream & write
   local total_written, _, loop_err = write_loop(ctx, res, httpc, fd, tmp, send_to_client, nil)
 
   File.fsync_fd(fd)
@@ -399,7 +425,7 @@ function Tee.tee_stream(ctx, url, dest_path, use_range_0, client_headers, send_t
   end
 
   -- Strict commit
-  strict_commit(ctx, tmp, dest_path, total_written, rid)
+  strict_commit(ctx, tmp, dest_path, total_written, rid, origin_headers_snapshot)
   inflight:delete(key)
   return
 end
@@ -421,23 +447,30 @@ function Tee.tee_stream_range_window(ctx, url, dest_path, client_start, client_e
 
   local ch = client_headers or ngx.req.get_headers()
   local headers = Upstream.build_client_like_headers(nil, url, ch)
-  headers["Range"] = (ch["Range"] or ch["range"]) or "bytes=0-"
+  -- ALWAYS request the full file from byte 0. The cache must be byte-0
+  -- aligned; forwarding the client's Range here would cause us to write
+  -- upstream's range-response bytes at file offset 0, corrupting the
+  -- cache and producing wrong bytes to the client. The client's slice is
+  -- handled by maybe_send_slice() in write_loop using send_start/send_end.
+  headers["Range"] = "bytes=0-"
 
   local res, httpc, final_url = Upstream.request(url, {
-    method     = "GET",
-    headers    = headers,
-    ssl_verify = cfg.SSL_VERIFY,
+    method          = "GET",
+    headers         = headers,
+    ssl_verify      = cfg.SSL_VERIFY,
+    read_timeout_ms = cfg.UPSTREAM_READ_TIMEOUT_MS,
   })
   if not res then
     return fail_exit(ngx.HTTP_BAD_GATEWAY, nil, key, nil, inflight, send_to_client)
   end
 
-  -- Range-hostile fallback
   if not (res.status == 200 or res.status == 206) then
     if headers["Range"] and (res.status == 416 or res.status == 400 or res.status == 403) then
       httpc:close()
+      Utils.log_event(ngx.INFO, "RANGE_RETRY", "retrying without Range header")
       local res2, httpc2, url2 = range_hostile_retry(
-        url, {ssl_verify = cfg.SSL_VERIFY}, totals, key, cfg, url, ch)
+        url, {ssl_verify = cfg.SSL_VERIFY, read_timeout_ms = cfg.UPSTREAM_READ_TIMEOUT_MS},
+        totals, key, cfg, url, ch, ctx.shared.probe_methods)
       if res2 and (res2.status == 200 or res2.status == 206) then
         res, httpc, final_url = res2, httpc2, url2
       else
@@ -445,7 +478,7 @@ function Tee.tee_stream_range_window(ctx, url, dest_path, client_start, client_e
         return fail_exit(ngx.HTTP_BAD_GATEWAY, nil, key, nil, inflight, send_to_client)
       end
     else
-      ngx.log(ngx.WARN, "[streamcache] tee-window status not OK: ", res.status)
+      Utils.log_event(ngx.WARN, "UPSTREAM_ERR", "status " .. tostring(res.status))
       return fail_exit(ngx.HTTP_BAD_GATEWAY, httpc, key, nil, inflight, send_to_client)
     end
   end
@@ -458,6 +491,7 @@ function Tee.tee_stream_range_window(ctx, url, dest_path, client_start, client_e
 
   -- Cache origin headers for followers
   cache_origin_headers(ctx.shared.resolved, key, res.headers)
+  local origin_headers_snapshot = res.headers
 
   -- If size unknown, fall back to nocache streaming
   if not total_size or total_size <= 0 then
@@ -503,8 +537,7 @@ function Tee.tee_stream_range_window(ctx, url, dest_path, client_start, client_e
   File.remove(tmp)
   local fd, err_open = File.open_fd(tmp)
   if not fd then
-    ngx.log(ngx.ERR, "[streamcache] tee-window cannot open temp (fd): ", tmp,
-      " err=", tostring(err_open), " ; falling back to nocache")
+    Utils.log_event(ngx.ERR, "TEE_WRITE_ERR", "disk write failed: cannot open temp file " .. tmp .. ": " .. tostring(err_open))
     httpc:close()
     inflight:delete(key)
     local NoCache = require "sc_nocache"
@@ -527,7 +560,7 @@ function Tee.tee_stream_range_window(ctx, url, dest_path, client_start, client_e
   end
 
   -- Strict commit
-  strict_commit(ctx, tmp, dest_path, total_written, rid)
+  strict_commit(ctx, tmp, dest_path, total_written, rid, origin_headers_snapshot)
   inflight:delete(key)
   return
 end
