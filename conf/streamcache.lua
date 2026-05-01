@@ -6,7 +6,7 @@
 --   1. Decode/validate URL
 --   2. Allowed hosts check
 --   3. Non-GET → head passthrough
---   4. Cache HIT → serve from disk
+--   4. Cache HIT → serve from disk (with optional revalidation probe)
 --   5. Parse Range header
 --   6. Far seek (> threshold) → stream_no_cache
 --   7. Writer election (inflight:add)
@@ -30,11 +30,12 @@ local cfg = Config.load()
 local ctx = {
   config = cfg,
   shared = {
-    inflight = ngx.shared.inflight,
-    access   = ngx.shared.access,
-    resolved = ngx.shared.resolved,
-    progress = ngx.shared.progress,
-    totals   = ngx.shared.totals,
+    inflight       = ngx.shared.inflight,
+    access         = ngx.shared.access,
+    resolved       = ngx.shared.resolved,
+    progress       = ngx.shared.progress,
+    totals         = ngx.shared.totals,
+    probe_methods  = ngx.shared.probe_methods,
   },
 }
 
@@ -42,7 +43,7 @@ local ctx = {
 local b64 = ngx.var.b64
 local orig = b64 and Utils.b64url_decode(b64) or nil
 if not orig or not orig:match("^https?://") then
-  ngx.log(ngx.WARN, "[streamcache] bad request (invalid or non-http URL)")
+  Utils.log_event(ngx.WARN, "BAD_REQUEST", "invalid URL")
   return ngx.exit(ngx.HTTP_BAD_REQUEST)
 end
 orig = orig:gsub("^%s+", ""):gsub("[%s\r\n]+$", "")
@@ -51,11 +52,15 @@ ctx.url = orig
 ctx.rid = ngx.var.request_id or tostring(ngx.now())
 ctx.key = Utils.key_from_url(orig)
 
+local req_range_early = ngx.req.get_headers()["Range"]
+
 -- ======================== Allowed Hosts ========================
-if cfg.ALLOWED_HOSTS and cfg.ALLOWED_HOSTS ~= "" then
-  local host = orig:match("^https?://([^/]+)")
+local allowed_hosts = cfg.ALLOWED_HOSTS or ""
+if allowed_hosts ~= "" then
+  local source_url = orig or ""
+  local host = source_url:match("^https?://([^/]+)") or ""
   local allowed = false
-  for h in cfg.ALLOWED_HOSTS:gmatch("[^,%s]+") do
+  for h in allowed_hosts:gmatch("[^,%s]+") do
     if host == h then allowed = true; break end
   end
   if not allowed then
@@ -87,14 +92,98 @@ if File.exists(final_path) then
   else
     ngx.header["X-Cache"] = "HIT"
     Utils.set_var_safe("sc_decision", "HIT")
-    if cfg.VERBOSE then
-      ngx.log(ngx.INFO, "[streamcache] HIT key=", key, " size=", Utils.b2human(sz))
+    local revalidate_interval = cfg.CACHE_REVALIDATE_INTERVAL or (12 * 3600)
+    local serve_from_cache = true
+    local meta_path = cfg.META_DIR .. "/" .. key .. ".meta"
+    local meta = File.read_meta(key, cfg.META_DIR) or {}
+
+    -- Determine baseline timestamp for "when did we last verify origin?"
+    -- Prefer last_validated (set by commit and by successful revalidations).
+    -- Fall back to last_access from meta, then file mtime, then 0.
+    local baseline = meta.last_validated or meta.last_access
+    if not baseline then
+      local h = io.popen('stat -c %Y "' .. final_path .. '" 2>/dev/null')
+      if h then local t = h:read("*l"); h:close(); baseline = tonumber(t) end
     end
-    -- Update LRU
-    local ts = ngx.now()
-    ctx.shared.access:set(key, ts)
-    File.write_meta(key, sz, ts, cfg.META_DIR)
-    return ngx.exec("/cache/" .. key)
+    if not baseline then baseline = 0 end
+    local age = ngx.now() - baseline
+
+    if revalidate_interval > 0 and age > revalidate_interval
+       and not ctx.shared.inflight:get(key) then
+      -- Revalidation due. Probe origin using the per-host method cache.
+      local probe_hdrs = Upstream.build_client_like_headers(nil, orig)
+      local probe = Upstream.probe_origin(orig, probe_hdrs, cfg.SSL_VERIFY,
+                                          ctx.shared.probe_methods)
+
+      if not probe.ok then
+        -- Graceful fallback: serve stale from cache when origin unreachable.
+        -- Don't update last_validated so the next request retries the probe
+        -- promptly once the provider recovers.
+        Utils.log_event(ngx.WARN, "REVALIDATE_FAIL",
+          "probe failed; serving stale from cache (url: " .. orig .. ")")
+      else
+        -- Compare against stored origin signals.
+        -- PRIMARY: size. Only invalidate when we have a positive answer
+        -- AND it disagrees with what we cached.
+        local stored_size  = meta.content_length or sz
+        local size_changed = (probe.size and probe.size > 0
+                              and stored_size and probe.size ~= stored_size)
+
+        -- SECONDARY: ETag and Last-Modified, only if BOTH stored and current
+        -- have the value. Missing-on-either-side ⇒ skip that signal so a
+        -- provider stripping these headers doesn't trigger mass eviction.
+        local etag_changed = (meta.etag and probe.etag
+                              and meta.etag ~= probe.etag)
+        local lm_changed   = (meta.last_modified and probe.last_modified
+                              and meta.last_modified ~= probe.last_modified)
+
+        if size_changed or etag_changed or lm_changed then
+          local reason
+          if size_changed then
+            reason = "origin size " .. Utils.b2human(probe.size)
+                  .. " ≠ cached " .. Utils.b2human(stored_size)
+          elseif etag_changed then
+            reason = "origin ETag changed"
+          else
+            reason = "origin Last-Modified changed"
+          end
+          Utils.log_request(ngx.NOTICE, {
+            label    = "REVALIDATE_EVICT",
+            url      = orig,
+            path     = ngx.var.uri,
+            range    = req_range_early or "none",
+            decision = "REVALIDATE_EVICT",
+            reason   = reason .. ", re-downloading",
+          })
+          File.remove(final_path)
+          File.remove(meta_path)
+          ctx.shared.inflight:delete(key)
+          ctx.shared.totals:delete(key)
+          serve_from_cache = false
+        else
+          -- Origin matches; bump last_validated so we don't re-probe
+          -- until the next interval elapses.
+          File.update_meta(key, { last_validated = ngx.now() }, cfg.META_DIR)
+        end
+      end
+    end
+
+    if serve_from_cache then
+      Utils.log_request(ngx.NOTICE, {
+        label    = "REQUEST",
+        url      = orig,
+        path     = ngx.var.uri,
+        range    = req_range_early or "none",
+        decision = "HIT",
+        reason   = "file cached, size " .. Utils.b2human(sz),
+      })
+      local ts = ngx.now()
+      ctx.shared.access:set(key, ts)
+      -- Update only last_access; preserve last_validated, content_type, etag,
+      -- last_modified. (update_meta does a read-merge-write.)
+      File.update_meta(key, { last_access = ts }, cfg.META_DIR)
+      return File.serve_cached(final_path, key, cfg)
+    end
   end
 end
 
@@ -104,7 +193,6 @@ local use_range_0  = false
 local near_start, near_end = nil, nil
 
 if not req_range or req_range == "" then
-  -- No Range from client: behave like a player upstream (Range:0-)
   use_range_0 = true
 else
   local s, e = req_range:match("^bytes=(%d+)%-([%d%*]*)$")
@@ -112,19 +200,31 @@ else
     s = tonumber(s)
     e = (e and e ~= "") and tonumber(e) or nil
     if s == 0 and (not e) then
-      -- bytes=0- : same as no range
       use_range_0 = true
     elseif s > 0 and s <= cfg.RANGE_TEE_THRESHOLD then
-      -- Near-start seek: tee full file, serve windowed slice
       near_start, near_end = s, e
       use_range_0 = true
+      Utils.log_request(ngx.NOTICE, {
+        label    = "REQUEST",
+        url      = orig,
+        path     = ngx.var.uri,
+        range    = req_range,
+        decision = "TEE_WINDOW",
+        reason   = "range start " .. tostring(s) .. " ≤ threshold " .. tostring(cfg.RANGE_TEE_THRESHOLD) .. ", caching full file",
+      })
     else
-      -- Far-seek: stream without cache; follow redirects; never expose Location
+      Utils.log_request(ngx.NOTICE, {
+        label    = "REQUEST",
+        url      = orig,
+        path     = ngx.var.uri,
+        range    = req_range,
+        decision = "NOCACHE",
+        reason   = "range start " .. tostring(s) .. " > threshold " .. tostring(cfg.RANGE_TEE_THRESHOLD),
+      })
       Utils.set_var_safe("sc_decision", "MISS_NO_CACHE")
       return NoCache.stream(orig, cfg, nil, false)
     end
   else
-    -- Malformed Range: treat as no-range
     use_range_0 = true
   end
 end
@@ -135,7 +235,6 @@ local captured_headers = ngx.req.get_headers()
 
 local added = ctx.shared.inflight:add(key, true, cfg.INFLIGHT_TTL)
 if not added then
-  -- Writer exists: try to follow from .part
   local s, e = nil, nil
   if req_range and req_range ~= "" then
     local s1, e1 = req_range:match("^bytes=(%d+)%-([%d%*]*)$")
@@ -147,20 +246,55 @@ if not added then
   if not s then s = 0; e = nil end
 
   if s == 0 or s <= cfg.RANGE_TEE_THRESHOLD then
+    Utils.log_request(ngx.NOTICE, {
+      label    = "REQUEST",
+      url      = orig,
+      path     = ngx.var.uri,
+      range    = req_range or "none",
+      decision = "FOLLOW",
+      reason   = "writer in progress",
+    })
     local ok = Follower.try_follow_with_wait(ctx, orig, s, e)
     if ok then return end
     if cfg.VERBOSE then
-      ngx.log(ngx.INFO, "[streamcache] follow not ready; fallback nocache key=", key)
+      Utils.log_event(ngx.INFO, "FOLLOW_MISS", "not ready, fallback to nocache")
     end
   end
-  -- Fallback: stream nocache
   Utils.set_var_safe("sc_decision", "MISS_NO_CACHE")
+  Utils.log_request(ngx.NOTICE, {
+    label    = "REQUEST",
+    url      = orig,
+    path     = ngx.var.uri,
+    range    = req_range or "none",
+    decision = "NOCACHE",
+    reason   = "follow not ready, fallback",
+  })
   return NoCache.stream(orig, cfg, nil, (not req_range or req_range == ""))
 end
 
 -- ======================== We Are Writer ========================
--- Start background writer timer (decoupled from client speed).
--- Client becomes a follower reading from the growing .part file.
+Utils.log_request(ngx.NOTICE, {
+  label    = "REQUEST",
+  url      = orig,
+  path     = ngx.var.uri,
+  range    = req_range or "none",
+  decision = "TEE",
+  reason   = "new writer, background download starting",
+})
+
+-- MISS-time probe-method discovery:
+-- For unknown providers, run discovery synchronously now. This populates
+-- the probe_methods cache so that the first stale check (and any future
+-- probes) can use the correct method without re-discovering. Discovery
+-- failures are logged at ERROR by probe_origin but DO NOT block writer
+-- launch — the writer's full GET request will succeed independently in
+-- many cases (e.g., providers that reject HEAD AND GET 0-0 but accept
+-- full GET with redirect-following).
+do
+  local probe_hdrs = Upstream.build_client_like_headers(nil, orig, captured_headers)
+  Upstream.ensure_method_known(orig, probe_hdrs, cfg.SSL_VERIFY,
+                               ctx.shared.probe_methods)
+end
 
 local function start_writer_timer(range0)
   return ngx.timer.at(0, function(premature)
@@ -171,17 +305,13 @@ end
 
 local ok_timer, err_timer
 if near_start then
-  ok_timer, err_timer = start_writer_timer(true) -- force Range: 0-
+  ok_timer, err_timer = start_writer_timer(true)
 else
   ok_timer, err_timer = start_writer_timer(use_range_0)
 end
 
--- If timer could not start, fall back to inline tee (client-coupled)
 if not ok_timer then
-  if cfg.VERBOSE then
-    ngx.log(ngx.WARN, "[streamcache] writer timer failed: ", tostring(err_timer),
-      " ; using inline tee")
-  end
+  Utils.log_event(ngx.WARN, "TIMER_FAIL", "using inline tee: " .. tostring(err_timer))
   if near_start then
     return Tee.tee_stream_range_window(
       ctx, orig, final_path, near_start, near_end, captured_headers, true)
