@@ -28,6 +28,7 @@ func InitHTTPClient() {
 		}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
 		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
 		// Disable TLS certificate verification if required (IPTV providers sometimes use self-signed certs)
 		TLSClientConfig: &tls.Config{

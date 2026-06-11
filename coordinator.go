@@ -277,7 +277,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		// Read and write chunks for this block
 		blockBytesWritten := int64(0)
 		blockLength := blockEndOffset - blockStartOffset
-		buffer := make([]byte, 64*1024) // 64KB chunk buffer
+		buffer := make([]byte, 512*1024) // 512KB chunk buffer
 
 		state.Lock.Lock()
 		state.BlockStates[currentBlockIndex] = BlockDownloading
