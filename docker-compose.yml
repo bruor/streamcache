@@ -1,7 +1,7 @@
 services:
   streamcache:
     build:
-      context: https://${GITHUB_TOKEN}@github.com/bruor/GoStreamCache.git#master
+      context: https://${GITHUB_TOKEN}@github.com/bruor/GoStreamCache.git#main
     container_name: streamcache
     restart: unless-stopped
     ports:
