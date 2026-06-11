@@ -1,0 +1,18 @@
+# Compiled binaries
+streamcache
+streamcache.exe
+streamcache.test
+
+# Cache & temporary assemblies
+/cache/
+*.part
+
+# Environment overrides
+.env
+.env.*
+
+# System and editor directories
+.DS_Store
+.idea/
+.vscode/
+.antigravitycli/

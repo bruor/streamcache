@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Streamcache VOD Status Page</title>
+    <!-- Google Fonts Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #080710;
+            --card-bg: rgba(255, 255, 255, 0.05);
+            --card-border: rgba(255, 255, 255, 0.1);
+            --accent-primary: #8a2be2;
+            --accent-secondary: #00f0ff;
+            --accent-green: #39ff14;
+            --accent-orange: #ff9f1c;
+            --text-main: #ffffff;
+            --text-sub: #b0b3b8;
+            --font-family: 'Inter', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            background-image: radial-gradient(circle at 10% 20%, rgba(138, 43, 226, 0.15) 0%, transparent 40%),
+                              radial-gradient(circle at 90% 80%, rgba(0, 240, 255, 0.1) 0%, transparent 40%);
+            color: var(--text-main);
+            font-family: var(--font-family);
+            min-height: 100vh;
+            padding: 2rem;
+            overflow-x: hidden;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--card-border);
+        }
+
+        h1 {
+            font-size: 2.2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #fff 30%, var(--accent-secondary) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .logo-dot {
+            width: 12px;
+            height: 12px;
+            background-color: var(--accent-secondary);
+            border-radius: 50%;
+            display: inline-block;
+            box-shadow: 0 0 10px var(--accent-secondary);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(0.9); opacity: 0.6; }
+            50% { transform: scale(1.2); opacity: 1; }
+            100% { transform: scale(0.9); opacity: 0.6; }
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 2rem;
+        }
+
+        @media (max-width: 1024px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Glassmorphism Card Style */
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+
+        .card-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 1.2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 0.5rem;
+        }
+
+        /* Disk space layout */
+        .disk-stats {
+            display: flex;
+            flex-direction: column;
+            gap: 1.2rem;
+        }
+
+        .progress-container {
+            width: 100%;
+        }
+
+        .progress-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.9rem;
+            color: var(--text-sub);
+            margin-bottom: 0.4rem;
+        }
+
+        .progress-bar-outer {
+            width: 100%;
+            height: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 5px;
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .progress-bar-inner {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+            border-radius: 5px;
+            transition: width 0.5s ease;
+        }
+
+        /* Active downloads */
+        .download-item {
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .download-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.8rem;
+            align-items: center;
+        }
+
+        .download-url {
+            font-weight: 600;
+            font-size: 0.95rem;
+            word-break: break-all;
+            max-width: 80%;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .download-badge {
+            background-color: var(--accent-primary);
+            color: var(--text-main);
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            animation: pulse-glow 1.5s infinite;
+        }
+
+        @keyframes pulse-glow {
+            0% { box-shadow: 0 0 0 0 rgba(138, 43, 226, 0.4); }
+            70% { box-shadow: 0 0 0 8px rgba(138, 43, 226, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(138, 43, 226, 0); }
+        }
+
+        .download-meta {
+            display: flex;
+            gap: 1.5rem;
+            font-size: 0.85rem;
+            color: var(--text-sub);
+            margin-bottom: 1rem;
+        }
+
+        .block-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(8px, 1fr));
+            gap: 2px;
+            margin-top: 0.8rem;
+            background: rgba(0, 0, 0, 0.4);
+            padding: 6px;
+            border-radius: 6px;
+            border: 1px solid var(--card-border);
+        }
+
+        .block {
+            aspect-ratio: 1/1;
+            border-radius: 1.5px;
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+
+        .block.completed {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 2px var(--accent-green);
+        }
+
+        .block.downloading {
+            background-color: var(--accent-secondary);
+            animation: blink 1s infinite alternate;
+        }
+
+        @keyframes blink {
+            from { opacity: 0.4; }
+            to { opacity: 1; }
+        }
+
+        /* Scheduler panel */
+        .scheduler-panel {
+            background: rgba(0, 0, 0, 0.15);
+            border-radius: 8px;
+            padding: 0.8rem;
+            margin-top: 0.8rem;
+            font-size: 0.85rem;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .scheduler-title {
+            color: var(--accent-secondary);
+            font-weight: 600;
+            margin-bottom: 0.4rem;
+        }
+
+        .scheduler-detail {
+            display: flex;
+            justify-content: space-between;
+            color: var(--text-sub);
+            margin-bottom: 0.3rem;
+        }
+
+        .starving-badge {
+            background: rgba(255, 159, 28, 0.2);
+            color: var(--accent-orange);
+            border: 1px solid rgba(255, 159, 28, 0.3);
+            border-radius: 4px;
+            padding: 1px 4px;
+            font-size: 0.75rem;
+            font-family: var(--font-mono);
+        }
+
+        /* Log console */
+        .console-container {
+            display: flex;
+            flex-direction: column;
+            height: 400px;
+        }
+
+        .console-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+
+        .console {
+            flex-grow: 1;
+            background: #000000;
+            border-radius: 8px;
+            padding: 1rem;
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--accent-green);
+            overflow-y: auto;
+            border: 1px solid var(--card-border);
+            white-space: pre-wrap;
+            box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.8);
+        }
+
+        .empty-state {
+            text-align: center;
+            color: var(--text-sub);
+            padding: 3rem 0;
+            font-size: 0.95rem;
+        }
+
+        .system-status {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.9rem;
+            color: var(--text-sub);
+        }
+
+        .status-pill {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 4px 10px;
+            border-radius: 20px;
+            border: 1px solid var(--card-border);
+        }
+
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-indicator.connected {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 8px var(--accent-green);
+        }
+
+        .status-indicator.disconnected {
+            background-color: #ff3333;
+            box-shadow: 0 0 8px #ff3333;
+        }
+
+        /* Active client connections styling */
+        .connection-item {
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        @media (max-width: 600px) {
+            .connection-item {
+                grid-template-columns: 1fr;
+                gap: 0.5rem;
+            }
+        }
+
+        .connection-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            grid-column: 1 / -1;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 0.5rem;
+            margin-bottom: 0.2rem;
+        }
+
+        .connection-client-id {
+            font-family: var(--font-mono);
+            font-weight: 600;
+            color: var(--accent-secondary);
+        }
+
+        .connection-status-badge {
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+
+        .connection-status-badge.downloaded {
+            background: rgba(57, 255, 20, 0.1);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 255, 20, 0.3);
+        }
+
+        .connection-status-badge.hydrating {
+            background: rgba(0, 240, 255, 0.1);
+            color: var(--accent-secondary);
+            border: 1px solid rgba(0, 240, 255, 0.3);
+        }
+
+        .connection-status-badge.starving {
+            background: rgba(255, 159, 28, 0.1);
+            color: var(--accent-orange);
+            border: 1px solid rgba(255, 159, 28, 0.3);
+            animation: pulse-glow-orange 1.5s infinite;
+        }
+
+        @keyframes pulse-glow-orange {
+            0% { box-shadow: 0 0 0 0 rgba(255, 159, 28, 0.4); }
+            70% { box-shadow: 0 0 0 8px rgba(255, 159, 28, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 159, 28, 0); }
+        }
+
+        .connection-details {
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+            font-size: 0.85rem;
+            color: var(--text-sub);
+        }
+
+        .connection-detail-row {
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .connection-detail-value {
+            color: var(--text-main);
+            font-weight: 500;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1><span class="logo-dot"></span> Streamcache VOD Proxy</h1>
+        <div class="system-status">
+            <div class="status-pill">
+                <span id="connection-status-dot" class="status-indicator disconnected"></span>
+                <span id="connection-status-text">Connecting SSE...</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="dashboard-grid">
+        <!-- Main Column: Active Downloads -->
+        <main>
+            <div class="card">
+                <div class="card-title">
+                    <span>Active Cache Hydrations</span>
+                    <span style="font-size: 0.85rem; color: var(--text-sub);" id="active-count">0 Downloading</span>
+                </div>
+                <div id="downloads-container">
+                    <div class="empty-state">No VOD files are currently hydrating to cache. Streams served directly from disk HIT will not appear here.</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">
+                    <span>Active Client Connections</span>
+                    <span style="font-size: 0.85rem; color: var(--text-sub);" id="connections-count">0 Connected</span>
+                </div>
+                <div id="connections-container">
+                    <div class="empty-state">No active client connections.</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="console-header card-title" style="margin-bottom: 0.5rem; border-bottom: none;">
+                    <span>System Console & Event Logs</span>
+                    <button onclick="clearConsole()" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: var(--text-sub); font-family: var(--font-family); font-size: 0.75rem; padding: 2px 8px; border-radius: 4px; cursor: pointer; transition: all 0.2s;">Clear</button>
+                </div>
+                <div class="console-container">
+                    <div id="console" class="console">Initializing Streamcache log stream...
+</div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Sidebar Column: Disk Space & Diagnostics -->
+        <aside>
+            <div class="card">
+                <div class="card-title">Cache Storage Status</div>
+                <div class="disk-stats">
+                    <div class="progress-container">
+                        <div class="progress-labels">
+                            <span>Cache Usage</span>
+                            <span id="cache-usage-label">0.00 GB / 0.00 GB</span>
+                        </div>
+                        <div class="progress-bar-outer">
+                            <div id="cache-usage-bar" class="progress-bar-inner" style="width: 0%"></div>
+                        </div>
+                    </div>
+
+                    <div class="progress-container">
+                        <div class="progress-labels">
+                            <span>Physical Disk Free Space</span>
+                            <span id="disk-free-label">0.00 GB Free</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-title">Diagnostics API</div>
+                <div style="font-size: 0.9rem; color: var(--text-sub); display: flex; flex-direction: column; gap: 0.8rem;">
+                    <div>Exposed REST API endpoints for debugging:</div>
+                    <div style="background: rgba(0,0,0,0.3); padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); font-family: var(--font-mono); font-size: 0.8rem;">
+                        <a href="/debug/state" target="_blank" style="color: var(--accent-secondary); text-decoration: none;">GET /debug/state</a>
+                        <span style="display:block; color: var(--text-sub); font-size: 0.75rem; margin-top: 2px;">Inspect active cache grids & scheduler</span>
+                    </div>
+                    <div style="background: rgba(0,0,0,0.3); padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); font-family: var(--font-mono); font-size: 0.8rem;">
+                        <a href="/debug/pprof/" target="_blank" style="color: var(--accent-secondary); text-decoration: none;">GET /debug/pprof</a>
+                        <span style="display:block; color: var(--text-sub); font-size: 0.75rem; margin-top: 2px;">Inspect Go runtime CPU/Mem profiles</span>
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <script>
+        const consoleEl = document.getElementById('console');
+        const downloadsContainer = document.getElementById('downloads-container');
+        const activeCountEl = document.getElementById('active-count');
+        const cacheUsageLabel = document.getElementById('cache-usage-label');
+        const cacheUsageBar = document.getElementById('cache-usage-bar');
+        const diskFreeLabel = document.getElementById('disk-free-label');
+        const connectionDot = document.getElementById('connection-status-dot');
+        const connectionText = document.getElementById('connection-status-text');
+        const connectionsContainer = document.getElementById('connections-container');
+        const connectionsCountEl = document.getElementById('connections-count');
+
+        function appendLog(text) {
+            consoleEl.innerText += text;
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+
+        function clearConsole() {
+            consoleEl.innerText = "";
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0.00 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // Establish Server-Sent Events (SSE) connection
+        function connectSSE() {
+            appendLog("\nConnecting to SSE Event Stream...");
+            const es = new EventSource('/dashboard/sse');
+
+            es.onopen = function() {
+                connectionDot.className = "status-indicator connected";
+                connectionText.innerText = "Connected";
+                appendLog("\n[SSE] Connected to event stream.");
+            };
+
+            es.onerror = function() {
+                connectionDot.className = "status-indicator disconnected";
+                connectionText.innerText = "Reconnecting...";
+                appendLog("\n[SSE] Connection lost. Reconnecting in 3s...");
+                es.close();
+                setTimeout(connectSSE, 3000);
+            };
+
+            // 1. Handle live logs stream
+            es.addEventListener('log', function(event) {
+                appendLog(event.data);
+            });
+
+            // 2. Handle state updates
+            es.addEventListener('state', function(event) {
+                const data = JSON.parse(event.data);
+                
+                // Update disk usage
+                const totalCache = data.total_cache_size_bytes;
+                const maxCache = data.max_cache_size_bytes;
+                const diskFree = data.disk_free_bytes;
+
+                cacheUsageLabel.innerText = `${formatBytes(totalCache)} / ${formatBytes(maxCache)}`;
+                const usagePercent = Math.min((totalCache / maxCache) * 100, 100);
+                cacheUsageBar.style.width = `${usagePercent}%`;
+
+                diskFreeLabel.innerText = `${formatBytes(diskFree)} Free`;
+
+                // Update active downloads
+                const active = data.active_downloads || [];
+                activeCountEl.innerText = `${active.length} Downloading`;
+
+                if (active.length === 0) {
+                    downloadsContainer.innerHTML = `
+                        <div class="empty-state">No VOD files are currently hydrating to cache. Streams served directly from disk HIT will not appear here.</div>
+                    `;
+                } else {
+                    let html = "";
+                    active.forEach(file => {
+                        // Calculate download completion
+                        let completedBlocks = 0;
+                        let blockHtml = "";
+                        file.block_states.forEach(state => {
+                            let cls = "";
+                            if (state === 2) {
+                                completedBlocks++;
+                                cls = "completed";
+                            } else if (state === 1) {
+                                cls = "downloading";
+                            }
+                            blockHtml += `<div class="block ${cls}"></div>`;
+                        });
+
+                        const completionPercent = ((completedBlocks / file.total_blocks) * 100).toFixed(1);
+
+                        // Scheduler info
+                        let starvingQueueHtml = "";
+                        if (file.starving_queue && file.starving_queue.length > 0) {
+                            starvingQueueHtml = file.starving_queue.map(b => `<span class="starving-badge">starving: block ${b}</span>`).join(" ");
+                        }
+
+                        html += `
+                            <div class="download-item">
+                                <div class="download-header">
+                                    <div class="download-url" title="${file.url}">${file.url}</div>
+                                    <div class="download-badge">${completionPercent}% Complete</div>
+                                </div>
+                                <div class="download-meta">
+                                    <span>Size: ${formatBytes(file.total_size)}</span>
+                                    <span>Blocks: ${completedBlocks}/${file.total_blocks}</span>
+                                    <span>Active Clients: ${file.active_clients}</span>
+                                </div>
+                                ${starvingQueueHtml ? `
+                                <div class="scheduler-panel">
+                                    <div class="scheduler-title">Debouncer Jump Queue</div>
+                                    <div>${starvingQueueHtml}</div>
+                                </div>
+                                ` : ''}
+                                <div class="block-grid">
+                                    ${blockHtml}
+                                </div>
+                            </div>
+                        `;
+                    });
+                    downloadsContainer.innerHTML = html;
+                }
+
+                // Update active connections
+                const connections = data.active_connections || [];
+                connectionsCountEl.innerText = `${connections.length} Connected`;
+
+                if (connections.length === 0) {
+                    connectionsContainer.innerHTML = `
+                        <div class="empty-state">No active client connections.</div>
+                    `;
+                } else {
+                    let connHtml = "";
+                    connections.forEach(conn => {
+                        // Calculate elapsed duration
+                        const elapsedSecs = Math.max(0, Math.floor(Date.now() / 1000) - conn.start_time);
+                        let durationStr = `${elapsedSecs}s`;
+                        if (elapsedSecs >= 60) {
+                            const mins = Math.floor(elapsedSecs / 60);
+                            const secs = elapsedSecs % 60;
+                            durationStr = `${mins}m ${secs}s`;
+                        }
+
+                        // Determine status
+                        let statusClass = 'hydrating';
+                        let statusText = 'Hydrating';
+                        if (conn.in_cache) {
+                            statusClass = 'downloaded';
+                            statusText = 'Downloaded';
+                        } else if (conn.starving_block !== -1) {
+                            statusClass = 'starving';
+                            statusText = `Starving (Block ${conn.starving_block})`;
+                        }
+
+                        // Format UA display
+                        let uaDisplay = conn.user_agent;
+                        if (uaDisplay.length > 45) {
+                            uaDisplay = uaDisplay.substring(0, 42) + "...";
+                        }
+
+                        // Calculate playback position percentage
+                        let percentageStr = "";
+                        if (conn.total_size > 0) {
+                            const percent = ((conn.offset / conn.total_size) * 100).toFixed(1);
+                            percentageStr = ` (${percent}%)`;
+                        }
+
+                        connHtml += `
+                            <div class="connection-item">
+                                <div class="connection-header">
+                                    <span class="connection-client-id">${conn.id}</span>
+                                    <span class="connection-status-badge ${statusClass}">${statusText}</span>
+                                </div>
+                                <div class="connection-details">
+                                    <div class="connection-detail-row">
+                                        <span>IP Address:</span>
+                                        <span class="connection-detail-value">${conn.remote_addr}</span>
+                                    </div>
+                                    <div class="connection-detail-row">
+                                        <span>User Agent:</span>
+                                        <span class="connection-detail-value" title="${conn.user_agent}">${uaDisplay}</span>
+                                    </div>
+                                    <div class="connection-detail-row">
+                                        <span>Elapsed Time:</span>
+                                        <span class="connection-detail-value">${durationStr}</span>
+                                    </div>
+                                </div>
+                                <div class="connection-details">
+                                    <div class="connection-detail-row" style="grid-column: 1 / -1;">
+                                        <span>Streaming File:</span>
+                                        <span class="connection-detail-value" title="${conn.url}" style="color: var(--accent-secondary); max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; text-align: right;">${conn.url}</span>
+                                    </div>
+                                    <div class="connection-detail-row">
+                                        <span>Current Offset:</span>
+                                        <span class="connection-detail-value">${formatBytes(conn.offset)}${percentageStr}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    connectionsContainer.innerHTML = connHtml;
+                }
+            });
+        }
+
+        connectSSE();
+    </script>
+</body>
+</html>
