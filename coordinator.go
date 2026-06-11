@@ -117,9 +117,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 		// Check if anyone is starving (needs blocks)
 		targetBlock := -1
+		isStarvingTarget := false
 		for _, starvingBlock := range state.Starving {
 			if state.BlockStates[starvingBlock] != BlockCompleted {
 				targetBlock = starvingBlock
+				isStarvingTarget = true
 				break // pick first starving client
 			}
 		}
@@ -161,33 +163,40 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			if targetBlock == currentBlockIndex+1 {
 				shouldJump = false
 			} else {
-				// If no client is starving for the current block, we bypass the debouncer
-				currentBlockBusy := false
-				for _, sb := range state.Starving {
-					if sb == currentBlockIndex {
-						currentBlockBusy = true
-						break
-					}
-				}
-
-				if !currentBlockBusy {
-					shouldJump = true
-					log.Printf("[Coord] No clients starving for current block %d. Jumping immediately to block %d", currentBlockIndex, targetBlock)
+				// If targetBlock is not a starvation block, we only jump if the current block is completed.
+				// Otherwise, we keep downloading the current block.
+				if !isStarvingTarget && state.BlockStates[currentBlockIndex] != BlockCompleted {
+					targetBlock = currentBlockIndex
+					shouldJump = false
 				} else {
-					elapsed := time.Since(connStartTime)
-					var debouncerOk bool
-					if GlobalConfig.SchedulerMinTime <= 0 && GlobalConfig.SchedulerMinBytes <= 0 {
-						debouncerOk = true
-					} else {
-						timeOk := GlobalConfig.SchedulerMinTime > 0 && elapsed >= GlobalConfig.SchedulerMinTime
-						bytesOk := GlobalConfig.SchedulerMinBytes > 0 && connBytesWritten >= GlobalConfig.SchedulerMinBytes
-						debouncerOk = timeOk || bytesOk
+					// If no client is starving for the current block, we bypass the debouncer
+					currentBlockBusy := false
+					for _, sb := range state.Starving {
+						if sb == currentBlockIndex {
+							currentBlockBusy = true
+							break
+						}
 					}
 
-					if debouncerOk {
+					if !currentBlockBusy {
 						shouldJump = true
-						log.Printf("[Coord] Debouncer allows jump: from block %d to %d (elapsed=%s, bytes=%dKB)",
-							currentBlockIndex, targetBlock, elapsed.Truncate(time.Millisecond), connBytesWritten/1024)
+						log.Printf("[Coord] No clients starving for current block %d. Jumping immediately to block %d", currentBlockIndex, targetBlock)
+					} else {
+						elapsed := time.Since(connStartTime)
+						var debouncerOk bool
+						if GlobalConfig.SchedulerMinTime <= 0 && GlobalConfig.SchedulerMinBytes <= 0 {
+							debouncerOk = true
+						} else {
+							timeOk := GlobalConfig.SchedulerMinTime > 0 && elapsed >= GlobalConfig.SchedulerMinTime
+							bytesOk := GlobalConfig.SchedulerMinBytes > 0 && connBytesWritten >= GlobalConfig.SchedulerMinBytes
+							debouncerOk = timeOk || bytesOk
+						}
+
+						if debouncerOk {
+							shouldJump = true
+							log.Printf("[Coord] Debouncer allows jump: from block %d to %d (elapsed=%s, bytes=%dKB)",
+								currentBlockIndex, targetBlock, elapsed.Truncate(time.Millisecond), connBytesWritten/1024)
+						}
 					}
 				}
 			}
