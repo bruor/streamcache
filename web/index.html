@@ -637,6 +637,7 @@
                 const maxCache = data.max_cache_size_bytes || 0;
                 const totalCache = data.total_cache_size_bytes || 0;
                 const diskFree = data.disk_free_bytes || 0;
+                const minDiskFree = data.min_disk_free_bytes || 0;
                 
                 if (maxCache <= 0) {
                     cacheUsageLabel.innerText = `${formatBytes(totalCache)} / Unlimited`;
@@ -647,7 +648,11 @@
                     cacheUsageBar.style.width = `${usagePercent}%`;
                 }
 
-                diskFreeLabel.innerText = `${formatBytes(diskFree)} Free`;
+                if (minDiskFree <= 0) {
+                    diskFreeLabel.innerText = `${formatBytes(diskFree)} Free`;
+                } else {
+                    diskFreeLabel.innerText = `${formatBytes(diskFree)} Free / ${formatBytes(minDiskFree)} Min`;
+                }
 
                 // Update active downloads
                 const active = data.active_downloads || [];

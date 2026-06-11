@@ -195,6 +195,7 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		"total_cache_size_bytes": GlobalRegistry.TotalCacheSize,
 		"max_cache_size_bytes":   GlobalConfig.CacheMaxBytes,
 		"disk_free_bytes":        freeSpace,
+		"min_disk_free_bytes":    GlobalConfig.MinDiskFreeBytes,
 		"active_downloads":       activeFiles,
 		"active_connections":     activeConnections,
 	}
