@@ -165,7 +165,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			} else {
 				// If targetBlock is not a starvation block, we only jump if the current block is completed.
 				// Otherwise, we keep downloading the current block.
-				if !isStarvingTarget && state.BlockStates[currentBlockIndex] != BlockCompleted {
+				if !isStarvingTarget && currentBlockIndex >= 0 && currentBlockIndex < len(state.BlockStates) && state.BlockStates[currentBlockIndex] != BlockCompleted {
 					targetBlock = currentBlockIndex
 					shouldJump = false
 				} else {
