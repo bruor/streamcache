@@ -16,6 +16,8 @@ services:
       
       # Block & Buffer Configs
       - BLOCK_SIZE=4MB
+      # Set to true to disable Fadvise page cache purging (allows OS to buffer writes in RAM, speeding up slow NAS writes)
+      # - DISABLE_FADVISE=true
       
       # Cache eviction bounds (e.g. 50GB, 1TB, or 0/none/off/disabled to rely solely on disk free space)
       - CACHE_MAX_BYTES=50GB

@@ -210,7 +210,9 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 
 		// Purge page cache on Linux to prevent memory bloat
-		FadviseDontNeed(file.Fd(), off, int64(n))
+		if !GlobalConfig.DisableFadvise {
+			FadviseDontNeed(file.Fd(), off, int64(n))
+		}
 	}
 	return n, err
 }

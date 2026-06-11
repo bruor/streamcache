@@ -19,6 +19,7 @@ type Config struct {
 	AllowedHosts             []string
 	SchedulerMinBytes        int64
 	SchedulerMinTime         time.Duration
+	DisableFadvise           bool
 }
 
 var GlobalConfig *Config
@@ -34,6 +35,7 @@ func LoadConfig() {
 		CacheRevalidateInterval: getEnvDuration("CACHE_REVALIDATE_INTERVAL", 1*time.Hour),
 		SchedulerMinBytes:       getEnvSize("SCHEDULER_MIN_BYTES", 16*1024*1024), // 16MB
 		SchedulerMinTime:        getEnvDuration("SCHEDULER_MIN_TIME", 2*time.Second),
+		DisableFadvise:          getEnvBool("DISABLE_FADVISE", false),
 	}
 
 	// Format port if missing colon
@@ -54,12 +56,13 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, DisableFadvise=%t",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.BlockSize/(1024*1024),
 		cfg.CacheMaxBytes/(1024*1024*1024),
 		cfg.MinDiskFreeBytes/(1024*1024*1024),
+		cfg.DisableFadvise,
 	)
 }
 
@@ -132,4 +135,13 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return val
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	valStr, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+	valStr = strings.TrimSpace(strings.ToLower(valStr))
+	return valStr == "true" || valStr == "1" || valStr == "yes" || valStr == "on"
 }

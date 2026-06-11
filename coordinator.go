@@ -348,7 +348,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				}
 
 				// Purge page cache to keep Docker container memory flat
-				FadviseDontNeed(file.Fd(), writeOffset, int64(n))
+				if !GlobalConfig.DisableFadvise {
+					FadviseDontNeed(file.Fd(), writeOffset, int64(n))
+				}
 
 				blockBytesWritten += int64(n)
 				connBytesWritten += int64(n)
