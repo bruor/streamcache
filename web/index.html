@@ -619,6 +619,9 @@
             // 2. Handle state updates
             es.addEventListener('state', function(event) {
                 const data = JSON.parse(event.data);
+                const maxCache = data.max_cache_size_bytes || 0;
+                const totalCache = data.total_cache_size_bytes || 0;
+                const diskFree = data.disk_free_bytes || 0;
                 
                 if (maxCache <= 0) {
                     cacheUsageLabel.innerText = `${formatBytes(totalCache)} / Unlimited`;

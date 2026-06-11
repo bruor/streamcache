@@ -22,7 +22,6 @@ type CacheReader struct {
 
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
 	state.Lock.Lock()
-	defer state.Lock.Unlock()
 
 	// Generate a unique client ID
 	clientID := fmt.Sprintf("client-%d", rand.Intn(1000000))
@@ -49,14 +48,21 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		}
 	}
 
+	// Copy necessary state fields and release state.Lock before invoking GlobalRegistry.RegisterConnection
+	// to avoid a deadlock due to lock inversion with GlobalRegistry.Lock.
+	totalSize := state.TotalSize
+	key := state.Key
+	url := state.URL
+	state.Lock.Unlock()
+
 	conn := &ClientConnection{
 		ID:            clientID,
-		Key:           state.Key,
-		URL:           state.URL,
+		Key:           key,
+		URL:           url,
 		RemoteAddr:    remoteAddr,
 		UserAgent:     userAgent,
 		Offset:        0,
-		TotalSize:     state.TotalSize,
+		TotalSize:     totalSize,
 		StartTime:     time.Now().Unix(),
 		InCache:       isCompleted,
 		StarvingBlock: -1,
@@ -69,7 +75,7 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		ctx:      ctx,
 	}
 
-	log.Printf("[Reader] Registered client %s (%s, UA: %s) for media %s", clientID, remoteAddr, userAgent, state.Key)
+	log.Printf("[Reader] Registered client %s (%s, UA: %s) for media %s", clientID, remoteAddr, userAgent, key)
 	return r
 }
 
