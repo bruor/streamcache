@@ -38,7 +38,7 @@ func InitHTTPClient() {
 	UpstreamHTTPClient = &http.Client{
 		Transport: transport,
 		Jar:       jar,
-		Timeout:   30 * time.Second, // Default timeout for requests
+		Timeout:   0, // Unlimited timeout for long-lived streams (handled by Transport timeouts)
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return errors.New("stopped after 10 redirects")

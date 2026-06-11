@@ -60,6 +60,8 @@ type FileCacheState struct {
 	Starving     map[string]int // Map of clientID -> starving block index
 	File         *os.File       // Open handle to writing file
 	NotifyChan   chan struct{}  // Channel to wake coordinator on client starvation
+	BytesDownloadedSec int64
+	DownloadSpeed      int64
 }
 
 type CacheRegistry struct {
@@ -78,6 +80,21 @@ func InitRegistry() {
 		Connections: make(map[string]*ClientConnection),
 	}
 	GlobalRegistry.LoadExistingCache()
+	go GlobalRegistry.startSpeedMonitor()
+}
+
+func (r *CacheRegistry) startSpeedMonitor() {
+	ticker := time.NewTicker(1 * time.Second)
+	for range ticker.C {
+		r.Lock.RLock()
+		for _, fileState := range r.Files {
+			fileState.Lock.Lock()
+			fileState.DownloadSpeed = fileState.BytesDownloadedSec
+			fileState.BytesDownloadedSec = 0
+			fileState.Lock.Unlock()
+		}
+		r.Lock.RUnlock()
+	}
 }
 
 func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection) {
@@ -182,7 +199,43 @@ func (r *CacheRegistry) UpdateSize(delta int64) {
 	r.Lock.Lock()
 	r.TotalCacheSize += delta
 	currentSize := r.TotalCacheSize
+
+	// Check if eviction is already running
+	if r.Evicting {
+		r.Lock.Unlock()
+		return
+	}
+
+	// Quick check if eviction is potentially needed
+	var cacheBytesToFree int64
+	if GlobalConfig.CacheMaxBytes > 0 && currentSize > GlobalConfig.CacheMaxBytes {
+		cacheBytesToFree = currentSize - GlobalConfig.CacheMaxBytes
+	}
+
+	// We also check if disk free space limit is enabled
+	needEvictCheck := cacheBytesToFree > 0 || GlobalConfig.MinDiskFreeBytes > 0
+
+	if !needEvictCheck {
+		r.Lock.Unlock()
+		return
+	}
+
+	r.Evicting = true
 	r.Lock.Unlock()
+
+	go r.runEviction()
+}
+
+func (r *CacheRegistry) runEviction() {
+	defer func() {
+		r.Lock.Lock()
+		r.Evicting = false
+		r.Lock.Unlock()
+	}()
+
+	r.Lock.RLock()
+	currentSize := r.TotalCacheSize
+	r.Lock.RUnlock()
 
 	cacheDir := GlobalConfig.CacheDir
 

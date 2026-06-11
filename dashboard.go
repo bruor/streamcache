@@ -120,6 +120,7 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		ActiveWriter  bool     `json:"active_writer"`
 		ActiveClients int      `json:"active_clients"`
 		StarvingQueue []int    `json:"starving_queue"`
+		DownloadSpeed int64    `json:"download_speed"`
 	}
 
 	var activeFiles []sseFile
@@ -150,6 +151,7 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 			ActiveWriter:  fileState.WriterActive,
 			ActiveClients: len(fileState.Clients),
 			StarvingQueue: starveQueue,
+			DownloadSpeed: fileState.DownloadSpeed,
 		})
 		fileState.Lock.Unlock()
 	}

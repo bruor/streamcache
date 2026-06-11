@@ -111,8 +111,16 @@ func TestOnDemandEviction(t *testing.T) {
 		GlobalConfig.CacheMaxBytes = oldMax
 	}()
 
-	// Trigger eviction synchronously via size update (adding 5 bytes, pushing size to 45, requiring 20 bytes to be freed)
+	// Trigger eviction via size update (asynchronous)
 	GlobalRegistry.UpdateSize(5)
+
+	// Wait for async eviction to complete (up to 1s)
+	for i := 0; i < 100; i++ {
+		if !FileExists(filepath.Join(GlobalConfig.CacheDir, "a")) && !FileExists(filepath.Join(GlobalConfig.CacheDir, "b")) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Check which files exist. We expect 'a' and 'b' (oldest) to be evicted.
 	// Only 'c' and 'd' should remain.

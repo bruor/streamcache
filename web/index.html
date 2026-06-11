@@ -290,6 +290,35 @@
             box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.8);
         }
 
+        .console-scroll-btn {
+            position: absolute;
+            bottom: 15px;
+            right: 15px;
+            background: var(--accent-primary);
+            color: #ffffff;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            font-family: var(--font-family);
+            font-size: 0.8rem;
+            font-weight: 600;
+            padding: 6px 12px;
+            border-radius: 20px;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(138, 43, 226, 0.4);
+            transition: all 0.2s ease-in-out;
+            animation: consoleBtnFadeIn 0.3s;
+            z-index: 10;
+        }
+
+        .console-scroll-btn:hover {
+            background: #9b4cfb;
+            transform: translateY(-2px);
+        }
+
+        @keyframes consoleBtnFadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
         .empty-state {
             text-align: center;
             color: var(--text-sub);
@@ -458,9 +487,11 @@
                     <span>System Console & Event Logs</span>
                     <button onclick="clearConsole()" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: var(--text-sub); font-family: var(--font-family); font-size: 0.75rem; padding: 2px 8px; border-radius: 4px; cursor: pointer; transition: all 0.2s;">Clear</button>
                 </div>
-                <div class="console-container">
-                    <div id="console" class="console">Initializing Streamcache log stream...
-</div>
+                <div class="console-container" style="position: relative;">
+                    <div id="console" class="console">Initializing Streamcache log stream...</div>
+                    <button id="console-scroll-btn" class="console-scroll-btn" onclick="scrollToBottom()" style="display: none;">
+                        ↓ Resume Auto-scroll
+                    </button>
                 </div>
             </div>
         </main>
@@ -508,6 +539,20 @@
 
     <script>
         const consoleEl = document.getElementById('console');
+        const scrollBtn = document.getElementById('console-scroll-btn');
+        let autoScrollEnabled = true;
+
+        // Listen for scroll events to toggle auto-scroll state
+        consoleEl.addEventListener('scroll', () => {
+            const isAtBottom = (consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight) < 40;
+            if (isAtBottom) {
+                autoScrollEnabled = true;
+                scrollBtn.style.display = 'none';
+            } else {
+                autoScrollEnabled = false;
+            }
+        });
+
         const downloadsContainer = document.getElementById('downloads-container');
         const activeCountEl = document.getElementById('active-count');
         const cacheUsageLabel = document.getElementById('cache-usage-label');
@@ -519,12 +564,24 @@
         const connectionsCountEl = document.getElementById('connections-count');
 
         function appendLog(text) {
+            const isAtBottom = (consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight) < 40;
             consoleEl.innerText += text;
+            if (autoScrollEnabled && isAtBottom) {
+                consoleEl.scrollTop = consoleEl.scrollHeight;
+            } else if (!autoScrollEnabled) {
+                scrollBtn.style.display = 'block';
+            }
+        }
+
+        function scrollToBottom() {
             consoleEl.scrollTop = consoleEl.scrollHeight;
+            autoScrollEnabled = true;
+            scrollBtn.style.display = 'none';
         }
 
         function clearConsole() {
             consoleEl.innerText = "";
+            scrollBtn.style.display = 'none';
         }
 
         function formatBytes(bytes) {
@@ -563,14 +620,14 @@
             es.addEventListener('state', function(event) {
                 const data = JSON.parse(event.data);
                 
-                // Update disk usage
-                const totalCache = data.total_cache_size_bytes;
-                const maxCache = data.max_cache_size_bytes;
-                const diskFree = data.disk_free_bytes;
-
-                cacheUsageLabel.innerText = `${formatBytes(totalCache)} / ${formatBytes(maxCache)}`;
-                const usagePercent = Math.min((totalCache / maxCache) * 100, 100);
-                cacheUsageBar.style.width = `${usagePercent}%`;
+                if (maxCache <= 0) {
+                    cacheUsageLabel.innerText = `${formatBytes(totalCache)} / Unlimited`;
+                    cacheUsageBar.style.width = `0%`;
+                } else {
+                    cacheUsageLabel.innerText = `${formatBytes(totalCache)} / ${formatBytes(maxCache)}`;
+                    const usagePercent = Math.min((totalCache / maxCache) * 100, 100);
+                    cacheUsageBar.style.width = `${usagePercent}%`;
+                }
 
                 diskFreeLabel.innerText = `${formatBytes(diskFree)} Free`;
 
@@ -617,6 +674,7 @@
                                     <span>Size: ${formatBytes(file.total_size)}</span>
                                     <span>Blocks: ${completedBlocks}/${file.total_blocks}</span>
                                     <span>Active Clients: ${file.active_clients}</span>
+                                    ${file.download_speed > 0 ? `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(file.download_speed)}/s</span>` : ''}
                                 </div>
                                 ${starvingQueueHtml ? `
                                 <div class="scheduler-panel">

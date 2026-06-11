@@ -332,6 +332,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				blockBytesWritten += int64(n)
 				connBytesWritten += int64(n)
 
+				// Update download speed counter
+				state.Lock.Lock()
+				state.BytesDownloadedSec += int64(n)
+				state.Lock.Unlock()
+
 				// Update running cache size O(1)
 				GlobalRegistry.UpdateSize(int64(n))
 			}
