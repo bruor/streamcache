@@ -593,4 +593,34 @@ func TestCacheFinalizationOrder(t *testing.T) {
 	})
 }
 
+func TestURLSanitizationAndKeyGeneration(t *testing.T) {
+	// Test cases of URLs with different query params that should produce the same key and extension
+	url1 := "http://infinity.gives/series/wflx2/31916535/1334565.mkv?token=foo&expiry=123"
+	url2 := "http://infinity.gives/series/wflx2/31916535/1334565.mkv?token=bar"
+	url3 := "http://infinity.gives/series/wflx2/31916535/1334565.mkv"
+
+	key1, ext1 := getCacheKeyAndExt(url1)
+	key2, ext2 := getCacheKeyAndExt(url2)
+	key3, ext3 := getCacheKeyAndExt(url3)
+
+	if key1 != key2 || key2 != key3 {
+		t.Errorf("Expected identical keys, got key1=%s, key2=%s, key3=%s", key1, key2, key3)
+	}
+
+	if ext1 != ".mkv" || ext2 != ".mkv" || ext3 != ".mkv" {
+		t.Errorf("Expected extension to be '.mkv' and clean of query parameters, got ext1=%s, ext2=%s, ext3=%s", ext1, ext2, ext3)
+	}
+
+	// Test URL with no extension
+	urlNoExt := "http://infinity.gives/series/wflx2/31916535/1334565?token=abc"
+	keyNoExt, extNoExt := getCacheKeyAndExt(urlNoExt)
+	if extNoExt != ".mkv" {
+		t.Errorf("Expected default '.mkv' extension when none is provided in path, got: %s", extNoExt)
+	}
+	if keyNoExt == key1 {
+		t.Errorf("Expected different key for different path, got same key %s", keyNoExt)
+	}
+}
+
+
 

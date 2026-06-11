@@ -91,12 +91,8 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Generate cache key (MD5 hash of URL)
-	key := fmt.Sprintf("%x", md5.Sum([]byte(targetURL)))
-	ext := filepath.Ext(targetURL)
-	if ext == "" {
-		ext = ".mkv" // default to mkv if extension cannot be determined
-	}
+	// Generate cache key and extension (stripping query parameters)
+	key, ext := getCacheKeyAndExt(targetURL)
 	cacheFileName := key + ext
 	cacheFilePath := filepath.Join(GlobalConfig.CacheDir, cacheFileName)
 
@@ -404,3 +400,31 @@ func (tr *trackingReader) Read(p []byte) (n int, err error) {
 	}
 	return n, err
 }
+
+func getCacheKeyAndExt(targetURL string) (string, string) {
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		// Fallback if URL parsing fails
+		key := fmt.Sprintf("%x", md5.Sum([]byte(targetURL)))
+		ext := filepath.Ext(targetURL)
+		if ext == "" {
+			ext = ".mkv"
+		}
+		// Strip query parameters from extension if present in fallback path
+		if idx := strings.Index(ext, "?"); idx != -1 {
+			ext = ext[:idx]
+		}
+		return key, ext
+	}
+
+	// Reconstruct the URL without query parameters or fragments
+	cleanURL := parsed.Scheme + "://" + parsed.Host + parsed.Path
+	key := fmt.Sprintf("%x", md5.Sum([]byte(cleanURL)))
+
+	ext := filepath.Ext(parsed.Path)
+	if ext == "" {
+		ext = ".mkv"
+	}
+	return key, ext
+}
+

@@ -10,10 +10,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
-var contentRangeRegex = regexp.MustCompile(`/(\d+)$`)
+var contentRangeRegex = regexp.MustCompile(`/(\d+)\s*$`)
 
 // Revalidate checks if a cached VOD has expired and probes the origin
 // to see if the file changed on the CDN.
@@ -65,7 +66,9 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	req.Header.Set("Range", "bytes=0-0")
 	if playerHeader != nil {
 		for k, vv := range playerHeader {
-			if k != "Range" && k != "Connection" && k != "Host" {
+			// Skip range, connection, host, accept-encoding, and conditional (If-*) headers
+			// to prevent them from interfering with retrieving the correct total file size.
+			if k != "Range" && k != "Connection" && k != "Host" && k != "Accept-Encoding" && !strings.HasPrefix(strings.ToLower(k), "if-") {
 				for _, v := range vv {
 					req.Header.Add(k, v)
 				}
@@ -102,7 +105,9 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	modified := false
 	reason := ""
 
-	if upstreamSize != meta.TotalSize {
+	// Only validate size if it is greater than 1. An upstreamSize of 1 or 0 usually indicates
+	// a parsed Content-Length of the single-byte range request due to a missing Content-Range header.
+	if upstreamSize > 1 && upstreamSize != meta.TotalSize {
 		modified = true
 		reason = fmt.Sprintf("file size changed (cached: %d, upstream: %d)", meta.TotalSize, upstreamSize)
 	} else if upstreamETag != "" && meta.ETag != "" && upstreamETag != meta.ETag {
