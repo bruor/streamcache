@@ -541,6 +541,8 @@
         const consoleEl = document.getElementById('console');
         const scrollBtn = document.getElementById('console-scroll-btn');
         let autoScrollEnabled = true;
+        let logLines = [];
+        const maxLogLines = 1000;
 
         // Listen for scroll events to toggle auto-scroll state
         consoleEl.addEventListener('scroll', () => {
@@ -564,8 +566,20 @@
         const connectionsCountEl = document.getElementById('connections-count');
 
         function appendLog(text) {
+            // Split incoming chunk by newline and append to rolling array
+            const newLines = text.split('\n');
+            logLines.push(...newLines);
+            
+            // Keep only the last 1000 lines
+            if (logLines.length > maxLogLines) {
+                logLines = logLines.slice(logLines.length - maxLogLines);
+            }
+
             const isAtBottom = (consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight) < 40;
-            consoleEl.innerText += text;
+            
+            // Update the DOM using textContent (substantially faster than innerText)
+            consoleEl.textContent = logLines.join('\n');
+            
             if (autoScrollEnabled && isAtBottom) {
                 consoleEl.scrollTop = consoleEl.scrollHeight;
             } else if (!autoScrollEnabled) {
@@ -580,7 +594,8 @@
         }
 
         function clearConsole() {
-            consoleEl.innerText = "";
+            logLines = [];
+            consoleEl.textContent = "";
             scrollBtn.style.display = 'none';
         }
 
