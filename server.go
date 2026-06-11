@@ -298,6 +298,13 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 				completed++
 			}
 		}
+
+		isCompleted := len(fileState.BlockStates) > 0 && completed == len(fileState.BlockStates)
+		if isCompleted {
+			fileState.Lock.Unlock()
+			continue
+		}
+
 		activeFiles = append(activeFiles, debugFile{
 			Key:           k,
 			URL:           fileState.URL,

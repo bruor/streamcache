@@ -128,6 +128,19 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 	for k, fileState := range GlobalRegistry.Files {
 		fileState.Lock.Lock()
 
+		// Skip completed files from active downloads list
+		isCompleted := len(fileState.BlockStates) > 0
+		for _, status := range fileState.BlockStates {
+			if status != BlockCompleted {
+				isCompleted = false
+				break
+			}
+		}
+		if isCompleted {
+			fileState.Lock.Unlock()
+			continue
+		}
+
 		// Deep copy block states array to prevent race conditions
 		blocks := make([]int, len(fileState.BlockStates))
 		copy(blocks, fileState.BlockStates)
