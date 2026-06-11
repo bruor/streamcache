@@ -124,12 +124,24 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 		}
 
-		// If no one is starving, find the next uncompleted block (sequential gap-filler)
+		// If no one is starving, find the next uncompleted block.
+		// Prefer starting the search from currentBlockIndex + 1 to download sequentially over the existing connection.
 		if targetBlock == -1 {
-			for i, status := range state.BlockStates {
-				if status != BlockCompleted {
-					targetBlock = i
-					break
+			if currentBlockIndex != -1 {
+				for i := currentBlockIndex + 1; i < len(state.BlockStates); i++ {
+					if state.BlockStates[i] != BlockCompleted {
+						targetBlock = i
+						break
+					}
+				}
+			}
+			// Fallback: search from the beginning of the file
+			if targetBlock == -1 {
+				for i, status := range state.BlockStates {
+					if status != BlockCompleted {
+						targetBlock = i
+						break
+					}
 				}
 			}
 		}
