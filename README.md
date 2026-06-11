@@ -76,6 +76,18 @@ If you have Docker installed, the easiest way to start the service is via Docker
    docker compose down
    ```
 
+#### Building from a Private GitHub Repository
+If you configure Docker Compose to pull the codebase directly from the remote private GitHub repository, you must authenticate using a GitHub Personal Access Token (PAT):
+1. **Create a PAT** with the following scope/permissions:
+   * **Fine-Grained PAT**: Select your repository and set `Contents: Read-only`.
+   * **Classic PAT**: Select the `repo` scope.
+2. **Build and Start**:
+   Export the token in your shell environment before running Compose:
+   ```bash
+   export GITHUB_TOKEN=your_personal_access_token
+   docker compose up -d --build
+   ```
+
 ---
 
 ## 📺 How to Use the Proxy
