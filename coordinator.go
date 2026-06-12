@@ -40,12 +40,17 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 		}
 
+		var fileToClose *os.File
 		shouldFinalize := len(state.Clients) == 0 && isCompleted && state.File != nil && !FileExists(state.Path)
 		if shouldFinalize {
-			_ = state.File.Close()
+			fileToClose = state.File
 			state.File = nil
 		}
 		state.Lock.Unlock()
+
+		if fileToClose != nil {
+			_ = fileToClose.Close()
+		}
 
 		if shouldFinalize {
 			err := os.Rename(state.PartPath, state.Path)

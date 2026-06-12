@@ -117,11 +117,13 @@ func (r *CacheReader) Close() error {
 func (r *CacheReader) finalizeCache() {
 	// Close write handle if open
 	r.state.Lock.Lock()
-	if r.state.File != nil {
-		_ = r.state.File.Close()
-		r.state.File = nil
-	}
+	fileToClose := r.state.File
+	r.state.File = nil
 	r.state.Lock.Unlock()
+
+	if fileToClose != nil {
+		_ = fileToClose.Close()
+	}
 
 	// Rename temporary file to final cache path
 	err := os.Rename(r.state.PartPath, r.state.Path)
