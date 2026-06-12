@@ -444,36 +444,15 @@ func getCacheKeyAndExt(targetURL string) (string, string) {
 }
 
 func migrateLegacyFile(legacyPath, newPath, targetURL string) error {
-	// 1. Get the legacy file's stat info (size and modification time)
-	stat, err := os.Stat(legacyPath)
-	if err != nil {
-		return err
-	}
-	legacySize := stat.Size()
-	modTime := stat.ModTime()
-
-	// 2. Rename the legacy file to the new path (with extension)
-	err = os.Rename(legacyPath, newPath)
+	// 1. Rename the legacy file to the new path (with extension)
+	err := os.Rename(legacyPath, newPath)
 	if err != nil {
 		return err
 	}
 
-	// 3. Create the initial companion metadata JSON
-	// We set LastValidated to the original modTime of the legacy file.
-	meta := FileMeta{
-		URL:           targetURL,
-		TotalSize:     legacySize,
-		LastValidated: modTime.Unix(),
-		Completed:     true,
-	}
-
-	metaBytes, err := json.Marshal(meta)
-	if err != nil {
-		return err
-	}
-
+	// 2. Create the companion metadata JSON using the shared helper
 	metaPath := newPath + ".json"
-	return os.WriteFile(metaPath, metaBytes, 0644)
+	return recreateMetadata(newPath, metaPath, targetURL)
 }
 
 
