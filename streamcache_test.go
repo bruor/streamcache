@@ -622,5 +622,64 @@ func TestURLSanitizationAndKeyGeneration(t *testing.T) {
 	}
 }
 
+func TestLegacyMigration(t *testing.T) {
+	// Prepare legacy file (no extension) in test cache
+	targetURL := "http://localhost/series/test_legacy.mkv"
+	key, ext := getCacheKeyAndExt(targetURL)
+	legacyPath := filepath.Join(GlobalConfig.CacheDir, key)
+	newPath := filepath.Join(GlobalConfig.CacheDir, key+ext)
+
+	// Write mock legacy file
+	legacyData := []byte("legacy video bytes content")
+	_ = os.WriteFile(legacyPath, legacyData, 0644)
+	defer os.Remove(legacyPath)
+	defer os.Remove(newPath)
+	defer os.Remove(newPath + ".json")
+
+	// Run migration helper
+	err := migrateLegacyFile(legacyPath, newPath, targetURL)
+	if err != nil {
+		t.Fatalf("Failed to run migrateLegacyFile: %v", err)
+	}
+
+	// Verify legacy file is moved/deleted
+	if FileExists(legacyPath) {
+		t.Errorf("Expected legacy file at %s to be moved/deleted, but it exists", legacyPath)
+	}
+
+	// Verify new file exists
+	if !FileExists(newPath) {
+		t.Errorf("Expected new file at %s to exist, but it does not", newPath)
+	}
+
+	// Verify metadata JSON exists and matches
+	metaPath := newPath + ".json"
+	if !FileExists(metaPath) {
+		t.Fatalf("Expected metadata file at %s to exist, but it does not", metaPath)
+	}
+
+	metaBytes, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("Failed to read metadata file: %v", err)
+	}
+
+	var meta FileMeta
+	err = json.Unmarshal(metaBytes, &meta)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal metadata JSON: %v", err)
+	}
+
+	if meta.URL != targetURL {
+		t.Errorf("Expected URL %s, got %s", targetURL, meta.URL)
+	}
+	if meta.TotalSize != int64(len(legacyData)) {
+		t.Errorf("Expected TotalSize %d, got %d", len(legacyData), meta.TotalSize)
+	}
+	if !meta.Completed {
+		t.Errorf("Expected Completed to be true, got false")
+	}
+}
+
+
 
 

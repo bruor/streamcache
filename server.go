@@ -97,6 +97,20 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	cacheFileName := key + ext
 	cacheFilePath := filepath.Join(GlobalConfig.CacheDir, cacheFileName)
 
+	// Check for legacy extension-less file if the new file is missing
+	if !FileExists(cacheFilePath) {
+		legacyFilePath := filepath.Join(GlobalConfig.CacheDir, key)
+		if FileExists(legacyFilePath) {
+			log.Printf("[Server] Legacy cache file detected for %s. Migrating...", key)
+			err := migrateLegacyFile(legacyFilePath, cacheFilePath, targetURL)
+			if err != nil {
+				log.Printf("[Server] Error migrating legacy file %s: %v", key, err)
+			} else {
+				log.Printf("[Server] Successfully migrated legacy cache: %s -> %s", key, cacheFileName)
+			}
+		}
+	}
+
 	// 3. Cache HIT Path with Revalidation
 	if FileExists(cacheFilePath) {
 		valid, err := Revalidate(cacheFileName, targetURL, r.Header)
@@ -428,4 +442,38 @@ func getCacheKeyAndExt(targetURL string) (string, string) {
 	}
 	return key, ext
 }
+
+func migrateLegacyFile(legacyPath, newPath, targetURL string) error {
+	// 1. Get the legacy file's stat info (size and modification time)
+	stat, err := os.Stat(legacyPath)
+	if err != nil {
+		return err
+	}
+	legacySize := stat.Size()
+	modTime := stat.ModTime()
+
+	// 2. Rename the legacy file to the new path (with extension)
+	err = os.Rename(legacyPath, newPath)
+	if err != nil {
+		return err
+	}
+
+	// 3. Create the initial companion metadata JSON
+	// We set LastValidated to the original modTime of the legacy file.
+	meta := FileMeta{
+		URL:           targetURL,
+		TotalSize:     legacySize,
+		LastValidated: modTime.Unix(),
+		Completed:     true,
+	}
+
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+
+	metaPath := newPath + ".json"
+	return os.WriteFile(metaPath, metaBytes, 0644)
+}
+
 
