@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -189,7 +190,7 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		return activeConnections[i].StartTime < activeConnections[j].StartTime
 	})
 
-	freeSpace, _ := GetDiskFreeSpace(GlobalConfig.CacheDir)
+	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
 		"total_cache_size_bytes": GlobalRegistry.TotalCacheSize,

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -73,6 +74,7 @@ type CacheRegistry struct {
 }
 
 var GlobalRegistry *CacheRegistry
+var GlobalDiskFreeBytes uint64
 
 func InitRegistry() {
 	GlobalRegistry = &CacheRegistry{
@@ -80,7 +82,23 @@ func InitRegistry() {
 		Connections: make(map[string]*ClientConnection),
 	}
 	GlobalRegistry.LoadExistingCache()
+
+	// Initial population of disk free space
+	space, _ := GetDiskFreeSpace(GlobalConfig.CacheDir)
+	atomic.StoreUint64(&GlobalDiskFreeBytes, space)
+	go startDiskFreeMonitor()
+
 	go GlobalRegistry.startSpeedMonitor()
+}
+
+func startDiskFreeMonitor() {
+	ticker := time.NewTicker(5 * time.Second)
+	for range ticker.C {
+		space, err := GetDiskFreeSpace(GlobalConfig.CacheDir)
+		if err == nil {
+			atomic.StoreUint64(&GlobalDiskFreeBytes, space)
+		}
+	}
 }
 
 func (r *CacheRegistry) startSpeedMonitor() {

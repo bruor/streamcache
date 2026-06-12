@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -339,7 +340,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		return activeConnections[i].StartTime < activeConnections[j].StartTime
 	})
 
-	freeSpace, _ := GetDiskFreeSpace(GlobalConfig.CacheDir)
+	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
 		"total_cache_size_bytes": GlobalRegistry.TotalCacheSize,
