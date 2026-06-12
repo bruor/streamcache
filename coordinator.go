@@ -40,8 +40,37 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 		}
 
+		// Try to finalize immediately on completion (works on Linux/Unix even with open file handles)
+		var immediateFinalize bool
+		if isCompleted && !FileExists(state.Path) {
+			err := os.Rename(state.PartPath, state.Path)
+			if err == nil {
+				immediateFinalize = true
+				// Save final metadata JSON confirming completion
+				metaPath := state.Path + ".json"
+				meta := FileMeta{
+					URL:           state.URL,
+					TotalSize:     state.TotalSize,
+					ETag:          state.ETag,
+					LastModified:  state.LastModified,
+					LastValidated: time.Now().Unix(),
+					Completed:     true,
+				}
+				newBytes, err := json.Marshal(meta)
+				if err == nil {
+					_ = os.WriteFile(metaPath, newBytes, 0644)
+				}
+				GlobalRegistry.Lock.Lock()
+				delete(GlobalRegistry.Files, state.Key)
+				GlobalRegistry.Lock.Unlock()
+				log.Printf("[Coord] Cached file finalized immediately on coordinator completion: %s", state.Key)
+			} else {
+				log.Printf("[Coord] Immediate finalize rename failed (likely Windows lock, deferring): %v", err)
+			}
+		}
+
 		var fileToClose *os.File
-		shouldFinalize := len(state.Clients) == 0 && isCompleted && state.File != nil && !FileExists(state.Path)
+		shouldFinalize := !immediateFinalize && len(state.Clients) == 0 && isCompleted && state.File != nil && !FileExists(state.Path)
 		if shouldFinalize {
 			fileToClose = state.File
 			state.File = nil
@@ -72,9 +101,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				GlobalRegistry.Lock.Lock()
 				delete(GlobalRegistry.Files, state.Key)
 				GlobalRegistry.Lock.Unlock()
-				log.Printf("[Coord] Cached file finalized on coordinator exit: %s", state.Key)
+				log.Printf("[Coord] Cached file finalized on coordinator exit (deferred): %s", state.Key)
 			} else {
-				log.Printf("[Coord] Error renaming cache file on coordinator exit: %v", err)
+				log.Printf("[Coord] Error renaming cache file on coordinator exit (deferred): %v", err)
 			}
 		}
 		log.Printf("[Coord] Exiting background coordinator for cache: %s", state.Key)

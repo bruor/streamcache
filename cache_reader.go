@@ -103,12 +103,22 @@ func (r *CacheReader) Close() error {
 	}
 
 	shouldFinalize := len(r.state.Clients) == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
+
+	// If the file was already finalized immediately by the coordinator,
+	// ensure the file handle is closed when the last client exits to prevent fd leaks.
+	var fileToClose *os.File
+	if len(r.state.Clients) == 0 && !r.state.WriterActive && r.state.File != nil && !shouldFinalize {
+		fileToClose = r.state.File
+		r.state.File = nil
+	}
 	r.state.Lock.Unlock()
 
 	GlobalRegistry.UnregisterConnection(r.clientID)
 
 	if shouldFinalize {
 		r.finalizeCache()
+	} else if fileToClose != nil {
+		_ = fileToClose.Close()
 	}
 
 	return nil
