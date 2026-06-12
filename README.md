@@ -13,6 +13,9 @@ It dynamically proxies video requests, downloads and caches content on-demand in
 - **Full Range Request Support**: Fully compatible with standard HTTP `Range` and `Accept-Ranges` headers. Video players can seek forward or backward smoothly.
 - **Smart Cache Eviction (LRU)**: Automatically frees cache space in real-time as chunks are downloaded when the cache size reaches the maximum threshold, or if the host machine's physical disk space drops below a safe limit.
 - **Upstream Cache Revalidation**: Periodically queries the upstream CDN (e.g. hourly) to check if the video file has been updated (via `ETag`/`Last-Modified`). If the upstream file changes, the local cache is automatically invalidated.
+- **Dynamic Metadata & Legacy Migration Recovery**: 
+  - *Legacy Cache Migration*: Automatically detects and migrates legacy cache files (extensionless `[key]` format) to the new cache standard (`[key].ext` and companion `.json` metadata file) on-demand when requested by a client.
+  - *Missing Metadata Recovery*: If a cached media file's companion `.json` metadata file is missing or deleted, the proxy dynamically regenerates it using the file's size and original disk modification time (`ModTime`) rather than evicting the file, ensuring seamless integration with the revalidation pipeline with zero redundant downloads.
 - **Dual Proxy Formats**: Supports query parameters (`/stream?url=...`) as well as clean, Base64-encoded URL paths (`/u/<base64_url>`).
 - **SSE Web Dashboard**: Includes a real-time web UI showing cache metrics, network stats, real-time CDN download speeds, smart log console scroll-locking, and active client connection details (tracking connection metadata, byte offset, and playback position percentage for downloaded and hydrating streams).
 

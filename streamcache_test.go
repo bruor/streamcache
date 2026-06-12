@@ -680,6 +680,78 @@ func TestLegacyMigration(t *testing.T) {
 	}
 }
 
+func TestRevalidateMissingMetadata(t *testing.T) {
+	// Prepare test file
+	targetURL := "http://localhost/series/test_reval.mkv"
+	key, ext := getCacheKeyAndExt(targetURL)
+	cacheFileName := key + ext
+	filePath := filepath.Join(GlobalConfig.CacheDir, cacheFileName)
+	metaPath := filePath + ".json"
+
+	// Ensure no leftover files
+	_ = os.Remove(filePath)
+	_ = os.Remove(metaPath)
+	defer os.Remove(filePath)
+	defer os.Remove(metaPath)
+
+	// Write mock cache file
+	fileData := []byte("some cache video bytes")
+	err := os.WriteFile(filePath, fileData, 0644)
+	if err != nil {
+		t.Fatalf("Failed to write mock cache file: %v", err)
+	}
+
+	// Verify metadata file does not exist initially
+	if FileExists(metaPath) {
+		t.Fatalf("Expected metadata file %s to not exist", metaPath)
+	}
+
+	// Save current revalidate interval and set it to a large value for this test
+	oldInterval := GlobalConfig.CacheRevalidateInterval
+	GlobalConfig.CacheRevalidateInterval = 1 * time.Hour
+	defer func() {
+		GlobalConfig.CacheRevalidateInterval = oldInterval
+	}()
+
+	// Run Revalidate. Since the metadata file is missing, it should recreate it dynamically.
+	// Since the recreation sets LastValidated to the file's ModTime (which is practically now),
+	// it will be within the 1-hour revalidation window, so it won't perform an HTTP probe.
+	valid, err := Revalidate(cacheFileName, targetURL, nil)
+	if err != nil {
+		t.Fatalf("Revalidate returned error: %v", err)
+	}
+	if !valid {
+		t.Errorf("Expected Revalidate to return true, got false")
+	}
+
+	// Verify metadata JSON has been recreated
+	if !FileExists(metaPath) {
+		t.Fatalf("Expected metadata file %s to have been recreated, but it does not exist", metaPath)
+	}
+
+	metaBytes, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("Failed to read recreated metadata: %v", err)
+	}
+
+	var meta FileMeta
+	err = json.Unmarshal(metaBytes, &meta)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal recreated metadata: %v", err)
+	}
+
+	if meta.URL != targetURL {
+		t.Errorf("Expected URL %s, got %s", targetURL, meta.URL)
+	}
+	if meta.TotalSize != int64(len(fileData)) {
+		t.Errorf("Expected TotalSize %d, got %d", len(fileData), meta.TotalSize)
+	}
+	if !meta.Completed {
+		t.Errorf("Expected Completed to be true, got false")
+	}
+}
+
+
 
 
 

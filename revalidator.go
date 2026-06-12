@@ -33,10 +33,20 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	// Read metadata
 	metaBytes, err := os.ReadFile(metaPath)
 	if err != nil {
-		// Video file exists but metadata is missing. Regard as invalid and recreate.
-		log.Printf("[Revalidate] Metadata missing for cached file %s. Evicting.", key)
-		evictCachedFile(filePath, metaPath)
-		return false, nil
+		// Video file exists but metadata is missing. Recreate it dynamically based on the file's ModTime.
+		log.Printf("[Revalidate] Metadata missing for cached file %s. Recreating from disk stat...", key)
+		err = recreateMetadata(filePath, metaPath, url)
+		if err != nil {
+			log.Printf("[Revalidate] Failed to recreate metadata for %s: %v. Evicting.", key, err)
+			evictCachedFile(filePath, metaPath)
+			return false, nil
+		}
+		// Read it back to continue validation
+		metaBytes, err = os.ReadFile(metaPath)
+		if err != nil {
+			evictCachedFile(filePath, metaPath)
+			return false, nil
+		}
 	}
 
 	var meta FileMeta
@@ -173,4 +183,25 @@ func parseTotalSizeFromHeaders(header http.Header) (int64, error) {
 	}
 
 	return 0, fmt.Errorf("unable to determine total size from headers")
+}
+
+func recreateMetadata(filePath, metaPath, url string) error {
+	stat, err := os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+
+	meta := FileMeta{
+		URL:           url,
+		TotalSize:     stat.Size(),
+		LastValidated: stat.ModTime().Unix(),
+		Completed:     true,
+	}
+
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(metaPath, metaBytes, 0644)
 }
