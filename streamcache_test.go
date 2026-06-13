@@ -751,6 +751,180 @@ func TestRevalidateMissingMetadata(t *testing.T) {
 	}
 }
 
+func TestIncompleteDownloadCleanup(t *testing.T) {
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	t.Run("incomplete_coordinator_exit_with_active_client", func(t *testing.T) {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = make(map[string]*FileCacheState)
+		GlobalRegistry.Lock.Unlock()
+
+		key := "test_incomplete_client.mkv"
+		state := &FileCacheState{
+			Key:          key,
+			URL:          "http://dummy",
+			Path:         filepath.Join(GlobalConfig.CacheDir, key),
+			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			TotalSize:    100,
+			TotalBlocks:  2,
+			BlockStates:  []int{BlockCompleted, BlockNotStarted}, // Incomplete
+			Clients:      make(map[string]chan struct{}),
+		}
+
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files[key] = state
+		GlobalRegistry.Lock.Unlock()
+
+		_ = os.WriteFile(state.PartPath, []byte("partial data"), 0644)
+		_ = os.WriteFile(state.MetaPath, []byte("{}"), 0644)
+
+		// Create client reader
+		reader := NewCacheReader(context.Background(), state, nil)
+
+		// Mock active coordinator exiting
+		state.Lock.Lock()
+		state.WriterActive = true
+		mockFile, _ := os.OpenFile(state.PartPath, os.O_RDWR, 0644)
+		state.File = mockFile
+		state.Lock.Unlock()
+
+		// Simulate coordinator exit: sets WriterActive=false, evaluates isCompleted=false
+		state.Lock.Lock()
+		state.WriterActive = false
+		var fileToClose *os.File
+		shouldCleanUpIncomplete := len(state.Clients) == 0
+		if shouldCleanUpIncomplete {
+			fileToClose = state.File
+			state.File = nil
+		}
+		state.Lock.Unlock()
+
+		if fileToClose != nil {
+			_ = fileToClose.Close()
+		}
+
+		// Since we have an active client, it should NOT clean up yet
+		if shouldCleanUpIncomplete {
+			t.Errorf("Expected shouldCleanUpIncomplete to be false because client is active")
+		}
+
+		// Verify files and registry entry still exist
+		if !FileExists(state.PartPath) {
+			t.Errorf("Expected part file to exist while client is active")
+		}
+
+		GlobalRegistry.Lock.Lock()
+		_, inRegistry := GlobalRegistry.Files[key]
+		GlobalRegistry.Lock.Unlock()
+		if !inRegistry {
+			t.Errorf("Expected file state to remain in registry while client is active")
+		}
+
+		// Now close the client reader. This should trigger the cleanup.
+		err := reader.Close()
+		if err != nil {
+			t.Fatalf("Reader Close failed: %v", err)
+		}
+
+		// Verify everything is deleted/cleaned up
+		if FileExists(state.PartPath) {
+			t.Errorf("Expected part file to be deleted on last client Close")
+		}
+		if FileExists(state.MetaPath) {
+			t.Errorf("Expected meta file to be deleted on last client Close")
+		}
+
+		GlobalRegistry.Lock.Lock()
+		_, inRegistry = GlobalRegistry.Files[key]
+		GlobalRegistry.Lock.Unlock()
+		if inRegistry {
+			t.Errorf("Expected file state to be removed from registry on last client Close")
+		}
+	})
+
+	t.Run("incomplete_coordinator_exit_no_active_client", func(t *testing.T) {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = make(map[string]*FileCacheState)
+		GlobalRegistry.Lock.Unlock()
+
+		key := "test_incomplete_no_client.mkv"
+		state := &FileCacheState{
+			Key:          key,
+			URL:          "http://dummy",
+			Path:         filepath.Join(GlobalConfig.CacheDir, key),
+			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			TotalSize:    100,
+			TotalBlocks:  2,
+			BlockStates:  []int{BlockCompleted, BlockNotStarted}, // Incomplete
+			Clients:      make(map[string]chan struct{}),
+		}
+
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files[key] = state
+		GlobalRegistry.Lock.Unlock()
+
+		_ = os.WriteFile(state.PartPath, []byte("partial data"), 0644)
+		_ = os.WriteFile(state.MetaPath, []byte("{}"), 0644)
+
+		state.Lock.Lock()
+		state.WriterActive = true
+		mockFile, _ := os.OpenFile(state.PartPath, os.O_RDWR, 0644)
+		state.File = mockFile
+		state.Lock.Unlock()
+
+		// Simulate coordinator exit: sets WriterActive=false, evaluates isCompleted=false
+		state.Lock.Lock()
+		state.WriterActive = false
+		var fileToClose *os.File
+		shouldCleanUpIncomplete := len(state.Clients) == 0
+		if shouldCleanUpIncomplete {
+			fileToClose = state.File
+			state.File = nil
+		}
+		state.Lock.Unlock()
+
+		if fileToClose != nil {
+			_ = fileToClose.Close()
+		}
+
+		if !shouldCleanUpIncomplete {
+			t.Errorf("Expected shouldCleanUpIncomplete to be true because no clients are active")
+		}
+
+		if shouldCleanUpIncomplete {
+			_ = os.Remove(state.PartPath)
+			_ = os.Remove(state.MetaPath)
+			GlobalRegistry.Lock.Lock()
+			delete(GlobalRegistry.Files, state.Key)
+			GlobalRegistry.Lock.Unlock()
+		}
+
+		// Verify everything is deleted/cleaned up immediately on coordinator exit
+		if FileExists(state.PartPath) {
+			t.Errorf("Expected part file to be deleted immediately")
+		}
+		if FileExists(state.MetaPath) {
+			t.Errorf("Expected meta file to be deleted immediately")
+		}
+
+		GlobalRegistry.Lock.Lock()
+		_, inRegistry := GlobalRegistry.Files[key]
+		GlobalRegistry.Lock.Unlock()
+		if inRegistry {
+			t.Errorf("Expected file state to be removed from registry immediately")
+		}
+	})
+}
+
 
 
 

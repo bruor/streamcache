@@ -103,6 +103,7 @@ func (r *CacheReader) Close() error {
 	}
 
 	shouldFinalize := len(r.state.Clients) == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
+	shouldCleanUpIncomplete := len(r.state.Clients) == 0 && !isCompleted && !r.state.WriterActive
 
 	// If the file was already finalized immediately by the coordinator,
 	// ensure the file handle is closed when the last client exits to prevent fd leaks.
@@ -117,8 +118,18 @@ func (r *CacheReader) Close() error {
 
 	if shouldFinalize {
 		r.finalizeCache()
-	} else if fileToClose != nil {
-		_ = fileToClose.Close()
+	} else {
+		if fileToClose != nil {
+			_ = fileToClose.Close()
+		}
+		if shouldCleanUpIncomplete {
+			_ = os.Remove(r.state.PartPath)
+			_ = os.Remove(r.state.MetaPath)
+			GlobalRegistry.Lock.Lock()
+			delete(GlobalRegistry.Files, r.state.Key)
+			GlobalRegistry.Lock.Unlock()
+			log.Printf("[Reader] Removed incomplete cache file on last client exit: %s", r.state.Key)
+		}
 	}
 
 	return nil

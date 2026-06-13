@@ -40,70 +40,97 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 		}
 
-		// Try to finalize immediately on completion (works on Linux/Unix even with open file handles)
-		var immediateFinalize bool
-		if isCompleted && !FileExists(state.Path) {
-			err := os.Rename(state.PartPath, state.Path)
-			if err == nil {
-				immediateFinalize = true
-				// Save final metadata JSON confirming completion
-				metaPath := state.Path + ".json"
-				meta := FileMeta{
-					URL:           state.URL,
-					TotalSize:     state.TotalSize,
-					ETag:          state.ETag,
-					LastModified:  state.LastModified,
-					LastValidated: time.Now().Unix(),
-					Completed:     true,
-				}
-				newBytes, err := json.Marshal(meta)
+		if isCompleted {
+			// Try to finalize immediately on completion
+			var immediateFinalize bool
+			if !FileExists(state.Path) {
+				// Unlock before performing OS operations and lock acquisitions
+				state.Lock.Unlock()
+				err := os.Rename(state.PartPath, state.Path)
 				if err == nil {
-					_ = os.WriteFile(metaPath, newBytes, 0644)
+					immediateFinalize = true
+					// Save final metadata JSON confirming completion
+					metaPath := state.Path + ".json"
+					meta := FileMeta{
+						URL:           state.URL,
+						TotalSize:     state.TotalSize,
+						ETag:          state.ETag,
+						LastModified:  state.LastModified,
+						LastValidated: time.Now().Unix(),
+						Completed:     true,
+					}
+					newBytes, err := json.Marshal(meta)
+					if err == nil {
+						_ = os.WriteFile(metaPath, newBytes, 0644)
+					}
+					GlobalRegistry.Lock.Lock()
+					delete(GlobalRegistry.Files, state.Key)
+					GlobalRegistry.Lock.Unlock()
+					log.Printf("[Coord] Cached file finalized immediately on coordinator completion: %s", state.Key)
+				} else {
+					log.Printf("[Coord] Immediate finalize rename failed (likely Windows lock, deferring): %v", err)
 				}
-				GlobalRegistry.Lock.Lock()
-				delete(GlobalRegistry.Files, state.Key)
-				GlobalRegistry.Lock.Unlock()
-				log.Printf("[Coord] Cached file finalized immediately on coordinator completion: %s", state.Key)
-			} else {
-				log.Printf("[Coord] Immediate finalize rename failed (likely Windows lock, deferring): %v", err)
+				state.Lock.Lock() // Relock to finish the evaluation of deferred paths
 			}
-		}
 
-		var fileToClose *os.File
-		shouldFinalize := !immediateFinalize && len(state.Clients) == 0 && isCompleted && state.File != nil && !FileExists(state.Path)
-		if shouldFinalize {
-			fileToClose = state.File
-			state.File = nil
-		}
-		state.Lock.Unlock()
+			var fileToClose *os.File
+			shouldFinalize := !immediateFinalize && len(state.Clients) == 0 && state.File != nil && !FileExists(state.Path)
+			if shouldFinalize {
+				fileToClose = state.File
+				state.File = nil
+			}
+			state.Lock.Unlock()
 
-		if fileToClose != nil {
-			_ = fileToClose.Close()
-		}
+			if fileToClose != nil {
+				_ = fileToClose.Close()
+			}
 
-		if shouldFinalize {
-			err := os.Rename(state.PartPath, state.Path)
-			if err == nil {
-				// Save final metadata JSON confirming completion
-				metaPath := state.Path + ".json"
-				meta := FileMeta{
-					URL:           state.URL,
-					TotalSize:     state.TotalSize,
-					ETag:          state.ETag,
-					LastModified:  state.LastModified,
-					LastValidated: time.Now().Unix(),
-					Completed:     true,
-				}
-				newBytes, err := json.Marshal(meta)
+			if shouldFinalize {
+				err := os.Rename(state.PartPath, state.Path)
 				if err == nil {
-					_ = os.WriteFile(metaPath, newBytes, 0644)
+					// Save final metadata JSON confirming completion
+					metaPath := state.Path + ".json"
+					meta := FileMeta{
+						URL:           state.URL,
+						TotalSize:     state.TotalSize,
+						ETag:          state.ETag,
+						LastModified:  state.LastModified,
+						LastValidated: time.Now().Unix(),
+						Completed:     true,
+					}
+					newBytes, err := json.Marshal(meta)
+					if err == nil {
+						_ = os.WriteFile(metaPath, newBytes, 0644)
+					}
+					GlobalRegistry.Lock.Lock()
+					delete(GlobalRegistry.Files, state.Key)
+					GlobalRegistry.Lock.Unlock()
+					log.Printf("[Coord] Cached file finalized on coordinator exit (deferred): %s", state.Key)
+				} else {
+					log.Printf("[Coord] Error renaming cache file on coordinator exit (deferred): %v", err)
 				}
+			}
+		} else {
+			// Incomplete download
+			var fileToClose *os.File
+			shouldCleanUpIncomplete := len(state.Clients) == 0
+			if shouldCleanUpIncomplete {
+				fileToClose = state.File
+				state.File = nil
+			}
+			state.Lock.Unlock()
+
+			if fileToClose != nil {
+				_ = fileToClose.Close()
+			}
+
+			if shouldCleanUpIncomplete {
+				_ = os.Remove(state.PartPath)
+				_ = os.Remove(state.MetaPath)
 				GlobalRegistry.Lock.Lock()
 				delete(GlobalRegistry.Files, state.Key)
 				GlobalRegistry.Lock.Unlock()
-				log.Printf("[Coord] Cached file finalized on coordinator exit (deferred): %s", state.Key)
-			} else {
-				log.Printf("[Coord] Error renaming cache file on coordinator exit (deferred): %v", err)
+				log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
 			}
 		}
 		log.Printf("[Coord] Exiting background coordinator for cache: %s", state.Key)

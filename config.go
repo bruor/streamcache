@@ -20,6 +20,7 @@ type Config struct {
 	SchedulerMinBytes        int64
 	SchedulerMinTime         time.Duration
 	DisableFadvise           bool
+	UpstreamReadTimeout      time.Duration
 }
 
 var GlobalConfig *Config
@@ -36,6 +37,7 @@ func LoadConfig() {
 		SchedulerMinBytes:       getEnvSize("SCHEDULER_MIN_BYTES", 16*1024*1024), // 16MB
 		SchedulerMinTime:        getEnvDuration("SCHEDULER_MIN_TIME", 2*time.Second),
 		DisableFadvise:          getEnvBool("DISABLE_FADVISE", false),
+		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 10*time.Second),
 	}
 
 	// Format port if missing colon
@@ -56,12 +58,13 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, DisableFadvise=%t",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.BlockSize/(1024*1024),
 		cfg.CacheMaxBytes/(1024*1024*1024),
 		cfg.MinDiskFreeBytes/(1024*1024*1024),
+		cfg.UpstreamReadTimeout,
 		cfg.DisableFadvise,
 	)
 }

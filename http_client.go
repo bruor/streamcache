@@ -79,5 +79,23 @@ func (d *netDialer) DialContext(ctx context.Context, network, address string) (n
 	var dialer net.Dialer
 	dialer.Timeout = d.Timeout
 	dialer.KeepAlive = d.KeepAlive
-	return dialer.DialContext(ctx, network, address)
+	conn, err := dialer.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	return &timeoutConn{Conn: conn, readTimeout: GlobalConfig.UpstreamReadTimeout}, nil
+}
+
+type timeoutConn struct {
+	net.Conn
+	readTimeout time.Duration
+}
+
+func (c *timeoutConn) Read(b []byte) (n int, err error) {
+	if c.readTimeout > 0 {
+		_ = c.SetReadDeadline(time.Now().Add(c.readTimeout))
+	}
+	n, err = c.Conn.Read(b)
+	_ = c.SetReadDeadline(time.Time{}) // clear deadline after read
+	return
 }
