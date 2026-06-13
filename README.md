@@ -12,6 +12,8 @@ It dynamically proxies video requests, downloads and caches content on-demand in
 - **Block-Based Starvation Scheduling**: The proxy coordinates downloads in blocks (default 2MB). If a player seeks to a different part of the video, the coordinator instantly shifts priority to download the missing block first. If all active clients (or the only client) are starving, it bypasses connection debouncing rules for an instant jump, ensuring zero playback latency.
 - **Full Range Request Support**: Fully compatible with standard HTTP `Range` and `Accept-Ranges` headers. Video players can seek forward or backward smoothly.
 - **Smart Cache Eviction (LRU)**: Automatically frees cache space in real-time as chunks are downloaded when the cache size reaches the maximum threshold, or if the host machine's physical disk space drops below a safe limit.
+- **Incomplete Download Garbage Collection**: If a background download is aborted or fails during runtime, the proxy automatically cleans up the incomplete `.part` file, deletes the companion JSON metadata, and clears the file from memory as soon as all clients disconnect, reclaiming disk space instantly.
+- **Upstream Connection Read Timeout**: Implements inactivity read timeouts at the socket layer to detect and break hung TCP connections, enabling aggressive, automated retries and failovers.
 - **Upstream Cache Revalidation**: Periodically queries the upstream CDN (e.g. hourly) to check if the video file has been updated (via `ETag`/`Last-Modified`). If the upstream file changes, the local cache is automatically invalidated.
 - **Dynamic Metadata & Legacy Migration Recovery**: 
   - *Legacy Cache Migration*: Automatically detects and migrates legacy cache files (extensionless `[key]` format) to the new cache standard (`[key].ext` and companion `.json` metadata file) on-demand when requested by a client.
@@ -37,6 +39,7 @@ Streamcache is configured using environment variables. Default fallback values a
 | `ALLOWED_HOSTS` | *(empty)* | Optional comma-separated list of domain names (e.g. `cdn.example.com`) to restrict which upstreams can be proxied. |
 | `SCHEDULER_MIN_BYTES` | `16MB` | Minimum bytes to download before the client starvation coordinator switches targets. Supports size units (e.g. `16MB`). Set to `0` or `none` to disable. |
 | `SCHEDULER_MIN_TIME` | `2s` | Minimum duration to stream a block before switching targets. Set to `0` or `none` to disable. |
+| `UPSTREAM_READ_TIMEOUT` | `10s` | Read timeout for upstream connections. Stalled reads from the CDN exceeding this duration are aborted and retried. |
 
 ---
 
