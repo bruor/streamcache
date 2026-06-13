@@ -8,7 +8,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
+)
+
+var (
+	coordinatorSleepMu sync.RWMutex
+	coordinatorSleepFn = time.Sleep
 )
 
 // StartCoordinator spawns the manager goroutine for a given file
@@ -161,6 +167,32 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	var connStartTime time.Time
 	var connBytesWritten int64
 
+	consecutiveFailures := 0
+	backoff := 2 * time.Second
+
+	handleFailure := func(isPermanent bool, errFormat string, args ...interface{}) bool {
+		log.Printf(errFormat, args...)
+		if isPermanent {
+			log.Printf("[Coord] Permanent failure encountered. Exiting coordinator for %s", state.Key)
+			return true // break/exit
+		}
+		consecutiveFailures++
+		if consecutiveFailures >= 8 {
+			log.Printf("[Coord] Maximum consecutive failures reached (8). Exiting coordinator for %s", state.Key)
+			return true // break/exit
+		}
+		log.Printf("[Coord] Retry %d/8. Sleeping %s before retrying...", consecutiveFailures, backoff)
+		coordinatorSleepMu.RLock()
+		sleepFn := coordinatorSleepFn
+		coordinatorSleepMu.RUnlock()
+		sleepFn(backoff)
+		backoff *= 2
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+		return false // do not break
+	}
+
 	// Helper to close upstream stream
 	closeUpstream := func() {
 		if activeRespBody != nil {
@@ -279,8 +311,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			req, err := http.NewRequestWithContext(context.Background(), "GET", state.URL, nil)
 			if err != nil {
 				state.Lock.Unlock()
-				log.Printf("[Coord] Error creating request: %v", err)
-				time.Sleep(1 * time.Second) // rate-limit retries
+				if handleFailure(false, "[Coord] Error creating request for %s: %v", state.Key, err) {
+					break
+				}
 				continue
 			}
 
@@ -307,21 +340,26 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			log.Printf("[Coord] Connecting upstream for block %d (Range: %s)", currentBlockIndex, rangeHeader)
 			resp, err := UpstreamHTTPClient.Do(req)
 			if err != nil {
-				log.Printf("[Coord] Upstream request failed: %v", err)
-				time.Sleep(1 * time.Second)
+				if handleFailure(false, "[Coord] Upstream request failed for %s: %v", state.Key, err) {
+					break
+				}
 				continue
 			}
 
 			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-				log.Printf("[Coord] Upstream returned error status: %d", resp.StatusCode)
 				_ = resp.Body.Close()
-				time.Sleep(1 * time.Second)
+				isPermanent := resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone
+				if handleFailure(isPermanent, "[Coord] Upstream returned error status %d for %s", resp.StatusCode, state.Key) {
+					break
+				}
 				continue
 			}
 
 			activeRespBody = resp.Body
 			currentUpstreamURL = resp.Request.URL.String()
 			log.Printf("[Coord] Connected successfully to CDN: %s", currentUpstreamURL)
+			consecutiveFailures = 0
+			backoff = 2 * time.Second
 			continue
 		}
 
@@ -423,6 +461,10 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 				// Update running cache size O(1)
 				GlobalRegistry.UpdateSize(int64(n))
+
+				// Reset consecutive failures and backoff on successful read
+				consecutiveFailures = 0
+				backoff = 2 * time.Second
 			}
 
 			if err != nil {
@@ -443,7 +485,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			state.Lock.Unlock()
 
 			closeUpstream()
-			time.Sleep(1 * time.Second)
+			if handleFailure(false, "[Coord] Download block %d failed for %s", currentBlockIndex, state.Key) {
+				break
+			}
 			continue
 		}
 

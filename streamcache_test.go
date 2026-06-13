@@ -925,6 +925,137 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 	})
 }
 
+func TestCoordinatorRetryTempering(t *testing.T) {
+	// Setup cache and tmp dirs
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	// Mock coordinator sleep to avoid actual delay in test execution
+	coordinatorSleepMu.Lock()
+	oldSleep := coordinatorSleepFn
+	coordinatorSleepFn = func(d time.Duration) {}
+	coordinatorSleepMu.Unlock()
+	defer func() {
+		coordinatorSleepMu.Lock()
+		coordinatorSleepFn = oldSleep
+		coordinatorSleepMu.Unlock()
+	}()
+
+	t.Run("permanent_403_fast_exit", func(t *testing.T) {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = make(map[string]*FileCacheState)
+		GlobalRegistry.Lock.Unlock()
+
+		// Server returns 403 Forbidden
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		}))
+		defer server.Close()
+
+		key := "test_403_fast_exit.mkv"
+		state := &FileCacheState{
+			Key:          key,
+			URL:          server.URL,
+			Path:         filepath.Join(GlobalConfig.CacheDir, key),
+			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			TotalSize:    100,
+			TotalBlocks:  2,
+			BlockStates:  []int{BlockNotStarted, BlockNotStarted},
+			Clients:      make(map[string]chan struct{}),
+			Starving:     make(map[string]int),
+			NotifyChan:   make(chan struct{}, 10),
+		}
+
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files[key] = state
+		GlobalRegistry.Lock.Unlock()
+
+		// Start coordinator
+		StartCoordinator(state, nil)
+
+		// Wait for coordinator to run and exit (should exit immediately on 403)
+		time.Sleep(50 * time.Millisecond)
+
+		state.Lock.Lock()
+		active := state.WriterActive
+		state.Lock.Unlock()
+
+		if active {
+			t.Errorf("Expected coordinator to exit immediately on 403, but it is still running")
+		}
+
+		// Since clients count is 0, the registry entry should be deleted on exit
+		GlobalRegistry.Lock.Lock()
+		_, inRegistry := GlobalRegistry.Files[key]
+		GlobalRegistry.Lock.Unlock()
+
+		if inRegistry {
+			t.Errorf("Expected registry entry to be cleaned up on coordinator exit")
+		}
+	})
+
+	t.Run("consecutive_failures_exhaustion_exit", func(t *testing.T) {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = make(map[string]*FileCacheState)
+		GlobalRegistry.Lock.Unlock()
+
+		// Server returns 500 Internal Server Error
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		key := "test_500_exhaustion.mkv"
+		state := &FileCacheState{
+			Key:          key,
+			URL:          server.URL,
+			Path:         filepath.Join(GlobalConfig.CacheDir, key),
+			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			TotalSize:    100,
+			TotalBlocks:  2,
+			BlockStates:  []int{BlockNotStarted, BlockNotStarted},
+			Clients:      make(map[string]chan struct{}),
+			Starving:     make(map[string]int),
+			NotifyChan:   make(chan struct{}, 10),
+		}
+
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files[key] = state
+		GlobalRegistry.Lock.Unlock()
+
+		// Start coordinator
+		StartCoordinator(state, nil)
+
+		// Wait for coordinator to run, fail 8 times (with mocked 0s sleep), and exit
+		time.Sleep(50 * time.Millisecond)
+
+		state.Lock.Lock()
+		active := state.WriterActive
+		state.Lock.Unlock()
+
+		if active {
+			t.Errorf("Expected coordinator to exit after 8 failures, but it is still running")
+		}
+
+		// Since clients count is 0, the registry entry should be deleted on exit
+		GlobalRegistry.Lock.Lock()
+		_, inRegistry := GlobalRegistry.Files[key]
+		GlobalRegistry.Lock.Unlock()
+
+		if inRegistry {
+			t.Errorf("Expected registry entry to be cleaned up after failure exit")
+		}
+	})
+}
+
 
 
 
