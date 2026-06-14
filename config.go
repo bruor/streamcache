@@ -37,7 +37,7 @@ func LoadConfig() {
 		SchedulerMinBytes:       getEnvSize("SCHEDULER_MIN_BYTES", 16*1024*1024), // 16MB
 		SchedulerMinTime:        getEnvDuration("SCHEDULER_MIN_TIME", 2*time.Second),
 		DisableFadvise:          getEnvBool("DISABLE_FADVISE", false),
-		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 10*time.Second),
+		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 30*time.Second),
 	}
 
 	// Format port if missing colon

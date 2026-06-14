@@ -36,6 +36,13 @@ func TestMain(m *testing.M) {
 	}
 	InitHTTPClient()
 
+	// Mock coordinator sleep in tests to prevent long delays
+	coordinatorSleepMu.Lock()
+	coordinatorSleepFn = func(d time.Duration) {
+		time.Sleep(1 * time.Millisecond)
+	}
+	coordinatorSleepMu.Unlock()
+
 	code := m.Run()
 
 	// Cleanup
@@ -77,6 +84,8 @@ func TestCacheReaderCancellation(t *testing.T) {
 }
 
 func TestOnDemandEviction(t *testing.T) {
+	defer cleanupAfterTest(t, nil)
+
 	// Clear registry size
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.TotalCacheSize = 0
@@ -139,6 +148,8 @@ func TestOnDemandEviction(t *testing.T) {
 }
 
 func TestRevalidationChangeDetection(t *testing.T) {
+	defer cleanupAfterTest(t, nil)
+
 	// Set up mock HTTP upstream server representing the IPTV CDN
 	mockETag := "etag-v1"
 	mockSize := int64(1000)
@@ -223,6 +234,7 @@ func TestDebouncedSchedulerTimeSlicing(t *testing.T) {
 		Starving:    make(map[string]int),
 		NotifyChan:  make(chan struct{}, 10),
 	}
+	defer cleanupAfterTest(t, state)
 
 	// Trigger Coordinator
 	StartCoordinator(state, nil)
@@ -318,6 +330,7 @@ func TestStarvationLoopPrevention(t *testing.T) {
 		Starving:    make(map[string]int),
 		NotifyChan:  make(chan struct{}, 10),
 	}
+	defer cleanupAfterTest(t, state)
 
 	state.Lock.Lock()
 	state.Clients["client-1"] = make(chan struct{}, 1)
@@ -379,6 +392,7 @@ func TestHeaderPropagation(t *testing.T) {
 		Starving:    make(map[string]int),
 		NotifyChan:  make(chan struct{}, 10),
 	}
+	defer cleanupAfterTest(t, state)
 
 	// 3. Create initial request headers simulating Chrome
 	chromeHeaders := make(http.Header)
@@ -436,6 +450,7 @@ func TestCacheFinalizationOrder(t *testing.T) {
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
+	defer cleanupAfterTest(t, nil)
 
 	// 1. Test case: client Close() occurs AFTER coordinator exits
 	t.Run("client_close_after_coordinator_exit", func(t *testing.T) {
@@ -760,6 +775,7 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
+	defer cleanupAfterTest(t, nil)
 
 	t.Run("incomplete_coordinator_exit_with_active_client", func(t *testing.T) {
 		GlobalRegistry.Lock.Lock()
@@ -935,6 +951,7 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
+	defer cleanupAfterTest(t, nil)
 
 	// Mock coordinator sleep to avoid actual delay in test execution
 	coordinatorSleepMu.Lock()
@@ -981,7 +998,15 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 		StartCoordinator(state, nil)
 
 		// Wait for coordinator to run and exit (should exit immediately on 403)
-		time.Sleep(50 * time.Millisecond)
+		for i := 0; i < 100; i++ {
+			state.Lock.Lock()
+			active := state.WriterActive
+			state.Lock.Unlock()
+			if !active {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 
 		state.Lock.Lock()
 		active := state.WriterActive
@@ -1035,7 +1060,15 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 		StartCoordinator(state, nil)
 
 		// Wait for coordinator to run, fail 8 times (with mocked 0s sleep), and exit
-		time.Sleep(50 * time.Millisecond)
+		for i := 0; i < 100; i++ {
+			state.Lock.Lock()
+			active := state.WriterActive
+			state.Lock.Unlock()
+			if !active {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 
 		state.Lock.Lock()
 		active := state.WriterActive
@@ -1054,6 +1087,141 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 			t.Errorf("Expected registry entry to be cleaned up after failure exit")
 		}
 	})
+}
+
+func TestCoordinatorNoBlockSkippingOnFailure(t *testing.T) {
+	// Setup cache and tmp dirs
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	// Mock coordinator sleep to avoid actual delay in test execution
+	coordinatorSleepMu.Lock()
+	oldSleep := coordinatorSleepFn
+	coordinatorSleepFn = func(d time.Duration) {}
+	coordinatorSleepMu.Unlock()
+	defer func() {
+		coordinatorSleepMu.Lock()
+		coordinatorSleepFn = oldSleep
+		coordinatorSleepMu.Unlock()
+	}()
+
+	// Mock server that returns a 500 on the very first request, and then succeeds
+	var lock sync.Mutex
+	var requestedRanges []string
+	var requestCount int
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		requestCount++
+		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		count := requestCount
+		lock.Unlock()
+
+		if count == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Range", "bytes 0-99/200")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 100))
+	}))
+	defer server.Close()
+
+	key := "test_no_skipping.mkv"
+	state := &FileCacheState{
+		Key:          key,
+		URL:          server.URL,
+		Path:         filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:    200,
+		TotalBlocks:  2,
+		BlockStates:  []int{BlockNotStarted, BlockNotStarted},
+		Clients:      make(map[string]chan struct{}),
+		Starving:     make(map[string]int),
+		NotifyChan:   make(chan struct{}, 10),
+	}
+	defer cleanupAfterTest(t, state)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	// Start coordinator
+	StartCoordinator(state, nil)
+
+	// Wait for coordinator to run, fail once, and reconnect
+	time.Sleep(100 * time.Millisecond)
+
+	lock.Lock()
+	ranges := make([]string, len(requestedRanges))
+	copy(ranges, requestedRanges)
+	lock.Unlock()
+
+	// We expect at least two requests:
+	// First request: bytes=0-199
+	// Second request: bytes=0-199 (NOT bytes=100-199, which would skip block 0!)
+	if len(ranges) < 2 {
+		t.Fatalf("Expected at least 2 requests, got %d", len(ranges))
+	}
+
+	if ranges[0] != "bytes=0-199" {
+		t.Errorf("Expected first request range to be bytes=0-199, got %s", ranges[0])
+	}
+	if ranges[1] != "bytes=0-199" {
+		t.Errorf("Expected second request range to be bytes=0-199 (retrying block 0), got %s (indicates block skipping!)", ranges[1])
+	}
+}
+
+func cleanupAfterTest(t *testing.T, state *FileCacheState) {
+	// If a coordinator was started for this state, wait for it to exit
+	if state != nil {
+		// Wait up to 1 second for coordinator to exit
+		deadline := time.Now().Add(1 * time.Second)
+		for time.Now().Before(deadline) {
+			state.Lock.Lock()
+			active := state.WriterActive
+			state.Lock.Unlock()
+			if !active {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		state.Lock.Lock()
+		active := state.WriterActive
+		state.Lock.Unlock()
+		if active {
+			t.Logf("Warning: Coordinator for %s did not exit in time", state.Key)
+		}
+	}
+
+	// Wait up to 1 second for eviction to finish
+	deadlineEvict := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadlineEvict) {
+		GlobalRegistry.Lock.Lock()
+		evicting := GlobalRegistry.Evicting
+		GlobalRegistry.Lock.Unlock()
+		if !evicting {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Clean up registry
+	GlobalRegistry.Lock.Lock()
+	if state != nil {
+		delete(GlobalRegistry.Files, state.Key)
+	}
+	// Also clear registry of other test files to be safe
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	GlobalRegistry.Lock.Unlock()
 }
 
 

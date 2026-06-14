@@ -222,7 +222,8 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		// If no one is starving, find the next uncompleted block.
 		// Prefer starting the search from currentBlockIndex + 1 to download sequentially over the existing connection.
 		if targetBlock == -1 {
-			if currentBlockIndex != -1 {
+			// If we have an active connection, prefer downloading sequentially from currentBlockIndex + 1
+			if activeRespBody != nil && currentBlockIndex != -1 {
 				for i := currentBlockIndex + 1; i < len(state.BlockStates); i++ {
 					if state.BlockStates[i] != BlockCompleted {
 						targetBlock = i
@@ -230,7 +231,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 					}
 				}
 			}
-			// Fallback: search from the beginning of the file
+			// Fallback: search from the beginning of the file (always used if we don't have an active connection)
 			if targetBlock == -1 {
 				for i, status := range state.BlockStates {
 					if status != BlockCompleted {
@@ -468,8 +469,8 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 
 			if err != nil {
-				if err != io.EOF && blockBytesWritten < blockLength {
-					log.Printf("[Coord] Upstream read error: %v", err)
+				if blockBytesWritten < blockLength {
+					log.Printf("[Coord] Upstream read error (premature EOF or error): %v", err)
 					blockFailed = true
 				}
 				closeUpstream()
