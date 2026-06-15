@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -98,4 +101,61 @@ func (c *timeoutConn) Read(b []byte) (n int, err error) {
 	n, err = c.Conn.Read(b)
 	_ = c.SetReadDeadline(time.Time{}) // clear deadline after read
 	return
+}
+
+type ProbeMethod string
+
+const (
+	ProbeMethodRange    ProbeMethod = "range"
+	ProbeMethodStandard ProbeMethod = "standard"
+)
+
+var (
+	probeMethodsMu sync.RWMutex
+	probeMethods   = make(map[string]ProbeMethod)
+)
+
+func GetProbeMethod(host string) ProbeMethod {
+	if host == "" {
+		return ProbeMethodRange
+	}
+	probeMethodsMu.RLock()
+	defer probeMethodsMu.RUnlock()
+	if method, exists := probeMethods[host]; exists {
+		return method
+	}
+	return ProbeMethodRange
+}
+
+func SetProbeMethod(host string, method ProbeMethod) {
+	if host == "" {
+		return
+	}
+	probeMethodsMu.Lock()
+	defer probeMethodsMu.Unlock()
+	probeMethods[host] = method
+}
+
+func GetCleanHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	host := parsed.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return host
+}
+
+func CopySafeHeaders(src, dst http.Header) {
+	for k, vv := range src {
+		kLower := strings.ToLower(k)
+		if kLower == "range" || kLower == "connection" || kLower == "host" || kLower == "accept-encoding" || strings.HasPrefix(kLower, "if-") {
+			continue
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
 }

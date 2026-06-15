@@ -172,45 +172,12 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 		// Probe the upstream CDN to fetch total size, ETag, and Last-Modified headers
 		log.Printf("[Server] Cache MISS for %s. Probing upstream CDN for metadata...", key)
-		req, err := http.NewRequestWithContext(r.Context(), "GET", targetURL, nil)
-		if err != nil {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-
-		req.Header.Set("Range", "bytes=0-0")
-		// Clone headers from client
-		for k, vv := range r.Header {
-			if k != "Range" && k != "Connection" && k != "Host" {
-				for _, v := range vv {
-					req.Header.Add(k, v)
-				}
-			}
-		}
-
-		resp, err := UpstreamHTTPClient.Do(req)
+		totalSize, etag, lastMod, _, err := probeUpstream(r.Context(), targetURL, r.Header, nil)
 		if err != nil {
 			log.Printf("[Server] Upstream probe failed: %v", err)
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-			log.Printf("[Server] Upstream probe returned status %d", resp.StatusCode)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-			return
-		}
-
-		totalSize, err := parseTotalSizeFromHeaders(resp.Header)
-		if err != nil {
-			log.Printf("[Server] Could not determine total size of upstream file: %v", err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-			return
-		}
-
-		etag := resp.Header.Get("ETag")
-		lastMod := resp.Header.Get("Last-Modified")
 
 		// Create metadata companion file
 		metaPath := cacheFilePath + ".json"

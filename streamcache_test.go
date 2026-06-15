@@ -1224,6 +1224,104 @@ func cleanupAfterTest(t *testing.T, state *FileCacheState) {
 	GlobalRegistry.Lock.Unlock()
 }
 
+func TestRobustProbe(t *testing.T) {
+	// 1. Test GetCleanHost and CopySafeHeaders
+	rawURL := "http://example.com:8080/some/path?query=1"
+	if host := GetCleanHost(rawURL); host != "example.com" {
+		t.Errorf("GetCleanHost failed: expected 'example.com', got %q", host)
+	}
+
+	srcHeaders := http.Header{}
+	srcHeaders.Set("Range", "bytes=100-200")
+	srcHeaders.Set("Connection", "keep-alive")
+	srcHeaders.Set("Host", "example.com")
+	srcHeaders.Set("Accept-Encoding", "gzip")
+	srcHeaders.Set("If-None-Match", "etag123")
+	srcHeaders.Set("User-Agent", "my-player")
+	srcHeaders.Set("X-Custom", "val")
+
+	dstHeaders := http.Header{}
+	CopySafeHeaders(srcHeaders, dstHeaders)
+
+	if dstHeaders.Get("Range") != "" || dstHeaders.Get("Connection") != "" || dstHeaders.Get("Host") != "" || dstHeaders.Get("Accept-Encoding") != "" || dstHeaders.Get("If-None-Match") != "" {
+		t.Errorf("CopySafeHeaders did not strip forbidden headers: %v", dstHeaders)
+	}
+	if dstHeaders.Get("User-Agent") != "my-player" || dstHeaders.Get("X-Custom") != "val" {
+		t.Errorf("CopySafeHeaders did not preserve safe headers: %v", dstHeaders)
+	}
+
+	// 2. Test Probe Fallback behavior
+	// Mock server that returns 403 Forbidden for Range requests, but returns 200 OK for standard requests.
+	var lock sync.Mutex
+	var requestCount int
+	var rangeHeaders []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		requestCount++
+		rangeHeaders = append(rangeHeaders, r.Header.Get("Range"))
+		lock.Unlock()
+
+		if r.Header.Get("Range") != "" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Length", "5000")
+		w.Header().Set("ETag", "test-etag")
+		w.Header().Set("Last-Modified", "test-lm")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// Perform the probe
+	ctx := context.Background()
+	size, etag, lm, notModified, err := probeUpstream(ctx, server.URL, nil, nil)
+	if err != nil {
+		t.Fatalf("probeUpstream failed: %v", err)
+	}
+
+	if size != 5000 {
+		t.Errorf("Expected size 5000, got %d", size)
+	}
+	if etag != "test-etag" {
+		t.Errorf("Expected etag 'test-etag', got %q", etag)
+	}
+	if lm != "test-lm" {
+		t.Errorf("Expected lm 'test-lm', got %q", lm)
+	}
+	if notModified {
+		t.Errorf("Expected notModified false, got true")
+	}
+
+	// Check that learning cache recorded standard probe preferred method
+	host := GetCleanHost(server.URL)
+	if pref := GetProbeMethod(host); pref != ProbeMethodStandard {
+		t.Errorf("Expected preferred method to be standard, got %s", pref)
+	}
+
+	// Make another probe request to the same server. Since standard GET is preferred now,
+	// it should go straight to standard probe and NOT send any range requests this time.
+	lock.Lock()
+	requestCountBefore := requestCount
+	lock.Unlock()
+
+	size2, _, _, _, err := probeUpstream(ctx, server.URL, nil, nil)
+	if err != nil {
+		t.Fatalf("second probeUpstream failed: %v", err)
+	}
+	if size2 != 5000 {
+		t.Errorf("Expected second probe size 5000, got %d", size2)
+	}
+
+	lock.Lock()
+	diff := requestCount - requestCountBefore
+	lock.Unlock()
+
+	if diff != 1 {
+		t.Errorf("Expected exactly 1 request for the cached host, got %d", diff)
+	}
+}
+
+
 
 
 
