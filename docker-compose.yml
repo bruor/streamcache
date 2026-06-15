@@ -32,5 +32,14 @@ services:
       # Cache change validation period
       - CACHE_REVALIDATE_INTERVAL=1h
       
+      # Timeout for stalled upstream reads (e.g. 30s)
+      - UPSTREAM_READ_TIMEOUT=30s
+      
+      # Maximum concurrent upstream downloader threads per VOD file
+      - MAX_UPSTREAM_WORKERS=2
+      
+      # Duration the proxy waits for active hydration progress to catch up before spawning a new connection
+      - CLIENT_HYDRATION_WAIT=2s
+      
       # Option to restrict domains allowed through the proxy (comma-separated list)
       # - ALLOWED_HOSTS=infinity.gives

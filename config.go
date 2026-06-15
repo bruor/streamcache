@@ -21,6 +21,8 @@ type Config struct {
 	SchedulerMinTime         time.Duration
 	DisableFadvise           bool
 	UpstreamReadTimeout      time.Duration
+	MaxUpstreamWorkers       int
+	ClientHydrationWait      time.Duration
 }
 
 var GlobalConfig *Config
@@ -38,6 +40,8 @@ func LoadConfig() {
 		SchedulerMinTime:        getEnvDuration("SCHEDULER_MIN_TIME", 2*time.Second),
 		DisableFadvise:          getEnvBool("DISABLE_FADVISE", false),
 		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 30*time.Second),
+		MaxUpstreamWorkers:      getEnvInt("MAX_UPSTREAM_WORKERS", 2),
+		ClientHydrationWait:     getEnvDuration("CLIENT_HYDRATION_WAIT", 2*time.Second),
 	}
 
 	// Format port if missing colon
@@ -58,7 +62,7 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.BlockSize/(1024*1024),
@@ -66,6 +70,8 @@ func LoadConfig() {
 		cfg.MinDiskFreeBytes/(1024*1024*1024),
 		cfg.UpstreamReadTimeout,
 		cfg.DisableFadvise,
+		cfg.MaxUpstreamWorkers,
+		cfg.ClientHydrationWait,
 	)
 }
 
@@ -147,4 +153,17 @@ func getEnvBool(key string, fallback bool) bool {
 	}
 	valStr = strings.TrimSpace(strings.ToLower(valStr))
 	return valStr == "true" || valStr == "1" || valStr == "yes" || valStr == "on"
+}
+
+func getEnvInt(key string, fallback int) int {
+	valStr, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback
+	}
+	val, err := strconv.Atoi(valStr)
+	if err != nil {
+		log.Printf("[Config] Warning: Invalid integer value for %s: %s. Using default %d", key, valStr, fallback)
+		return fallback
+	}
+	return val
 }

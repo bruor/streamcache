@@ -1321,6 +1321,115 @@ func TestRobustProbe(t *testing.T) {
 	}
 }
 
+func TestConcurrentUpstreamWorkers(t *testing.T) {
+	// Set up directories
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	tmpDir, err := os.MkdirTemp("", "sc-test-concurrent-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	// Save and mock config
+	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldWait := GlobalConfig.ClientHydrationWait
+	oldBlockSize := GlobalConfig.BlockSize
+	GlobalConfig.MaxUpstreamWorkers = 2
+	GlobalConfig.ClientHydrationWait = 0 // Disable wait to trigger instant spawn for seek
+	GlobalConfig.BlockSize = 100         // Block size 100 bytes
+
+	defer func() {
+		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
+		GlobalConfig.ClientHydrationWait = oldWait
+		GlobalConfig.BlockSize = oldBlockSize
+	}()
+
+	// Mock server
+	var lock sync.Mutex
+	var requestedRanges []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		lock.Unlock()
+
+		w.Header().Set("Content-Range", "bytes 0-99/400") // total size 400
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 100))
+	}))
+	defer server.Close()
+
+	key := "test_concurrent.mkv"
+	state := &FileCacheState{
+		Key:          key,
+		URL:          server.URL,
+		Path:         filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:    400,
+		TotalBlocks:  4, // 4 blocks of size 100
+		BlockStates:  []int{BlockNotStarted, BlockNotStarted, BlockNotStarted, BlockNotStarted},
+		Clients:      make(map[string]chan struct{}),
+		Starving:     make(map[string]int),
+		NotifyChan:   make(chan struct{}, 10),
+	}
+	defer cleanupAfterTest(t, state)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	// 1. Start coordinator. It will automatically spawn worker 1 starting at block 0.
+	StartCoordinator(state, nil)
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Simulate client starvation for block 3 (seek to block 3)
+	state.Lock.Lock()
+	state.Starving["client-test"] = 3
+	state.Lock.Unlock()
+
+	select {
+	case state.NotifyChan <- struct{}{}:
+	default:
+	}
+
+	// Wait for coordinator to detect starvation and spawn worker 2
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify that multiple ranges were requested concurrently
+	lock.Lock()
+	ranges := make([]string, len(requestedRanges))
+	copy(ranges, requestedRanges)
+	lock.Unlock()
+
+	if len(ranges) < 2 {
+		t.Fatalf("Expected at least 2 range requests, got %d. Ranges: %v", len(ranges), ranges)
+	}
+
+	// We expect one worker to request from block 0 (bytes=0-399) and another from block 3 (bytes=300-399)
+	hasStart := false
+	hasEnd := false
+	for _, r := range ranges {
+		if r == "bytes=0-399" {
+			hasStart = true
+		}
+		if r == "bytes=300-399" {
+			hasEnd = true
+		}
+	}
+
+	if !hasStart || !hasEnd {
+		t.Errorf("Expected requests starting at block 0 (bytes=0-399) and block 3 (bytes=300-399). Got: %v", ranges)
+	}
+}
+
 
 
 

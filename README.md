@@ -45,6 +45,8 @@ Streamcache is configured using environment variables. Default fallback values a
 | `SCHEDULER_MIN_BYTES` | `16MB` | Minimum bytes to download before the client starvation coordinator switches targets. Supports size units (e.g. `16MB`). Set to `0` or `none` to disable. |
 | `SCHEDULER_MIN_TIME` | `2s` | Minimum duration to stream a block before switching targets. Set to `0` or `none` to disable. |
 | `UPSTREAM_READ_TIMEOUT` | `30s` | Read timeout for upstream connections. Stalled reads from the CDN exceeding this duration are aborted and retried. |
+| `MAX_UPSTREAM_WORKERS` | `2` | Maximum concurrent upstream downloader threads per VOD file. |
+| `CLIENT_HYDRATION_WAIT` | `2s` | Duration the proxy waits for active hydration to catch up before spawning a new connection (Jump Suppression). |
 
 ---
 
