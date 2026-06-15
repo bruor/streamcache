@@ -236,6 +236,16 @@ func TestDebouncedSchedulerTimeSlicing(t *testing.T) {
 	}
 	defer cleanupAfterTest(t, state)
 
+	// Set debouncer to 0 to trigger instant preemption in single-worker setup
+	oldMinBytes := GlobalConfig.SchedulerMinBytes
+	oldMinTime := GlobalConfig.SchedulerMinTime
+	GlobalConfig.SchedulerMinBytes = 0
+	GlobalConfig.SchedulerMinTime = 0
+	defer func() {
+		GlobalConfig.SchedulerMinBytes = oldMinBytes
+		GlobalConfig.SchedulerMinTime = oldMinTime
+	}()
+
 	// Trigger Coordinator
 	StartCoordinator(state, nil)
 	time.Sleep(20 * time.Millisecond) // Let it connect

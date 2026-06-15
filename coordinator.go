@@ -362,33 +362,22 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						
 						for _, w := range activeWorkers {
 							wCurrent := w.currentBlock
-							isWorkerDownloadingStarveBlock := false
-							for _, clientStarveBlock := range state.Starving {
-								if clientStarveBlock == wCurrent {
-									isWorkerDownloadingStarveBlock = true
-									break
-								}
+							
+							// Check debouncer always to protect CDN from connection thrashing
+							connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
+							connBytes := atomic.LoadInt64(&w.connBytesWritten)
+							var elapsed time.Duration
+							if connStartNano > 0 {
+								elapsed = time.Since(time.Unix(0, connStartNano))
 							}
 							
 							eligible := false
-							if !isWorkerDownloadingStarveBlock {
+							if GlobalConfig.SchedulerMinTime <= 0 && GlobalConfig.SchedulerMinBytes <= 0 {
 								eligible = true
 							} else {
-								// Check debouncer
-								connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
-								connBytes := atomic.LoadInt64(&w.connBytesWritten)
-								var elapsed time.Duration
-								if connStartNano > 0 {
-									elapsed = time.Since(time.Unix(0, connStartNano))
-								}
-								
-								if GlobalConfig.SchedulerMinTime <= 0 && GlobalConfig.SchedulerMinBytes <= 0 {
-									eligible = true
-								} else {
-									timeOk := GlobalConfig.SchedulerMinTime > 0 && elapsed >= GlobalConfig.SchedulerMinTime
-									bytesOk := GlobalConfig.SchedulerMinBytes > 0 && connBytes >= GlobalConfig.SchedulerMinBytes
-									eligible = timeOk || bytesOk
-								}
+								timeOk := GlobalConfig.SchedulerMinTime > 0 && elapsed >= GlobalConfig.SchedulerMinTime
+								bytesOk := GlobalConfig.SchedulerMinBytes > 0 && connBytes >= GlobalConfig.SchedulerMinBytes
+								eligible = timeOk || bytesOk
 							}
 
 							if eligible {
