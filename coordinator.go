@@ -47,6 +47,12 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		}
 
 		if isCompleted {
+			state.UpstreamStatus = "Completed"
+		} else {
+			state.UpstreamStatus = "Idle"
+		}
+
+		if isCompleted {
 			// Try to finalize immediately on completion
 			var immediateFinalize bool
 			if !FileExists(state.Path) {
@@ -182,6 +188,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			return true // break/exit
 		}
 		log.Printf("[Coord] Retry %d/8. Sleeping %s before retrying...", consecutiveFailures, backoff)
+		state.Lock.Lock()
+		state.UpstreamStatus = "Throttled"
+		state.Lock.Unlock()
 		coordinatorSleepMu.RLock()
 		sleepFn := coordinatorSleepFn
 		coordinatorSleepMu.RUnlock()
@@ -336,6 +345,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				req.Header.Set("Accept", "*/*")
 			}
 
+			state.UpstreamStatus = "Connecting"
 			state.Lock.Unlock()
 
 			log.Printf("[Coord] Connecting upstream for block %d (Range: %s)", currentBlockIndex, rangeHeader)
@@ -359,6 +369,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			activeRespBody = resp.Body
 			currentUpstreamURL = resp.Request.URL.String()
 			log.Printf("[Coord] Connected successfully to CDN: %s", currentUpstreamURL)
+			state.Lock.Lock()
+			state.UpstreamStatus = "Downloading"
+			state.Lock.Unlock()
 			consecutiveFailures = 0
 			backoff = 2 * time.Second
 			continue

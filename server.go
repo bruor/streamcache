@@ -221,20 +221,21 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 		// Create FileCacheState
 		state = &FileCacheState{
-			Key:           cacheFileName,
-			URL:           targetURL,
-			Path:          cacheFilePath,
-			PartPath:      partPath,
-			MetaPath:      metaPath,
-			TotalSize:     totalSize,
-			TotalBlocks:   totalBlocks,
-			BlockStates:   blockStates,
-			ETag:          etag,
-			LastModified:  lastMod,
-			LastValidated: time.Now().Unix(),
-			Clients:       make(map[string]chan struct{}),
-			Starving:      make(map[string]int),
-			NotifyChan:    make(chan struct{}, 10),
+			Key:            cacheFileName,
+			URL:            targetURL,
+			Path:           cacheFilePath,
+			PartPath:       partPath,
+			MetaPath:       metaPath,
+			TotalSize:      totalSize,
+			TotalBlocks:    totalBlocks,
+			BlockStates:    blockStates,
+			ETag:           etag,
+			LastModified:   lastMod,
+			LastValidated:  time.Now().Unix(),
+			Clients:        make(map[string]chan struct{}),
+			Starving:       make(map[string]int),
+			NotifyChan:     make(chan struct{}, 10),
+			UpstreamStatus: "Idle",
 		}
 
 		// Save initial sparse metadata

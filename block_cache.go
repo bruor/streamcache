@@ -63,6 +63,7 @@ type FileCacheState struct {
 	NotifyChan   chan struct{}  // Channel to wake coordinator on client starvation
 	BytesDownloadedSec int64
 	DownloadSpeed      int64
+	UpstreamStatus     string
 }
 
 type CacheRegistry struct {

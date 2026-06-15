@@ -427,6 +427,52 @@
             100% { box-shadow: 0 0 0 0 rgba(255, 159, 28, 0); }
         }
 
+        .upstream-status-badge {
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+
+        .upstream-status-badge.connecting {
+            background: rgba(255, 159, 28, 0.1);
+            color: var(--accent-orange);
+            border: 1px solid rgba(255, 159, 28, 0.3);
+        }
+
+        .upstream-status-badge.downloading {
+            background: rgba(0, 240, 255, 0.1);
+            color: var(--accent-secondary);
+            border: 1px solid rgba(0, 240, 245, 0.3);
+        }
+
+        .upstream-status-badge.throttled {
+            background: rgba(255, 0, 0, 0.15);
+            color: #ff4a4a;
+            border: 1px solid rgba(255, 0, 0, 0.3);
+            animation: pulse-glow-red 1.5s infinite;
+        }
+
+        .upstream-status-badge.completed {
+            background: rgba(57, 255, 20, 0.1);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 255, 20, 0.3);
+        }
+
+        .upstream-status-badge.idle {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-sub);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        @keyframes pulse-glow-red {
+            0% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.4); }
+            70% { box-shadow: 0 0 0 6px rgba(255, 0, 0, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0); }
+        }
+
         .connection-details {
             display: flex;
             flex-direction: column;
@@ -697,6 +743,7 @@
                                     <span>Size: ${formatBytes(file.total_size)}</span>
                                     <span>Blocks: ${completedBlocks}/${file.total_blocks}</span>
                                     <span>Active Clients: ${file.active_clients}</span>
+                                    ${file.upstream_status ? `<span>Upstream: <span class="upstream-status-badge ${file.upstream_status.toLowerCase()}">${file.upstream_status}</span></span>` : ''}
                                     ${file.download_speed > 0 ? `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(file.download_speed)}/s</span>` : ''}
                                 </div>
                                 ${starvingQueueHtml ? `

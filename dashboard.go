@@ -113,15 +113,16 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 	defer GlobalRegistry.Lock.RUnlock()
 
 	type sseFile struct {
-		Key           string   `json:"key"`
-		URL           string   `json:"url"`
-		TotalSize     int64    `json:"total_size"`
-		TotalBlocks   int      `json:"total_blocks"`
-		BlockStates   []int    `json:"block_states"`
-		ActiveWriter  bool     `json:"active_writer"`
-		ActiveClients int      `json:"active_clients"`
-		StarvingQueue []int    `json:"starving_queue"`
-		DownloadSpeed int64    `json:"download_speed"`
+		Key            string   `json:"key"`
+		URL            string   `json:"url"`
+		TotalSize      int64    `json:"total_size"`
+		TotalBlocks    int      `json:"total_blocks"`
+		BlockStates    []int    `json:"block_states"`
+		ActiveWriter   bool     `json:"active_writer"`
+		ActiveClients  int      `json:"active_clients"`
+		StarvingQueue  []int    `json:"starving_queue"`
+		DownloadSpeed  int64    `json:"download_speed"`
+		UpstreamStatus string   `json:"upstream_status"`
 	}
 
 	var activeFiles []sseFile
@@ -157,15 +158,16 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		}
 
 		activeFiles = append(activeFiles, sseFile{
-			Key:           k,
-			URL:           fileState.URL,
-			TotalSize:     fileState.TotalSize,
-			TotalBlocks:   fileState.TotalBlocks,
-			BlockStates:   blocks,
-			ActiveWriter:  fileState.WriterActive,
-			ActiveClients: len(fileState.Clients),
-			StarvingQueue: starveQueue,
-			DownloadSpeed: fileState.DownloadSpeed,
+			Key:            k,
+			URL:            fileState.URL,
+			TotalSize:      fileState.TotalSize,
+			TotalBlocks:    fileState.TotalBlocks,
+			BlockStates:    blocks,
+			ActiveWriter:   fileState.WriterActive,
+			ActiveClients:  len(fileState.Clients),
+			StarvingQueue:  starveQueue,
+			DownloadSpeed:  fileState.DownloadSpeed,
+			UpstreamStatus: fileState.UpstreamStatus,
 		})
 		fileState.Lock.Unlock()
 	}
