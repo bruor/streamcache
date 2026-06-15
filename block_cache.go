@@ -64,6 +64,28 @@ type FileCacheState struct {
 	BytesDownloadedSec int64
 	DownloadSpeed      int64
 	UpstreamStatus     string
+	RecentConnections  []ConnectionInfo
+	ObservedCooldown   float64
+}
+
+type ConnectionInfo struct {
+	Opened time.Time
+	Closed time.Time // IsZero if still active
+}
+
+func (s *FileCacheState) RecordConnStart() int {
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	s.RecentConnections = append(s.RecentConnections, ConnectionInfo{Opened: time.Now()})
+	return len(s.RecentConnections) - 1
+}
+
+func (s *FileCacheState) RecordConnEnd(index int) {
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	if index >= 0 && index < len(s.RecentConnections) {
+		s.RecentConnections[index].Closed = time.Now()
+	}
 }
 
 type CacheRegistry struct {

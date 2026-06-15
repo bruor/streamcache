@@ -123,6 +123,8 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		StarvingQueue  []int    `json:"starving_queue"`
 		DownloadSpeed  int64    `json:"download_speed"`
 		UpstreamStatus string   `json:"upstream_status"`
+		ConnectionsLast30s int  `json:"connections_last_30s"`
+		ObservedCooldown   float64 `json:"observed_cooldown"`
 	}
 
 	var activeFiles []sseFile
@@ -157,6 +159,22 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 			}
 		}
 
+		// Filter out connections that are both closed AND closed more than 30 seconds ago
+		var filteredConns []ConnectionInfo
+		activeCount := 0
+		closedInLast30sCount := 0
+		cutoff := time.Now().Add(-30 * time.Second)
+		for _, conn := range fileState.RecentConnections {
+			if conn.Closed.IsZero() {
+				filteredConns = append(filteredConns, conn)
+				activeCount++
+			} else if conn.Closed.After(cutoff) {
+				filteredConns = append(filteredConns, conn)
+				closedInLast30sCount++
+			}
+		}
+		fileState.RecentConnections = filteredConns
+
 		activeFiles = append(activeFiles, sseFile{
 			Key:            k,
 			URL:            fileState.URL,
@@ -168,6 +186,8 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 			StarvingQueue:  starveQueue,
 			DownloadSpeed:  fileState.DownloadSpeed,
 			UpstreamStatus: fileState.UpstreamStatus,
+			ConnectionsLast30s: activeCount + closedInLast30sCount,
+			ObservedCooldown:   fileState.ObservedCooldown,
 		})
 		fileState.Lock.Unlock()
 	}

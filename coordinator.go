@@ -482,12 +482,19 @@ func runDownloadWorker(
 		return false
 	}
 
+	connIndex := -1
+	hadFailure := false
+
 	var activeRespBody io.ReadCloser
 	closeConnection := func() {
 		if activeRespBody != nil {
 			_ = activeRespBody.Close()
 			activeRespBody = nil
 			log.Printf("[Worker-%d] Closed active upstream connection", w.id)
+			if connIndex != -1 {
+				state.RecordConnEnd(connIndex)
+				connIndex = -1
+			}
 		}
 	}
 	defer closeConnection()
@@ -544,6 +551,7 @@ func runDownloadWorker(
 			log.Printf("[Worker-%d] Connecting upstream for block %d (Range: %s)", w.id, currentBlock, rangeHeader)
 			resp, err := UpstreamHTTPClient.Do(req)
 			if err != nil {
+				hadFailure = true
 				if handleFailure(false, "[Worker-%d] Upstream connection failed: %v", w.id, err) {
 					return
 				}
@@ -551,6 +559,7 @@ func runDownloadWorker(
 			}
 
 			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+				hadFailure = true
 				_ = resp.Body.Close()
 				isPermanent := resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone
 				if handleFailure(isPermanent, "[Worker-%d] Upstream returned error status %d", w.id, resp.StatusCode) {
@@ -570,6 +579,27 @@ func runDownloadWorker(
 
 			atomic.StoreInt64(&w.connStartTimeNano, time.Now().UnixNano())
 			atomic.StoreInt64(&w.connBytesWritten, 0)
+
+			connIndex = state.RecordConnStart()
+
+			if hadFailure {
+				state.Lock.Lock()
+				var lastClosed time.Time
+				for i := len(state.RecentConnections) - 1; i >= 0; i-- {
+					c := state.RecentConnections[i]
+					if !c.Closed.IsZero() {
+						lastClosed = c.Closed
+						break
+					}
+				}
+				if !lastClosed.IsZero() {
+					elapsed := time.Since(lastClosed).Seconds()
+					state.ObservedCooldown = elapsed
+					log.Printf("[Coord] Observed cooldown from last closed connection: %.2fs", elapsed)
+				}
+				state.Lock.Unlock()
+				hadFailure = false
+			}
 		}
 
 		state.Lock.Lock()

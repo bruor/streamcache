@@ -1440,8 +1440,137 @@ func TestConcurrentUpstreamWorkers(t *testing.T) {
 	}
 }
 
+func TestConnectionTelemetry(t *testing.T) {
+	state := &FileCacheState{}
+	
+	// Start connection
+	idx1 := state.RecordConnStart()
+	if idx1 != 0 {
+		t.Errorf("Expected index 0, got %d", idx1)
+	}
+	if len(state.RecentConnections) != 1 {
+		t.Errorf("Expected 1 recent connection, got %d", len(state.RecentConnections))
+	}
+	if state.RecentConnections[0].Opened.IsZero() {
+		t.Error("Expected Opened timestamp to be non-zero")
+	}
+	if !state.RecentConnections[0].Closed.IsZero() {
+		t.Error("Expected Closed timestamp to be zero initially")
+	}
 
+	// Start a second connection
+	idx2 := state.RecordConnStart()
+	if idx2 != 1 {
+		t.Errorf("Expected index 1, got %d", idx2)
+	}
 
+	// Close the first connection
+	state.RecordConnEnd(idx1)
+	if state.RecentConnections[0].Closed.IsZero() {
+		t.Error("Expected Closed timestamp to be non-zero after RecordConnEnd")
+	}
+	if !state.RecentConnections[1].Closed.IsZero() {
+		t.Error("Expected second connection to still be active (Closed = zero)")
+	}
+}
 
+func TestCoordinatorObservedCooldown(t *testing.T) {
+	// Set up directories
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	tmpDir, err := os.MkdirTemp("", "sc-test-cooldown-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
 
+	// Save and mock config
+	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldWait := GlobalConfig.ClientHydrationWait
+	oldBlockSize := GlobalConfig.BlockSize
+	GlobalConfig.MaxUpstreamWorkers = 1
+	GlobalConfig.ClientHydrationWait = 0
+	GlobalConfig.BlockSize = 100 // Block size 100 bytes
+
+	defer func() {
+		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
+		GlobalConfig.ClientHydrationWait = oldWait
+		GlobalConfig.BlockSize = oldBlockSize
+	}()
+
+	// Mock server
+	var lock sync.Mutex
+	reqCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		reqCount++
+		currentReq := reqCount
+		lock.Unlock()
+
+		if currentReq == 1 {
+			// First request: serve block 0, but only 100 bytes (EOF next)
+			w.Header().Set("Content-Range", "bytes 0-99/200")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(make([]byte, 100))
+		} else if currentReq == 2 {
+			// Second request: return failure
+			w.WriteHeader(http.StatusInternalServerError)
+		} else {
+			// Subsequent requests: serve block 1
+			w.Header().Set("Content-Range", "bytes 100-199/200")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(make([]byte, 100))
+		}
+	}))
+	defer server.Close()
+
+	key := "test_cooldown.mkv"
+	state := &FileCacheState{
+		Key:          key,
+		URL:          server.URL,
+		Path:         filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:    200,
+		TotalBlocks:  2, // 2 blocks of size 100
+		BlockStates:  []int{BlockNotStarted, BlockNotStarted},
+		Clients:      make(map[string]chan struct{}),
+		Starving:     make(map[string]int),
+		NotifyChan:   make(chan struct{}, 10),
+	}
+	defer cleanupAfterTest(t, state)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	// Start coordinator. It will automatically spawn worker 1 starting at block 0.
+	StartCoordinator(state, nil)
+
+	// Wait for the worker to finish both blocks (and retry after error)
+	// Retry backoff starts at 2 seconds.
+	time.Sleep(3 * time.Second)
+
+	state.Lock.Lock()
+	cooldown := state.ObservedCooldown
+	block0Completed := state.BlockStates[0] == BlockCompleted
+	block1Completed := state.BlockStates[1] == BlockCompleted
+	state.Lock.Unlock()
+
+	if !block0Completed || !block1Completed {
+		t.Errorf("Expected both blocks to complete, got: block0=%v, block1=%v", block0Completed, block1Completed)
+	}
+
+	if cooldown <= 0 {
+		t.Errorf("Expected ObservedCooldown to be > 0, got %f", cooldown)
+	} else {
+		t.Logf("Successfully observed cooldown: %fs", cooldown)
+	}
+}
