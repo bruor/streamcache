@@ -32,12 +32,14 @@ func StartCoordinator(state *FileCacheState, initialHeader http.Header) {
 }
 
 type Worker struct {
-	id           int
-	startBlock   int
-	cancel       context.CancelFunc
-	currentBlock int
-	offset       int64 // guarded atomically
-	speed        int64 // estimated speed (bytes/sec)
+	id                int
+	startBlock        int
+	cancel            context.CancelFunc
+	currentBlock      int
+	offset            int64 // guarded atomically
+	speed             int64 // estimated speed (bytes/sec)
+	connStartTimeNano int64 // Unix nano timestamp of connection start, guarded atomically
+	connBytesWritten   int64 // bytes read on this connection, guarded atomically
 }
 
 func runCoordinator(state *FileCacheState, initialHeader http.Header) {
@@ -355,28 +357,28 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								}
 							}
 							
+							eligible := false
 							if !isWorkerDownloadingStarveBlock {
-								var minDistanceToClient int64 = 1e18
-								for _, clientStarveBlock := range state.Starving {
-									dist := int64(clientStarveBlock - wCurrent)
-									if dist < 0 {
-										dist = -dist
-									}
-									if dist < minDistanceToClient {
-										minDistanceToClient = dist
-									}
+								eligible = true
+							} else {
+								// Check debouncer
+								connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
+								connBytes := atomic.LoadInt64(&w.connBytesWritten)
+								var elapsed time.Duration
+								if connStartNano > 0 {
+									elapsed = time.Since(time.Unix(0, connStartNano))
 								}
-								if minDistanceToClient > maxDistance {
-									maxDistance = minDistanceToClient
-									workerToPreempt = w
+								
+								if GlobalConfig.SchedulerMinTime <= 0 && GlobalConfig.SchedulerMinBytes <= 0 {
+									eligible = true
+								} else {
+									timeOk := GlobalConfig.SchedulerMinTime > 0 && elapsed >= GlobalConfig.SchedulerMinTime
+									bytesOk := GlobalConfig.SchedulerMinBytes > 0 && connBytes >= GlobalConfig.SchedulerMinBytes
+									eligible = timeOk || bytesOk
 								}
 							}
-						}
-						
-						// Fallback: preempt any furthest worker if all are technically downloading client targets
-						if workerToPreempt == nil && len(activeWorkers) > 0 {
-							for _, w := range activeWorkers {
-								wCurrent := w.currentBlock
+
+							if eligible {
 								var minDistanceToClient int64 = 1e18
 								for _, clientStarveBlock := range state.Starving {
 									dist := int64(clientStarveBlock - wCurrent)
@@ -563,6 +565,9 @@ func runDownloadWorker(
 			
 			consecutiveFailures = 0
 			backoff = 2 * time.Second
+
+			atomic.StoreInt64(&w.connStartTimeNano, time.Now().UnixNano())
+			atomic.StoreInt64(&w.connBytesWritten, 0)
 		}
 
 		state.Lock.Lock()
@@ -609,6 +614,7 @@ func runDownloadWorker(
 
 				blockBytesWritten += int64(n)
 				atomic.StoreInt64(&w.offset, blockStartOffset+blockBytesWritten)
+				atomic.AddInt64(&w.connBytesWritten, int64(n))
 
 				atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
 				GlobalRegistry.UpdateSize(int64(n))
@@ -653,6 +659,12 @@ func runDownloadWorker(
 				case ch <- struct{}{}:
 				default:
 				}
+			}
+
+			// Notify coordinator loop to wake up and check if it should preempt / finalize / check keep-alive
+			select {
+			case state.NotifyChan <- struct{}{}:
+			default:
 			}
 
 			// We REMOVED the intermediate metadata JSON file write from here to prevent redundant disk I/O!
