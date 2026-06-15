@@ -285,6 +285,7 @@
             font-size: 0.85rem;
             color: var(--accent-green);
             overflow-y: auto;
+            overflow-anchor: auto;
             border: 1px solid var(--card-border);
             white-space: pre-wrap;
             box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.8);
@@ -587,7 +588,6 @@
         const consoleEl = document.getElementById('console');
         const scrollBtn = document.getElementById('console-scroll-btn');
         let autoScrollEnabled = true;
-        let logLines = [];
         const maxLogLines = 1000;
 
         // Listen for scroll events to toggle auto-scroll state
@@ -612,19 +612,39 @@
         const connectionsCountEl = document.getElementById('connections-count');
 
         function appendLog(text) {
-            // Split incoming chunk by newline and append to rolling array
-            const newLines = text.split('\n');
-            logLines.push(...newLines);
-            
-            // Keep only the last 1000 lines
-            if (logLines.length > maxLogLines) {
-                logLines = logLines.slice(logLines.length - maxLogLines);
+            // Clear initial loading text node on first write
+            if (consoleEl.childNodes.length === 1 && consoleEl.firstChild.nodeType === Node.TEXT_NODE && consoleEl.firstChild.textContent.startsWith("Initializing")) {
+                consoleEl.textContent = "";
             }
 
+            const newLines = text.split('\n');
+            const fragment = document.createDocumentFragment();
+            let addedCount = 0;
+            
+            newLines.forEach(line => {
+                if (line.trim() === '') return;
+                // Filter out block completed logs
+                if (line.includes("Block ") && line.includes("completed")) return;
+                
+                const div = document.createElement('div');
+                div.style.whiteSpace = 'pre-wrap';
+                div.style.minHeight = '1.2em';
+                div.textContent = line;
+                fragment.appendChild(div);
+                addedCount++;
+            });
+            
+            if (addedCount === 0) return;
+            
+            // Check if we were at the bottom before appending
             const isAtBottom = (consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight) < 40;
             
-            // Update the DOM using textContent (substantially faster than innerText)
-            consoleEl.textContent = logLines.join('\n');
+            consoleEl.appendChild(fragment);
+            
+            // Limit to maxLogLines
+            while (consoleEl.children.length > maxLogLines) {
+                consoleEl.removeChild(consoleEl.firstChild);
+            }
             
             if (autoScrollEnabled && isAtBottom) {
                 consoleEl.scrollTop = consoleEl.scrollHeight;
@@ -640,8 +660,7 @@
         }
 
         function clearConsole() {
-            logLines = [];
-            consoleEl.textContent = "";
+            consoleEl.innerHTML = "";
             scrollBtn.style.display = 'none';
         }
 
