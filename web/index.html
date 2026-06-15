@@ -744,7 +744,7 @@
                                     <span>Blocks: ${completedBlocks}/${file.total_blocks}</span>
                                     <span>Active Clients: ${file.active_clients}</span>
                                     ${file.upstream_status ? `<span>Upstream: <span class="upstream-status-badge ${file.upstream_status.toLowerCase()}">${file.upstream_status}</span></span>` : ''}
-                                    <span>Connections: ${file.connections_last_30s || 0}</span>
+                                    <span>Connections (30s): ${file.connections_last_30s || 0}</span>
                                     ${file.observed_cooldown > 0 ? `<span>Observed Cooldown: ${file.observed_cooldown.toFixed(1)}s</span>` : ''}
                                     ${file.download_speed > 0 ? `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(file.download_speed)}/s</span>` : ''}
                                 </div>
