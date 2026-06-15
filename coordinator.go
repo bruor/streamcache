@@ -268,7 +268,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			state.Lock.Lock()
 			nextUncompletedBlock := -1
 			for i, status := range state.BlockStates {
-				if status != BlockCompleted && status != BlockDownloading {
+				if status != BlockCompleted {
 					nextUncompletedBlock = i
 					break
 				}
@@ -285,19 +285,32 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		case <-state.NotifyChan:
 			state.Lock.Lock()
 			
-			// Find all starving blocks that are not completed or currently downloading
+			// Find all starving blocks that are not completed or currently actively downloading
 			var starvingBlocks []int
 			for _, sb := range state.Starving {
-				if state.BlockStates[sb] != BlockCompleted && state.BlockStates[sb] != BlockDownloading {
-					alreadyInList := false
-					for _, b := range starvingBlocks {
-						if b == sb {
-							alreadyInList = true
+				if state.BlockStates[sb] != BlockCompleted {
+					// Check if any active worker is currently downloading this block
+					isBeingDownloaded := false
+					workersLock.Lock()
+					for _, w := range activeWorkers {
+						if w.currentBlock == sb {
+							isBeingDownloaded = true
 							break
 						}
 					}
-					if !alreadyInList {
-						starvingBlocks = append(starvingBlocks, sb)
+					workersLock.Unlock()
+
+					if !isBeingDownloaded {
+						alreadyInList := false
+						for _, b := range starvingBlocks {
+							if b == sb {
+								alreadyInList = true
+								break
+							}
+						}
+						if !alreadyInList {
+							starvingBlocks = append(starvingBlocks, sb)
+						}
 					}
 				}
 			}
