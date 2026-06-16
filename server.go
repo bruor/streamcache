@@ -170,11 +170,26 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	if !active {
 		GlobalRegistry.Lock.Unlock()
 
+		if GlobalRegistry.IsProbeFailed(cacheFileName) {
+			log.Printf("[Server] Cache MISS for %s bypassed (cached upstream probe failure)", key)
+			http.Error(w, "Bad Gateway (Cached Upstream Failure)", http.StatusBadGateway)
+			return
+		}
+
 		// Probe the upstream CDN to fetch total size, ETag, and Last-Modified headers
 		log.Printf("[Server] Cache MISS for %s. Probing upstream CDN for metadata...", key)
 		totalSize, etag, lastMod, _, err := probeUpstream(r.Context(), targetURL, r.Header, nil)
 		if err != nil {
 			log.Printf("[Server] Upstream probe failed: %v", err)
+			cooldown := GlobalConfig.ProbeTransientCooldown
+			errType := "transient"
+			if isHTMLProbeError(err) || isPermanentProbeError(err) {
+				cooldown = GlobalConfig.ProbeFailureCooldown
+				errType = "permanent"
+			}
+			log.Printf("[Server] Recording %s probe failure tombstone for %s (Duration: %s)", errType, key, cooldown)
+			GlobalRegistry.RecordFailedProbe(cacheFileName, cooldown)
+
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 			return
 		}

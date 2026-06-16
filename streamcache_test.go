@@ -1444,32 +1444,36 @@ func TestConnectionTelemetry(t *testing.T) {
 	state := &FileCacheState{}
 	
 	// Start connection
-	idx1 := state.RecordConnStart()
-	if idx1 != 0 {
-		t.Errorf("Expected index 0, got %d", idx1)
-	}
+	conn1 := "conn-1"
+	state.RecordConnStart(conn1)
 	if len(state.RecentConnections) != 1 {
 		t.Errorf("Expected 1 recent connection, got %d", len(state.RecentConnections))
 	}
-	if state.RecentConnections[0].Opened.IsZero() {
+	c1, exists := state.RecentConnections[conn1]
+	if !exists {
+		t.Fatal("Expected conn-1 to exist in map")
+	}
+	if c1.Opened.IsZero() {
 		t.Error("Expected Opened timestamp to be non-zero")
 	}
-	if !state.RecentConnections[0].Closed.IsZero() {
+	if !c1.Closed.IsZero() {
 		t.Error("Expected Closed timestamp to be zero initially")
 	}
 
 	// Start a second connection
-	idx2 := state.RecordConnStart()
-	if idx2 != 1 {
-		t.Errorf("Expected index 1, got %d", idx2)
+	conn2 := "conn-2"
+	state.RecordConnStart(conn2)
+	if len(state.RecentConnections) != 2 {
+		t.Errorf("Expected 2 recent connections, got %d", len(state.RecentConnections))
 	}
 
 	// Close the first connection
-	state.RecordConnEnd(idx1)
-	if state.RecentConnections[0].Closed.IsZero() {
+	state.RecordConnEnd(conn1)
+	if c1.Closed.IsZero() {
 		t.Error("Expected Closed timestamp to be non-zero after RecordConnEnd")
 	}
-	if !state.RecentConnections[1].Closed.IsZero() {
+	c2 := state.RecentConnections[conn2]
+	if !c2.Closed.IsZero() {
 		t.Error("Expected second connection to still be active (Closed = zero)")
 	}
 }
@@ -1572,5 +1576,148 @@ func TestCoordinatorObservedCooldown(t *testing.T) {
 		t.Errorf("Expected ObservedCooldown to be > 0, got %f", cooldown)
 	} else {
 		t.Logf("Successfully observed cooldown: %fs", cooldown)
+	}
+}
+
+func TestProbeHTMLTypeRejection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html><body>Error</body></html>"))
+	}))
+	defer server.Close()
+
+	_, _, _, _, err := probeUpstream(context.Background(), server.URL, nil, nil)
+	if err == nil {
+		t.Fatal("Expected probe to fail when Content-Type is HTML, but it succeeded")
+	}
+	if !isHTMLProbeError(err) {
+		t.Errorf("Expected HTML probe error, got: %v", err)
+	}
+}
+
+func TestProbeCatastrophicAbort(t *testing.T) {
+	var lock sync.Mutex
+	reqCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		reqCount++
+		lock.Unlock()
+
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK) // 200 but HTML content type
+	}))
+	defer server.Close()
+
+	_, _, _, _, err := probeUpstream(context.Background(), server.URL, nil, nil)
+	if err == nil {
+		t.Fatal("Expected probe to fail")
+	}
+
+	lock.Lock()
+	count := reqCount
+	lock.Unlock()
+
+	// Should abort immediately after Range probe (exactly 1 request)
+	// and NOT execute standard GET fallback
+	if count != 1 {
+		t.Errorf("Expected exactly 1 request to mock server, got %d", count)
+	}
+}
+
+func TestProbeFailureNegativeCaching(t *testing.T) {
+	// Initialize registry
+	InitRegistry()
+
+	var lock sync.Mutex
+	reqCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		reqCount++
+		lock.Unlock()
+
+		w.WriteHeader(http.StatusNotFound) // 404 Not Found (Permanent & Catastrophic)
+	}))
+	defer server.Close()
+
+	// Save and set configs
+	oldInterval := GlobalConfig.ProbeFailureCooldown
+	oldTransient := GlobalConfig.ProbeTransientCooldown
+	GlobalConfig.ProbeFailureCooldown = 200 * time.Millisecond
+	GlobalConfig.ProbeTransientCooldown = 50 * time.Millisecond
+	defer func() {
+		GlobalConfig.ProbeFailureCooldown = oldInterval
+		GlobalConfig.ProbeTransientCooldown = oldTransient
+	}()
+
+	key := "test_tombstone.mkv"
+	targetURL := server.URL
+
+	// First request: Cache MISS, should hit mock server and fail
+	req := httptest.NewRequest("GET", "http://localhost:8080/play/"+key, nil)
+	w := httptest.NewRecorder()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if GlobalRegistry.IsProbeFailed(key) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("Gateway Bypass"))
+			return
+		}
+
+		_, _, _, _, err := probeUpstream(r.Context(), targetURL, r.Header, nil)
+		if err != nil {
+			cooldown := GlobalConfig.ProbeTransientCooldown
+			if isHTMLProbeError(err) || isPermanentProbeError(err) {
+				cooldown = GlobalConfig.ProbeFailureCooldown
+			}
+			GlobalRegistry.RecordFailedProbe(key, cooldown)
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Request 1: should call probe and fail (reqCount = 1)
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected 502 Bad Gateway, got %d", w.Code)
+	}
+
+	lock.Lock()
+	c1 := reqCount
+	lock.Unlock()
+	if c1 != 1 {
+		t.Fatalf("Expected exactly 1 request to server on first try, got %d", c1)
+	}
+
+	// Request 2: within cooldown (200ms), should bypass probe and serve 502 immediately
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req)
+	if w2.Code != http.StatusBadGateway {
+		t.Errorf("Expected 502 Bad Gateway, got %d", w2.Code)
+	}
+
+	lock.Lock()
+	c2 := reqCount
+	lock.Unlock()
+	if c2 != 1 {
+		t.Errorf("Expected request count to remain 1 (bypassed), got %d", c2)
+	}
+
+	// Wait for cooldown to expire
+	time.Sleep(250 * time.Millisecond)
+
+	// Request 3: cooldown expired, should hit server again (reqCount = 2)
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, req)
+	if w3.Code != http.StatusBadGateway {
+		t.Errorf("Expected 502 Bad Gateway, got %d", w3.Code)
+	}
+
+	lock.Lock()
+	c3 := reqCount
+	lock.Unlock()
+	if c3 != 2 {
+		t.Errorf("Expected request count to increase to 2 after expiration, got %d", c3)
 	}
 }

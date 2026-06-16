@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -205,6 +206,10 @@ func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Head
 			SetProbeMethod(originalHost, ProbeMethodRange)
 			return size, etag, lm, notModified, nil
 		}
+		if isCatastrophicProbeError(err) {
+			log.Printf("[Probe] Range probe hit catastrophic failure on host %s: %v. Aborting immediately.", originalHost, err)
+			return 0, "", "", false, err
+		}
 		log.Printf("[Probe] Range probe failed for host %s: %v. Trying standard GET fallback...", originalHost, err)
 		lastErr = err
 	}
@@ -215,6 +220,10 @@ func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Head
 		// Succeeded with standard. Update cache.
 		SetProbeMethod(originalHost, ProbeMethodStandard)
 		return size, etag, lm, notModified, nil
+	}
+	if isCatastrophicProbeError(err) {
+		log.Printf("[Probe] Standard probe hit catastrophic failure on host %s: %v. Aborting immediately.", originalHost, err)
+		return 0, "", "", false, err
 	}
 
 	// If standard GET failed but we haven't tried Range probe yet, try Range probe as final fallback
@@ -271,6 +280,11 @@ func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Head
 		return 0, "", "", false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
+	contentType := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(strings.ToLower(contentType), "text/html") {
+		return 0, "", "", false, fmt.Errorf("upstream returned HTML content type %q (likely a CDN block or redirect)", contentType)
+	}
+
 	// Cache successful target host
 	finalHost := GetCleanHost(resp.Request.URL.String())
 	if finalHost != "" {
@@ -322,6 +336,11 @@ func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.H
 		return 0, "", "", false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
+	contentType := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(strings.ToLower(contentType), "text/html") {
+		return 0, "", "", false, fmt.Errorf("upstream returned HTML content type %q (likely a CDN block or redirect)", contentType)
+	}
+
 	// Cache successful target host
 	finalHost := GetCleanHost(resp.Request.URL.String())
 	if finalHost != "" {
@@ -351,4 +370,40 @@ func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.H
 	}
 
 	return size, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), false, nil
+}
+
+func isHTMLProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "upstream returned HTML content type")
+}
+
+func isPermanentProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "unexpected status code: 403") ||
+		strings.Contains(msg, "unexpected status code: 404") ||
+		strings.Contains(msg, "unexpected status code: 410")
+}
+
+func isCatastrophicProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isHTMLProbeError(err) {
+		return true
+	}
+	// Check for permanent errors except 403 (like 404, 410)
+	if isPermanentProbeError(err) && !strings.Contains(err.Error(), "unexpected status code: 403") {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "dial tcp")
 }

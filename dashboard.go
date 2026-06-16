@@ -160,16 +160,16 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		}
 
 		// Filter out connections that are both closed AND closed more than 30 seconds ago
-		var filteredConns []ConnectionInfo
+		filteredConns := make(map[string]*ConnectionInfo)
 		activeCount := 0
 		closedInLast30sCount := 0
 		cutoff := time.Now().Add(-30 * time.Second)
-		for _, conn := range fileState.RecentConnections {
+		for id, conn := range fileState.RecentConnections {
 			if conn.Closed.IsZero() {
-				filteredConns = append(filteredConns, conn)
+				filteredConns[id] = conn
 				activeCount++
 			} else if conn.Closed.After(cutoff) {
-				filteredConns = append(filteredConns, conn)
+				filteredConns[id] = conn
 				closedInLast30sCount++
 			}
 		}

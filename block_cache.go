@@ -64,27 +64,32 @@ type FileCacheState struct {
 	BytesDownloadedSec int64
 	DownloadSpeed      int64
 	UpstreamStatus     string
-	RecentConnections  []ConnectionInfo
+	RecentConnections  map[string]*ConnectionInfo
 	ObservedCooldown   float64
 }
 
 type ConnectionInfo struct {
+	ID     string
 	Opened time.Time
 	Closed time.Time // IsZero if still active
 }
 
-func (s *FileCacheState) RecordConnStart() int {
+func (s *FileCacheState) RecordConnStart(connID string) {
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
-	s.RecentConnections = append(s.RecentConnections, ConnectionInfo{Opened: time.Now()})
-	return len(s.RecentConnections) - 1
+	if s.RecentConnections == nil {
+		s.RecentConnections = make(map[string]*ConnectionInfo)
+	}
+	s.RecentConnections[connID] = &ConnectionInfo{ID: connID, Opened: time.Now()}
 }
 
-func (s *FileCacheState) RecordConnEnd(index int) {
+func (s *FileCacheState) RecordConnEnd(connID string) {
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
-	if index >= 0 && index < len(s.RecentConnections) {
-		s.RecentConnections[index].Closed = time.Now()
+	if s.RecentConnections != nil {
+		if conn, exists := s.RecentConnections[connID]; exists {
+			conn.Closed = time.Now()
+		}
 	}
 }
 
@@ -92,6 +97,7 @@ type CacheRegistry struct {
 	Lock           sync.RWMutex
 	Files          map[string]*FileCacheState
 	Connections    map[string]*ClientConnection
+	FailedProbes   map[string]time.Time
 	TotalCacheSize int64
 	Evicting       bool
 }
@@ -101,8 +107,9 @@ var GlobalDiskFreeBytes uint64
 
 func InitRegistry() {
 	GlobalRegistry = &CacheRegistry{
-		Files:       make(map[string]*FileCacheState),
-		Connections: make(map[string]*ClientConnection),
+		Files:        make(map[string]*FileCacheState),
+		Connections:  make(map[string]*ClientConnection),
+		FailedProbes: make(map[string]time.Time),
 	}
 	GlobalRegistry.LoadExistingCache()
 
@@ -112,6 +119,31 @@ func InitRegistry() {
 	go startDiskFreeMonitor()
 
 	go GlobalRegistry.startSpeedMonitor()
+}
+
+func (r *CacheRegistry) RecordFailedProbe(key string, duration time.Duration) {
+	r.Lock.Lock()
+	defer r.Lock.Unlock()
+	if r.FailedProbes == nil {
+		r.FailedProbes = make(map[string]time.Time)
+	}
+	r.FailedProbes[key] = time.Now().Add(duration)
+}
+
+func (r *CacheRegistry) IsProbeFailed(key string) bool {
+	r.Lock.RLock()
+	defer r.Lock.RUnlock()
+	if r.FailedProbes == nil {
+		return false
+	}
+	expiry, exists := r.FailedProbes[key]
+	if !exists {
+		return false
+	}
+	if time.Now().After(expiry) {
+		return false
+	}
+	return true
 }
 
 func startDiskFreeMonitor() {

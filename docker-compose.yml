@@ -41,5 +41,9 @@ services:
       # Duration the proxy waits for active hydration progress to catch up before spawning a new connection
       - CLIENT_HYDRATION_WAIT=2s
       
+      # Cooldown durations for upstream probe failures
+      - PROBE_FAILURE_COOLDOWN=10m
+      - PROBE_TRANSIENT_COOLDOWN=30s
+      
       # Option to restrict domains allowed through the proxy (comma-separated list)
       # - ALLOWED_HOSTS=infinity.gives

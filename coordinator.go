@@ -482,7 +482,7 @@ func runDownloadWorker(
 		return false
 	}
 
-	connIndex := -1
+	connID := ""
 	hadFailure := false
 
 	var activeRespBody io.ReadCloser
@@ -491,9 +491,9 @@ func runDownloadWorker(
 			_ = activeRespBody.Close()
 			activeRespBody = nil
 			log.Printf("[Worker-%d] Closed active upstream connection", w.id)
-			if connIndex != -1 {
-				state.RecordConnEnd(connIndex)
-				connIndex = -1
+			if connID != "" {
+				state.RecordConnEnd(connID)
+				connID = ""
 			}
 		}
 	}
@@ -580,16 +580,17 @@ func runDownloadWorker(
 			atomic.StoreInt64(&w.connStartTimeNano, time.Now().UnixNano())
 			atomic.StoreInt64(&w.connBytesWritten, 0)
 
-			connIndex = state.RecordConnStart()
+			connID = fmt.Sprintf("worker-%d-%d", w.id, time.Now().UnixNano())
+			state.RecordConnStart(connID)
 
 			if hadFailure {
 				state.Lock.Lock()
 				var lastClosed time.Time
-				for i := len(state.RecentConnections) - 1; i >= 0; i-- {
-					c := state.RecentConnections[i]
+				for _, c := range state.RecentConnections {
 					if !c.Closed.IsZero() {
-						lastClosed = c.Closed
-						break
+						if lastClosed.IsZero() || c.Closed.After(lastClosed) {
+							lastClosed = c.Closed
+						}
 					}
 				}
 				if !lastClosed.IsZero() {

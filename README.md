@@ -49,6 +49,8 @@ Streamcache is configured using environment variables. Default fallback values a
 | `UPSTREAM_READ_TIMEOUT` | `30s` | Read timeout for upstream connections. Stalled reads from the CDN exceeding this duration are aborted and retried. |
 | `MAX_UPSTREAM_WORKERS` | `2` | Maximum concurrent upstream downloader threads per VOD file. |
 | `CLIENT_HYDRATION_WAIT` | `2s` | Duration the proxy waits for active hydration to catch up before spawning a new connection (Jump Suppression). |
+| `PROBE_FAILURE_COOLDOWN` | `10m` | Cooldown duration for caching catastrophic/permanent probe failures (e.g. HTML blocks, HTTP 403/404) to block retries. |
+| `PROBE_TRANSIENT_COOLDOWN` | `30s` | Cooldown duration for caching transient probe failures (e.g. timeouts, network drops, HTTP 500/503) to absorb retry storms. |
 
 ---
 

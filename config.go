@@ -23,6 +23,8 @@ type Config struct {
 	UpstreamReadTimeout      time.Duration
 	MaxUpstreamWorkers       int
 	ClientHydrationWait      time.Duration
+	ProbeFailureCooldown     time.Duration
+	ProbeTransientCooldown   time.Duration
 }
 
 var GlobalConfig *Config
@@ -42,6 +44,8 @@ func LoadConfig() {
 		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 30*time.Second),
 		MaxUpstreamWorkers:      getEnvInt("MAX_UPSTREAM_WORKERS", 2),
 		ClientHydrationWait:     getEnvDuration("CLIENT_HYDRATION_WAIT", 2*time.Second),
+		ProbeFailureCooldown:    getEnvDuration("PROBE_FAILURE_COOLDOWN", 10*time.Minute),
+		ProbeTransientCooldown:  getEnvDuration("PROBE_TRANSIENT_COOLDOWN", 30*time.Second),
 	}
 
 	// Format port if missing colon
@@ -62,7 +66,7 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.BlockSize/(1024*1024),
@@ -72,6 +76,8 @@ func LoadConfig() {
 		cfg.DisableFadvise,
 		cfg.MaxUpstreamWorkers,
 		cfg.ClientHydrationWait,
+		cfg.ProbeFailureCooldown,
+		cfg.ProbeTransientCooldown,
 	)
 }
 
