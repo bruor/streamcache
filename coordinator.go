@@ -518,13 +518,14 @@ func runDownloadWorker(
 	defer closeConnection()
 
 	blockSize := GlobalConfig.BlockSize
-	blocksToGrab := int(GlobalConfig.SchedulerMinBytes / blockSize)
-	if blocksToGrab < 1 {
-		blocksToGrab = 1
+	targetStartOffset := state.TotalSize - GlobalConfig.SchedulerMinBytes
+	if targetStartOffset < 0 {
+		targetStartOffset = 0
 	}
+	firstEndBlock := int(targetStartOffset / blockSize)
+	blocksToGrab := state.TotalBlocks - firstEndBlock
 
-	if w.startBlock == 0 && state.TotalBlocks >= 10 && state.TotalBlocks > blocksToGrab {
-		firstEndBlock := state.TotalBlocks - blocksToGrab
+	if w.startBlock == 0 && state.TotalBlocks >= 10 && firstEndBlock > 0 && blocksToGrab > 0 {
 		lastBlocksUncompleted := false
 		state.Lock.Lock()
 		for b := firstEndBlock; b < state.TotalBlocks; b++ {
