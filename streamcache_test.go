@@ -1721,3 +1721,104 @@ func TestProbeFailureNegativeCaching(t *testing.T) {
 		t.Errorf("Expected request count to increase to 2 after expiration, got %d", c3)
 	}
 }
+
+func TestSequentialLastBlockPrefetch(t *testing.T) {
+	// Setup cache and tmp dirs
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	// Temporarily override BlockSize and SchedulerMinBytes
+	oldBlockSize := GlobalConfig.BlockSize
+	oldMinBytes := GlobalConfig.SchedulerMinBytes
+	GlobalConfig.BlockSize = 100
+	GlobalConfig.SchedulerMinBytes = 200 // Grab 2 blocks (200 bytes) at the end
+	defer func() {
+		GlobalConfig.BlockSize = oldBlockSize
+		GlobalConfig.SchedulerMinBytes = oldMinBytes
+	}()
+
+	var lock sync.Mutex
+	var requestedRanges []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		lock.Unlock()
+
+		w.Header().Set("Content-Range", "bytes 0-999/1000")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 1000))
+	}))
+	defer server.Close()
+
+	key := "test_prefetch.mkv"
+	state := &FileCacheState{
+		Key:          key,
+		URL:          server.URL,
+		Path:         filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:    1000,
+		TotalBlocks:  10, // 10 blocks of 100 bytes
+		BlockStates:  make([]int, 10),
+		Clients:      make(map[string]chan struct{}),
+		Starving:     make(map[string]int),
+		NotifyChan:   make(chan struct{}, 10),
+	}
+	defer cleanupAfterTest(t, state)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	// Simulate client starving on block 0
+	state.Lock.Lock()
+	state.Starving["client-1"] = 0
+	state.Lock.Unlock()
+
+	// Start coordinator. It will spawn Worker 1 starting at starving block 0.
+	StartCoordinator(state, nil)
+
+	// Sleep briefly to let the worker start pre-fetching
+	time.Sleep(100 * time.Millisecond)
+
+	// Simulate player requesting block 9 (last block) concurrently to simulate anti-sharing/starvation storm
+	state.Lock.Lock()
+	state.Starving["client-2"] = 9
+	state.Lock.Unlock()
+	select {
+	case state.NotifyChan <- struct{}{}:
+	default:
+	}
+
+	// Wait for coordinator to run and process the notification
+	time.Sleep(150 * time.Millisecond)
+
+	lock.Lock()
+	ranges := make([]string, len(requestedRanges))
+	copy(ranges, requestedRanges)
+	lock.Unlock()
+
+	// Verify requested ranges
+	if len(ranges) < 2 {
+		t.Fatalf("Expected at least 2 requests (1 prefetch, 1 sequential), got %d", len(ranges))
+	}
+
+	// The first request must be the last 2 blocks (blocks 8 and 9) range: bytes=800-999
+	expectedPrefetchRange := "bytes=800-999"
+	if ranges[0] != expectedPrefetchRange {
+		t.Errorf("Expected first request range (prefetch) to be %s, got %s", expectedPrefetchRange, ranges[0])
+	}
+
+	// The second request should be block 0 range starting from 0: bytes=0-999
+	expectedSequentialRange := "bytes=0-999"
+	if ranges[1] != expectedSequentialRange {
+		t.Errorf("Expected second request range to be %s, got %s", expectedSequentialRange, ranges[1])
+	}
+}

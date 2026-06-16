@@ -40,6 +40,7 @@ type Worker struct {
 	speed             int64 // estimated speed (bytes/sec)
 	connStartTimeNano int64 // Unix nano timestamp of connection start, guarded atomically
 	connBytesWritten   int64 // bytes read on this connection, guarded atomically
+	isPrefetching     int32 // 1 if prefetching last blocks (metadata), 0 otherwise, guarded atomically
 }
 
 func runCoordinator(state *FileCacheState, initialHeader http.Header) {
@@ -285,6 +286,23 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		case <-state.NotifyChan:
 			state.Lock.Lock()
 			
+			// If any active worker is currently pre-fetching index/metadata,
+			// suppress spawning of new workers and pre-emption to avoid race conditions.
+			isPreFetchingActive := false
+			workersLock.Lock()
+			for _, w := range activeWorkers {
+				if atomic.LoadInt32(&w.isPrefetching) == 1 {
+					isPreFetchingActive = true
+					break
+				}
+			}
+			workersLock.Unlock()
+
+			if isPreFetchingActive {
+				state.Lock.Unlock()
+				continue
+			}
+
 			// Find all starving blocks that are not completed or currently actively downloading
 			var starvingBlocks []int
 			for _, sb := range state.Starving {
@@ -499,6 +517,165 @@ func runDownloadWorker(
 	}
 	defer closeConnection()
 
+	blockSize := GlobalConfig.BlockSize
+	blocksToGrab := int(GlobalConfig.SchedulerMinBytes / blockSize)
+	if blocksToGrab < 1 {
+		blocksToGrab = 1
+	}
+
+	if w.startBlock == 0 && state.TotalBlocks >= 10 && state.TotalBlocks > blocksToGrab {
+		firstEndBlock := state.TotalBlocks - blocksToGrab
+		lastBlocksUncompleted := false
+		state.Lock.Lock()
+		for b := firstEndBlock; b < state.TotalBlocks; b++ {
+			if state.BlockStates[b] != BlockCompleted {
+				lastBlocksUncompleted = true
+				break
+			}
+		}
+		state.Lock.Unlock()
+
+		if lastBlocksUncompleted {
+			log.Printf("[Worker-%d] Pre-fetching last %d blocks for container index metadata sequentially...", w.id, blocksToGrab)
+			atomic.StoreInt32(&w.isPrefetching, 1)
+
+			prefetchStart := int64(firstEndBlock) * blockSize
+			prefetchLength := state.TotalSize - prefetchStart
+
+			req, err := http.NewRequestWithContext(ctx, "GET", state.URL, nil)
+			if err == nil {
+				rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
+				req.Header.Set("Range", rangeHeader)
+				if initialHeader != nil && len(initialHeader) > 0 {
+					for k, vv := range initialHeader {
+						if k != "Range" && k != "Connection" && k != "Host" {
+							for _, v := range vv {
+								req.Header.Add(k, v)
+							}
+						}
+					}
+				} else {
+					req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
+					req.Header.Set("Accept", "*/*")
+				}
+
+				state.Lock.Lock()
+				state.UpstreamStatus = "Connecting"
+				state.Lock.Unlock()
+
+				resp, rerr := UpstreamHTTPClient.Do(req)
+				if rerr == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+					state.Lock.Lock()
+					state.UpstreamStatus = "Downloading"
+					for b := firstEndBlock; b < state.TotalBlocks; b++ {
+						if state.BlockStates[b] != BlockCompleted {
+							state.BlockStates[b] = BlockDownloading
+						}
+					}
+					state.Lock.Unlock()
+
+					buffer := make([]byte, 512*1024)
+					bytesRead := int64(0)
+					prefetchFailed := false
+
+					for bytesRead < prefetchLength {
+						select {
+						case <-ctx.Done():
+							prefetchFailed = true
+							break
+						default:
+						}
+						if prefetchFailed {
+							break
+						}
+
+						limit := int64(len(buffer))
+						if prefetchLength-bytesRead < limit {
+							limit = prefetchLength - bytesRead
+						}
+
+						n, readErr := resp.Body.Read(buffer[:limit])
+						if n > 0 {
+							writeOffset := prefetchStart + bytesRead
+							_, werr := file.WriteAt(buffer[:n], writeOffset)
+							if werr != nil {
+								log.Printf("[Worker-%d] Prefetch file write error: %v", w.id, werr)
+								prefetchFailed = true
+								break
+							}
+
+							if !GlobalConfig.DisableFadvise {
+								FadviseDontNeed(file.Fd(), writeOffset, int64(n))
+							}
+
+							bytesRead += int64(n)
+
+							state.Lock.Lock()
+							for b := firstEndBlock; b < state.TotalBlocks; b++ {
+								bStart := int64(b) * blockSize
+								bEnd := bStart + blockSize
+								if bEnd > state.TotalSize {
+									bEnd = state.TotalSize
+								}
+								if prefetchStart+bytesRead >= bEnd && state.BlockStates[b] == BlockDownloading {
+									state.BlockStates[b] = BlockCompleted
+									for _, ch := range state.Clients {
+										safeSignal(ch)
+									}
+								}
+							}
+							state.Lock.Unlock()
+						}
+
+						if readErr != nil {
+							if bytesRead < prefetchLength {
+								log.Printf("[Worker-%d] Prefetch read error: %v", w.id, readErr)
+								prefetchFailed = true
+							}
+							break
+						}
+					}
+					_ = resp.Body.Close()
+
+					state.Lock.Lock()
+					for b := firstEndBlock; b < state.TotalBlocks; b++ {
+						bStart := int64(b) * blockSize
+						bEnd := bStart + blockSize
+						if bEnd > state.TotalSize {
+							bEnd = state.TotalSize
+						}
+						if prefetchStart+bytesRead >= bEnd {
+							state.BlockStates[b] = BlockCompleted
+						} else {
+							if state.BlockStates[b] != BlockCompleted {
+								state.BlockStates[b] = BlockNotStarted
+							}
+						}
+					}
+					for _, ch := range state.Clients {
+						safeSignal(ch)
+					}
+					state.Lock.Unlock()
+				} else {
+					if rerr == nil {
+						_ = resp.Body.Close()
+					}
+					log.Printf("[Worker-%d] Prefetch request failed. Status: %v, err: %v", w.id, resp, rerr)
+				}
+			} else {
+				log.Printf("[Worker-%d] Prefetch request creation failed: %v", w.id, err)
+			}
+
+			atomic.StoreInt32(&w.isPrefetching, 0)
+			log.Printf("[Worker-%d] Pre-fetching finished.", w.id)
+
+			select {
+			case state.NotifyChan <- struct{}{}:
+			default:
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -688,10 +865,7 @@ func runDownloadWorker(
 			log.Printf("[Worker-%d] Block %d completed", w.id, currentBlock)
 
 			for _, ch := range state.Clients {
-				select {
-				case ch <- struct{}{}:
-				default:
-				}
+				safeSignal(ch)
 			}
 
 			// Notify coordinator loop to wake up and check if it should preempt / finalize / check keep-alive
@@ -728,5 +902,15 @@ func runDownloadWorker(
 			w.currentBlock = currentBlock
 			state.Lock.Unlock()
 		}
+	}
+}
+
+func safeSignal(ch chan struct{}) {
+	defer func() {
+		_ = recover()
+	}()
+	select {
+	case ch <- struct{}{}:
+	default:
 	}
 }
