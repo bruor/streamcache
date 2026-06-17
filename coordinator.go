@@ -76,7 +76,6 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	defer func() {
 		parentCancel()
 		state.Lock.Lock()
-		state.WriterActive = false
 
 		// We check if all blocks are completed to ensure we only finalize fully completed files.
 		isCompleted := len(state.BlockStates) > 0
@@ -88,7 +87,15 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		}
 
 		if isCompleted {
+			state.UpstreamStatus = "Committing"
+			state.Lock.Unlock()
+			if file != nil {
+				log.Printf("[Coord] Committing and flushing cache file to disk: %s", state.Key)
+				_ = file.Sync()
+			}
+			state.Lock.Lock()
 			state.UpstreamStatus = "Completed"
+			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
 		} else {
 			state.UpstreamStatus = "Idle"
 		}
@@ -186,6 +193,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
 			}
 		}
+
+		state.Lock.Lock()
+		state.WriterActive = false
+		state.Lock.Unlock()
+
 		log.Printf("[Coord] Exiting background coordinator for cache: %s", state.Key)
 	}()
 
@@ -340,20 +352,57 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 					workersLock.Lock()
 					for _, w := range activeWorkers {
 						wCurrent := w.currentBlock
-						wOffset := atomic.LoadInt64(&w.offset)
-						wSpeed := atomic.LoadInt64(&w.speed)
-						
-						// If a worker is moving sequentially towards sb and has speed > 0
-						if wCurrent >= 0 && wCurrent <= sb && wSpeed > 0 {
-							targetOffset := int64(sb) * GlobalConfig.BlockSize
-							if wOffset <= targetOffset {
-								bytesRemaining := (int64(sb)+1)*GlobalConfig.BlockSize - wOffset
-								eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
-								if eta < GlobalConfig.ClientHydrationWait {
-									log.Printf("[Coord] Client Hydration Wait active for block %d (ETA %.2fs < threshold %s). Suppressing connection jump.", 
-										sb, eta.Seconds(), GlobalConfig.ClientHydrationWait)
-									suppressed = true
+						if wCurrent < 0 {
+							continue
+						}
+
+						// 1. If the worker is already downloading sb, or is about to download sb next
+						if wCurrent == sb || wCurrent+1 == sb {
+							log.Printf("[Coord] Client Hydration Wait active for block %d (worker %d is at block %d). Suppressing connection jump.", 
+								sb, w.id, wCurrent)
+							suppressed = true
+							break
+						}
+
+						// 2. If the worker is further behind, check if it will reach sb sequentially
+						if wCurrent < sb {
+							// Check if there are any completed blocks in between
+							hasCompletedBlockInPath := false
+							for b := wCurrent + 1; b < sb; b++ {
+								if state.BlockStates[b] == BlockCompleted {
+									hasCompletedBlockInPath = true
 									break
+								}
+							}
+
+							if !hasCompletedBlockInPath {
+								wOffset := atomic.LoadInt64(&w.offset)
+								wSpeed := atomic.LoadInt64(&w.speed)
+
+								// Estimate speed dynamically if not set yet
+								if wSpeed == 0 {
+									connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
+									connBytes := atomic.LoadInt64(&w.connBytesWritten)
+									if connStartNano > 0 && connBytes > 0 {
+										elapsedSecs := time.Since(time.Unix(0, connStartNano)).Seconds()
+										if elapsedSecs > 0.1 {
+											wSpeed = int64(float64(connBytes) / elapsedSecs)
+										}
+									}
+								}
+
+								if wSpeed > 0 {
+									targetOffset := int64(sb) * GlobalConfig.BlockSize
+									if wOffset <= targetOffset {
+										bytesRemaining := (int64(sb)+1)*GlobalConfig.BlockSize - wOffset
+										eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
+										if eta < GlobalConfig.ClientHydrationWait {
+											log.Printf("[Coord] Client Hydration Wait active for block %d (ETA %.2fs < threshold %s). Suppressing connection jump.", 
+												sb, eta.Seconds(), GlobalConfig.ClientHydrationWait)
+											suppressed = true
+											break
+										}
+									}
 								}
 							}
 						}

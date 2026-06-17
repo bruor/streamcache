@@ -1440,6 +1440,99 @@ func TestConcurrentUpstreamWorkers(t *testing.T) {
 	}
 }
 
+func TestClientSequentialReadSuppression(t *testing.T) {
+	// Setup cache and tmp dirs
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	tmpDir := t.TempDir()
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	// Save and mock config
+	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldWait := GlobalConfig.ClientHydrationWait
+	oldBlockSize := GlobalConfig.BlockSize
+	GlobalConfig.MaxUpstreamWorkers = 2
+	GlobalConfig.ClientHydrationWait = 2 * time.Second
+	GlobalConfig.BlockSize = 100
+
+	defer func() {
+		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
+		GlobalConfig.ClientHydrationWait = oldWait
+		GlobalConfig.BlockSize = oldBlockSize
+	}()
+
+	// Mock server with delay for block 0 to keep Worker 1 active
+	var lock sync.Mutex
+	var requestedRanges []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		isFirst := len(requestedRanges) == 1
+		lock.Unlock()
+
+		if isFirst {
+			time.Sleep(250 * time.Millisecond)
+		}
+
+		w.Header().Set("Content-Range", "bytes 0-99/400")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 100))
+	}))
+	defer server.Close()
+
+	key := "test_sequential_suppression.mkv"
+	state := &FileCacheState{
+		Key:          key,
+		URL:          server.URL,
+		Path:         filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:    400,
+		TotalBlocks:  4,
+		BlockStates:  []int{BlockNotStarted, BlockNotStarted, BlockNotStarted, BlockNotStarted},
+		Clients:      make(map[string]chan struct{}),
+		Starving:     make(map[string]int),
+		NotifyChan:   make(chan struct{}, 10),
+	}
+	defer cleanupAfterTest(t, state)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	// 1. Start coordinator. It will automatically spawn worker 1 starting at block 0.
+	StartCoordinator(state, nil)
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Simulate sequential client reading block 1 (sb = 1, worker currentBlock = 0)
+	state.Lock.Lock()
+	state.Starving["client-test"] = 1
+	state.Lock.Unlock()
+
+	select {
+	case state.NotifyChan <- struct{}{}:
+	default:
+	}
+
+	// Wait for coordinator to evaluate starvation
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify that ONLY 1 upstream connection range request was made (no second worker spawned for block 1)
+	lock.Lock()
+	ranges := make([]string, len(requestedRanges))
+	copy(ranges, requestedRanges)
+	lock.Unlock()
+
+	if len(ranges) != 1 {
+		t.Errorf("Expected exactly 1 range request (suppression should prevent worker 2 from spawning for block 1), but got %d. Ranges: %v", len(ranges), ranges)
+	}
+}
+
 func TestConnectionTelemetry(t *testing.T) {
 	state := &FileCacheState{}
 	

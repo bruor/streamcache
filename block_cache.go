@@ -217,6 +217,18 @@ func (r *CacheRegistry) UpdateConnectionStarvation(connID string, starvingBlock 
 	}
 }
 
+func (r *CacheRegistry) MarkConnectionsAsInCache(key string) {
+	r.Lock.Lock()
+	defer r.Lock.Unlock()
+	if r.Connections != nil {
+		for _, conn := range r.Connections {
+			if conn.Key == key {
+				conn.InCache = true
+			}
+		}
+	}
+}
+
 // LoadExistingCache runs once at startup to calculate initial cache size
 // and delete any dangling .part files that don't have metadata.
 func (r *CacheRegistry) LoadExistingCache() {
