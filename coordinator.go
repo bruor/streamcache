@@ -69,8 +69,6 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	state.Lock.Unlock()
 
 	parentCtx, parentCancel := context.WithCancel(context.Background())
-	var activeWorkers []*Worker
-	var workersLock sync.Mutex
 	workerIdGen := 0
 
 	defer func() {
@@ -202,11 +200,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	}()
 
 	removeWorker := func(w *Worker) {
-		workersLock.Lock()
-		defer workersLock.Unlock()
-		for i, aw := range activeWorkers {
+		state.WorkersLock.Lock()
+		defer state.WorkersLock.Unlock()
+		for i, aw := range state.ActiveWorkers {
 			if aw.id == w.id {
-				activeWorkers = append(activeWorkers[:i], activeWorkers[i+1:]...)
+				state.ActiveWorkers = append(state.ActiveWorkers[:i], state.ActiveWorkers[i+1:]...)
 				break
 			}
 		}
@@ -217,8 +215,8 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	}
 
 	spawnWorker := func(startBlock int) {
-		workersLock.Lock()
-		defer workersLock.Unlock()
+		state.WorkersLock.Lock()
+		defer state.WorkersLock.Unlock()
 		workerIdGen++
 		wCtx, wCancel := context.WithCancel(parentCtx)
 		w := &Worker{
@@ -227,7 +225,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			cancel:       wCancel,
 			currentBlock: startBlock,
 		}
-		activeWorkers = append(activeWorkers, w)
+		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, removeWorker, parentCancel)
 	}
 
@@ -273,9 +271,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		}
 
 		// Keep-alive check: if no workers are running, start one
-		workersLock.Lock()
-		activeCount := len(activeWorkers)
-		workersLock.Unlock()
+		state.WorkersLock.Lock()
+		activeCount := len(state.ActiveWorkers)
+		state.WorkersLock.Unlock()
 		
 		if activeCount == 0 {
 			state.Lock.Lock()
@@ -301,14 +299,14 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			// If any active worker is currently pre-fetching index/metadata,
 			// suppress spawning of new workers and pre-emption to avoid race conditions.
 			isPreFetchingActive := false
-			workersLock.Lock()
-			for _, w := range activeWorkers {
+			state.WorkersLock.Lock()
+			for _, w := range state.ActiveWorkers {
 				if atomic.LoadInt32(&w.isPrefetching) == 1 {
 					isPreFetchingActive = true
 					break
 				}
 			}
-			workersLock.Unlock()
+			state.WorkersLock.Unlock()
 
 			if isPreFetchingActive {
 				state.Lock.Unlock()
@@ -321,14 +319,14 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				if state.BlockStates[sb] != BlockCompleted {
 					// Check if any active worker is currently downloading this block
 					isBeingDownloaded := false
-					workersLock.Lock()
-					for _, w := range activeWorkers {
+					state.WorkersLock.Lock()
+					for _, w := range state.ActiveWorkers {
 						if w.currentBlock == sb {
 							isBeingDownloaded = true
 							break
 						}
 					}
-					workersLock.Unlock()
+					state.WorkersLock.Unlock()
 
 					if !isBeingDownloaded {
 						alreadyInList := false
@@ -349,8 +347,8 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				// For each starvation target, decide whether to wait (Hydration Wait Time) or spawn/preempt
 				for _, sb := range starvingBlocks {
 					suppressed := false
-					workersLock.Lock()
-					for _, w := range activeWorkers {
+					state.WorkersLock.Lock()
+					for _, w := range state.ActiveWorkers {
 						wCurrent := w.currentBlock
 						if wCurrent < 0 {
 							continue
@@ -407,15 +405,15 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 							}
 						}
 					}
-					workersLock.Unlock()
+					state.WorkersLock.Unlock()
 
 					if suppressed {
 						continue
 					}
 
-					workersLock.Lock()
-					activeCount = len(activeWorkers)
-					workersLock.Unlock()
+					state.WorkersLock.Lock()
+					activeCount = len(state.ActiveWorkers)
+					state.WorkersLock.Unlock()
 
 					if activeCount < GlobalConfig.MaxUpstreamWorkers {
 						log.Printf("[Coord] Spawning new worker starting at starving block %d (Active: %d/%d)", 
@@ -423,11 +421,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						spawnWorker(sb)
 					} else {
 						// Worker limit reached. Find furthest worker to pre-empt
-						workersLock.Lock()
+						state.WorkersLock.Lock()
 						var workerToPreempt *Worker
 						maxDistance := int64(-1)
 						
-						for _, w := range activeWorkers {
+						for _, w := range state.ActiveWorkers {
 							wCurrent := w.currentBlock
 							
 							// Check debouncer always to protect CDN from connection thrashing
@@ -470,18 +468,18 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								workerToPreempt.id, workerToPreempt.currentBlock, sb)
 							workerToPreempt.cancel()
 							
-							// Remove from activeWorkers slice immediately to prevent reuse
-							for i, aw := range activeWorkers {
+							// Remove from ActiveWorkers slice immediately to prevent reuse
+							for i, aw := range state.ActiveWorkers {
 								if aw.id == workerToPreempt.id {
-									activeWorkers = append(activeWorkers[:i], activeWorkers[i+1:]...)
+									state.ActiveWorkers = append(state.ActiveWorkers[:i], state.ActiveWorkers[i+1:]...)
 									break
 								}
 							}
-							workersLock.Unlock()
+							state.WorkersLock.Unlock()
 							
 							spawnWorker(sb)
 						} else {
-							workersLock.Unlock()
+							state.WorkersLock.Unlock()
 						}
 					}
 				}
@@ -942,10 +940,22 @@ func runDownloadWorker(
 			}
 			
 			if nextStatus == BlockDownloading {
-				log.Printf("[Worker-%d] Next block %d already downloading by another worker. Exiting.", w.id, nextBlock)
-				state.Lock.Unlock()
-				closeConnection()
-				return
+				isAnotherWorkerDownloading := false
+				state.WorkersLock.Lock()
+				for _, aw := range state.ActiveWorkers {
+					if aw.id != w.id && aw.currentBlock == nextBlock {
+						isAnotherWorkerDownloading = true
+						break
+					}
+				}
+				state.WorkersLock.Unlock()
+
+				if isAnotherWorkerDownloading {
+					log.Printf("[Worker-%d] Next block %d already downloading by another worker. Exiting.", w.id, nextBlock)
+					state.Lock.Unlock()
+					closeConnection()
+					return
+				}
 			}
 
 			currentBlock = nextBlock

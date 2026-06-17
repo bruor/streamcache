@@ -66,6 +66,8 @@ type FileCacheState struct {
 	UpstreamStatus     string
 	RecentConnections  map[string]*ConnectionInfo
 	ObservedCooldown   float64
+	ActiveWorkers      []*Worker
+	WorkersLock        sync.Mutex
 }
 
 type ConnectionInfo struct {
