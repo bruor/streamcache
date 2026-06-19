@@ -263,6 +263,9 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 	// Find a matching session
 	var matchedSession *ClientSession
 	if r.Sessions != nil {
+		var bestSession *ClientSession
+		var bestDiff int64 = -1
+
 		for _, session := range r.Sessions {
 			if session.Key != conn.Key {
 				continue
@@ -273,16 +276,25 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 			if !userAgentsMatch(session.UserAgent, conn.UserAgent) {
 				continue
 			}
+
+			// If the session is idle, it is a very strong match candidate (e.g. player seeks or resumes)
+			if session.ActiveConns == 0 {
+				bestSession = session
+				break
+			}
+
 			diff := conn.Offset - session.Offset
 			if diff < 0 {
 				diff = -diff
 			}
-			isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-10*1024*1024
-			if diff <= 5*1024*1024 || isNearEOF {
-				matchedSession = session
-				break
+
+			// Track the session with the smallest offset difference
+			if bestDiff == -1 || diff < bestDiff {
+				bestDiff = diff
+				bestSession = session
 			}
 		}
+		matchedSession = bestSession
 	}
 
 	if matchedSession != nil {
