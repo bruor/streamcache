@@ -409,6 +409,19 @@
             border: 1px solid rgba(57, 255, 20, 0.3);
         }
 
+        .connection-status-badge.active {
+            background: rgba(57, 255, 20, 0.1);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 255, 20, 0.3);
+        }
+
+        .connection-status-badge.idle {
+            background: rgba(255, 159, 28, 0.15);
+            color: var(--accent-orange);
+            border: 1px solid rgba(255, 159, 28, 0.3);
+            animation: pulse-glow-orange 1.5s infinite;
+        }
+
         .connection-status-badge.hydrating {
             background: rgba(0, 240, 255, 0.1);
             color: var(--accent-secondary);
@@ -799,9 +812,12 @@
                         }
 
                         // Determine status
-                        let statusClass = 'hydrating';
-                        let statusText = 'Hydrating';
-                        if (conn.in_cache) {
+                        let statusClass = 'active';
+                        let statusText = 'Active';
+                        if (conn.active_conns === 0) {
+                            statusClass = 'idle';
+                            statusText = 'Buffered / Idle';
+                        } else if (conn.in_cache) {
                             statusClass = 'downloaded';
                             statusText = 'Downloaded';
                         } else if (conn.starving_block !== -1) {
@@ -822,10 +838,12 @@
                             percentageStr = ` (${percent}%)`;
                         }
 
+                        const activeLabel = conn.active_conns !== undefined ? (conn.active_conns > 0 ? ` (${conn.active_conns} active)` : ' (Idle)') : '';
+
                         connHtml += `
                             <div class="connection-item">
                                 <div class="connection-header">
-                                    <span class="connection-client-id">${conn.id}</span>
+                                    <span class="connection-client-id">${conn.id}${activeLabel}</span>
                                     <span class="connection-status-badge ${statusClass}">${statusText}</span>
                                 </div>
                                 <div class="connection-details">

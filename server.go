@@ -133,13 +133,18 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					totalSize = stat.Size()
 				}
 
+				var startOffset int64
+				if r != nil {
+					startOffset = parseRangeStart(r.Header.Get("Range"))
+				}
+
 				conn := &ClientConnection{
 					ID:            connID,
 					Key:           cacheFileName,
 					URL:           targetURL,
 					RemoteAddr:    remoteAddr,
 					UserAgent:     userAgent,
-					Offset:        0,
+					Offset:        startOffset,
 					TotalSize:     totalSize,
 					StartTime:     time.Now().Unix(),
 					InCache:       true,
@@ -268,6 +273,8 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDebugState(w http.ResponseWriter, r *http.Request) {
+	activeSessions := GlobalRegistry.GetActiveSessions()
+
 	GlobalRegistry.Lock.RLock()
 	defer GlobalRegistry.Lock.RUnlock()
 
@@ -283,7 +290,6 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var activeFiles []debugFile
-	var activeConnections []ClientConnection
 	for k, fileState := range GlobalRegistry.Files {
 		fileState.Lock.Lock()
 		completed := 0
@@ -312,9 +318,6 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		fileState.Lock.Unlock()
 	}
 
-	for _, conn := range GlobalRegistry.Connections {
-		activeConnections = append(activeConnections, *conn)
-	}
 
 	// Sort active files from most complete to least complete (descending)
 	sort.Slice(activeFiles, func(i, j int) bool {
@@ -332,9 +335,9 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		return compI > compJ
 	})
 
-	// Sort active connections by start time (oldest first)
-	sort.Slice(activeConnections, func(i, j int) bool {
-		return activeConnections[i].StartTime < activeConnections[j].StartTime
+	// Sort active sessions by start time (oldest first)
+	sort.Slice(activeSessions, func(i, j int) bool {
+		return activeSessions[i].StartTime < activeSessions[j].StartTime
 	})
 
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
@@ -344,7 +347,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		"max_cache_size_bytes":   GlobalConfig.CacheMaxBytes,
 		"disk_free_bytes":        freeSpace,
 		"active_downloads":       activeFiles,
-		"active_connections":     activeConnections,
+		"active_connections":     activeSessions,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

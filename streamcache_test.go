@@ -1979,3 +1979,182 @@ func TestCommittingStateIncluded(t *testing.T) {
 	}
 }
 
+func TestClientSessionMapping(t *testing.T) {
+	// Initialize / clear registry
+	GlobalRegistry.Lock.Lock()
+	oldConnections := GlobalRegistry.Connections
+	oldSessions := GlobalRegistry.Sessions
+	GlobalRegistry.Connections = make(map[string]*ClientConnection)
+	GlobalRegistry.Sessions = make(map[string]*ClientSession)
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Connections = oldConnections
+		GlobalRegistry.Sessions = oldSessions
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	key := "test_session_video.mp4"
+	url := "http://example.com/test_session_video.mp4"
+	ip := "192.168.1.100:12345"
+	ua := "Lavf/60.3.100"
+
+	// 1. Register first connection
+	conn1 := &ClientConnection{
+		ID:            "conn1",
+		Key:           key,
+		URL:           url,
+		RemoteAddr:    ip,
+		UserAgent:     ua,
+		Offset:        1000,
+		TotalSize:     100000,
+		StartTime:     time.Now().Unix(),
+		InCache:       false,
+		StarvingBlock: -1,
+	}
+	GlobalRegistry.RegisterConnection("conn1", conn1)
+
+	sessions := GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("Expected 1 active session, got %d", len(sessions))
+	}
+	session := sessions[0]
+	if session.ID != "conn1" {
+		t.Errorf("Expected session ID to be 'conn1', got '%s'", session.ID)
+	}
+	if session.ActiveConns != 1 {
+		t.Errorf("Expected active_conns to be 1, got %d", session.ActiveConns)
+	}
+
+	// 2. Register second connection (ephemeral port changes, offset within 5MB)
+	conn2 := &ClientConnection{
+		ID:            "conn2",
+		Key:           key,
+		URL:           url,
+		RemoteAddr:    "192.168.1.100:54321", // same IP, different port
+		UserAgent:     ua,
+		Offset:        2000, // within 5MB
+		TotalSize:     100000,
+		StartTime:     time.Now().Unix(),
+		InCache:       false,
+		StarvingBlock: -1,
+	}
+	GlobalRegistry.RegisterConnection("conn2", conn2)
+
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("Expected connections from same IP/key to be grouped, got %d sessions", len(sessions))
+	}
+	session = sessions[0]
+	if session.ActiveConns != 2 {
+		t.Errorf("Expected active_conns to be 2, got %d", session.ActiveConns)
+	}
+
+	// 3. Unregister one connection -> session should remain active but with active_conns = 1
+	GlobalRegistry.UnregisterConnection("conn1")
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("Expected 1 session to remain, got %d", len(sessions))
+	}
+	session = sessions[0]
+	if session.ActiveConns != 1 {
+		t.Errorf("Expected active_conns to be 1 after unregistering conn1, got %d", session.ActiveConns)
+	}
+
+	// 4. Unregister second connection -> session should remain (Buffered / Idle) with active_conns = 0
+	GlobalRegistry.UnregisterConnection("conn2")
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("Expected session to remain in idle cooldown, got %d sessions", len(sessions))
+	}
+	session = sessions[0]
+	if session.ActiveConns != 0 {
+		t.Errorf("Expected active_conns to be 0, got %d", session.ActiveConns)
+	}
+
+	// 5. Test concurrency split (watch party scenario)
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Connections = make(map[string]*ClientConnection)
+	GlobalRegistry.Sessions = make(map[string]*ClientSession)
+	GlobalRegistry.Lock.Unlock()
+
+	conn3 := &ClientConnection{
+		ID:            "conn3",
+		Key:           key,
+		URL:           url,
+		RemoteAddr:    "192.168.1.100:11111",
+		UserAgent:     ua,
+		Offset:        5000,
+		TotalSize:     100000,
+		StartTime:     time.Now().Unix(),
+		InCache:       false,
+		StarvingBlock: -1,
+	}
+	conn4 := &ClientConnection{
+		ID:            "conn4",
+		Key:           key,
+		URL:           url,
+		RemoteAddr:    "192.168.1.100:22222",
+		UserAgent:     ua,
+		Offset:        6000,
+		TotalSize:     100000,
+		StartTime:     time.Now().Unix(),
+		InCache:       false,
+		StarvingBlock: -1,
+	}
+
+	GlobalRegistry.RegisterConnection("conn3", conn3)
+	GlobalRegistry.RegisterConnection("conn4", conn4)
+
+	// Verify they are grouped initially
+	GlobalRegistry.Lock.Lock()
+	sess, ok := GlobalRegistry.Sessions["conn3"]
+	if !ok {
+		GlobalRegistry.Lock.Unlock()
+		t.Fatal("Expected session for conn3 to exist")
+	}
+	// Artificially manipulate Opened timestamps to mock > 2 seconds concurrency overlap
+	sess.Conns["conn3"].Opened = time.Now().Add(-5 * time.Second)
+	sess.Conns["conn4"].Opened = time.Now().Add(-3 * time.Second)
+	GlobalRegistry.Lock.Unlock()
+
+	// GetActiveSessions should trigger the split
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 2 {
+		t.Fatalf("Expected concurrency split to result in 2 sessions, got %d", len(sessions))
+	}
+
+	// 6. Test 60-second idle cleanup
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Connections = make(map[string]*ClientConnection)
+	GlobalRegistry.Sessions = make(map[string]*ClientSession)
+	GlobalRegistry.Lock.Unlock()
+
+	conn5 := &ClientConnection{
+		ID:            "conn5",
+		Key:           key,
+		URL:           url,
+		RemoteAddr:    ip,
+		UserAgent:     ua,
+		Offset:        1000,
+		TotalSize:     100000,
+		StartTime:     time.Now().Unix(),
+	}
+	GlobalRegistry.RegisterConnection("conn5", conn5)
+	GlobalRegistry.UnregisterConnection("conn5")
+
+	// Artificially age the idle session
+	GlobalRegistry.Lock.Lock()
+	sess5 := GlobalRegistry.Sessions["conn5"]
+	sess5.LastActive = time.Now().Add(-61 * time.Second)
+	GlobalRegistry.Lock.Unlock()
+
+	// GetActiveSessions should purge it
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 0 {
+		t.Errorf("Expected idle session to be purged, got %d sessions", len(sessions))
+	}
+}
+
+

@@ -27,7 +27,7 @@ It dynamically proxies video requests, downloads and caches content on-demand in
   - *Legacy Cache Migration*: Automatically detects and migrates legacy cache files (extensionless `[key]` format) to the new cache standard (`[key].ext` and companion `.json` metadata file) on-demand when requested by a client.
   - *Missing Metadata Recovery*: If a cached media file's companion `.json` metadata file is missing or deleted, the proxy dynamically regenerates it using the file's size and original disk modification time (`ModTime`) rather than evicting the file, ensuring seamless integration with the revalidation pipeline with zero redundant downloads.
 - **Dual Proxy Formats**: Supports query parameters (`/stream?url=...`) as well as clean, Base64-encoded URL paths (`/u/<base64_url>`).
-- **SSE Web Dashboard**: Includes a real-time web UI showing cache metrics, network stats, real-time CDN download speeds, smart log console scroll-locking, and active client connection details (tracking connection metadata, byte offset, and playback position percentage for downloaded and hydrating streams). It also visualizes the real-time connection status between the proxy and the upstream CDN (e.g. `Connecting`, `Downloading`, `Throttled`, `Completed`) to clearly distinguish upstream network conditions from client-side playback starvation.
+- **SSE Web Dashboard & Contiguous Playback Sessions**: Includes a real-time web UI showing cache metrics, network stats, real-time CDN download speeds, smart log console scroll-locking, and contiguous client playback sessions (which group short-lived player TCP connections into stable session cards, tracking connection metadata, byte offset, active connection count, and playback position percentage for downloaded and hydrating streams). It also visualizes the real-time connection status between the proxy and the upstream CDN (e.g. `Connecting`, `Downloading`, `Throttled`, `Completed`) to clearly distinguish upstream network conditions from client-side playback starvation.
 
 ---
 
@@ -131,6 +131,6 @@ For clean URLs or to hide raw upstream links from clients, Base64-encode the tar
 
 ## 🛠️ Diagnostics & Development
 
-- **SSE Web Dashboard**: `http://localhost:8080/` (displays cache storage status, active downloads, system logs, and live client connections with play offset, percentage progress, and downloaded/hydrating status tracking)
+- **SSE Web Dashboard**: `http://localhost:8080/` (displays cache storage status, active downloads, system logs, and stable client playback sessions with play offset, percentage progress, active connection count, and downloaded/hydrating/idle status tracking)
 - **JSON Registry State**: `http://localhost:8080/debug/state` (exposes memory maps of cache blocks and detailed client connection metadata)
 - **Go pprof Profile Endpoint**: `http://localhost:8080/debug/pprof/` (runtime profiling tools)

@@ -109,6 +109,8 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
+	activeSessions := GlobalRegistry.GetActiveSessions()
+
 	GlobalRegistry.Lock.RLock()
 	defer GlobalRegistry.Lock.RUnlock()
 
@@ -128,7 +130,6 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 	}
 
 	var activeFiles []sseFile
-	var activeConnections []ClientConnection
 	for k, fileState := range GlobalRegistry.Files {
 		fileState.Lock.Lock()
 
@@ -192,9 +193,6 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		fileState.Lock.Unlock()
 	}
 
-	for _, conn := range GlobalRegistry.Connections {
-		activeConnections = append(activeConnections, *conn)
-	}
 
 	// Sort active files from most complete to least complete (descending)
 	sort.Slice(activeFiles, func(i, j int) bool {
@@ -207,9 +205,9 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		return compI > compJ
 	})
 
-	// Sort active connections by start time (oldest first)
-	sort.Slice(activeConnections, func(i, j int) bool {
-		return activeConnections[i].StartTime < activeConnections[j].StartTime
+	// Sort active sessions by start time (oldest first)
+	sort.Slice(activeSessions, func(i, j int) bool {
+		return activeSessions[i].StartTime < activeSessions[j].StartTime
 	})
 
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
@@ -220,7 +218,7 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		"disk_free_bytes":        freeSpace,
 		"min_disk_free_bytes":    GlobalConfig.MinDiskFreeBytes,
 		"active_downloads":       activeFiles,
-		"active_connections":     activeConnections,
+		"active_connections":     activeSessions,
 	}
 
 	payload, err := json.Marshal(data)

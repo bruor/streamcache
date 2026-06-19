@@ -55,13 +55,18 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 	url := state.URL
 	state.Lock.Unlock()
 
+	var startOffset int64
+	if req != nil {
+		startOffset = parseRangeStart(req.Header.Get("Range"))
+	}
+
 	conn := &ClientConnection{
 		ID:            clientID,
 		Key:           key,
 		URL:           url,
 		RemoteAddr:    remoteAddr,
 		UserAgent:     userAgent,
-		Offset:        0,
+		Offset:        startOffset,
 		TotalSize:     totalSize,
 		StartTime:     time.Now().Unix(),
 		InCache:       isCompleted,
