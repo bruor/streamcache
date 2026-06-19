@@ -2155,6 +2155,65 @@ func TestClientSessionMapping(t *testing.T) {
 	if len(sessions) != 0 {
 		t.Errorf("Expected idle session to be purged, got %d sessions", len(sessions))
 	}
+
+	// 7. Test EOF grouping, probe classification and offset protection
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Connections = make(map[string]*ClientConnection)
+	GlobalRegistry.Sessions = make(map[string]*ClientSession)
+	GlobalRegistry.Lock.Unlock()
+
+	conn6 := &ClientConnection{
+		ID:            "conn6",
+		Key:           key,
+		URL:           url,
+		RemoteAddr:    ip,
+		UserAgent:     ua,
+		Offset:        1000,
+		StartOffset:   1000,
+		TotalSize:     100000000, // 100MB
+		StartTime:     time.Now().Unix(),
+	}
+	GlobalRegistry.RegisterConnection("conn6", conn6)
+
+	// conn7 is registered near EOF and has read 0 bytes -> should be identified as a probe
+	conn7 := &ClientConnection{
+		ID:            "conn7",
+		Key:           key,
+		URL:           url,
+		RemoteAddr:    "192.168.1.100:55555",
+		UserAgent:     ua,
+		Offset:        95000000, // within 10MB of EOF
+		StartOffset:   95000000,
+		TotalSize:     100000000,
+		StartTime:     time.Now().Unix(),
+	}
+	GlobalRegistry.RegisterConnection("conn7", conn7)
+
+	// GetActiveSessions should count ONLY conn6 (non-probe), so ActiveConns should be 1
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("Expected EOF connection to group with existing session, got %d sessions", len(sessions))
+	}
+	session = sessions[0]
+	if session.ActiveConns != 1 {
+		t.Errorf("Expected active_conns to be 1 (conn7 is a probe), got %d", session.ActiveConns)
+	}
+
+	// The session offset should NOT be overwritten by the EOF probe connection offset
+	if session.Offset != 1000 {
+		t.Errorf("Expected session offset to remain 1000, got %d", session.Offset)
+	}
+
+	// Now simulate conn7 reading more than 2MB (becomes a legitimate playback, no longer a probe)
+	conn7.Offset = 98000000 // has read 3MB (98MB - 95MB = 3MB)
+	GlobalRegistry.UpdateConnectionOffset("conn7", 98000000)
+
+	// Since conn7 is no longer a probe, ActiveConns should now be 2, and the session offset can update
+	sessions = GlobalRegistry.GetActiveSessions()
+	session = sessions[0]
+	if session.ActiveConns != 2 {
+		t.Errorf("Expected active_conns to be 2 after conn7 read > 2MB, got %d", session.ActiveConns)
+	}
 }
 
 

@@ -67,6 +67,7 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		RemoteAddr:    remoteAddr,
 		UserAgent:     userAgent,
 		Offset:        startOffset,
+		StartOffset:   startOffset,
 		TotalSize:     totalSize,
 		StartTime:     time.Now().Unix(),
 		InCache:       isCompleted,

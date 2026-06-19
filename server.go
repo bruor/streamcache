@@ -145,6 +145,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					RemoteAddr:    remoteAddr,
 					UserAgent:     userAgent,
 					Offset:        startOffset,
+					StartOffset:   startOffset,
 					TotalSize:     totalSize,
 					StartTime:     time.Now().Unix(),
 					InCache:       true,

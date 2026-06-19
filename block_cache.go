@@ -37,6 +37,7 @@ type ClientConnection struct {
 	RemoteAddr    string `json:"remote_addr"`
 	UserAgent     string `json:"user_agent"`
 	Offset        int64  `json:"offset"`
+	StartOffset   int64  `json:"start_offset"`
 	TotalSize     int64  `json:"total_size"`
 	StartTime     int64  `json:"start_time"` // Unix timestamp
 	InCache       bool   `json:"in_cache"`
@@ -50,6 +51,7 @@ type ClientSession struct {
 	RemoteAddr    string                      `json:"remote_addr"`
 	UserAgent     string                      `json:"user_agent"`
 	Offset        int64                       `json:"offset"`
+	MaxOffset     int64                       `json:"max_offset"`
 	TotalSize     int64                       `json:"total_size"`
 	StartTime     int64                       `json:"start_time"` // Unix timestamp
 	LastActive    time.Time                   `json:"last_active"`
@@ -275,7 +277,8 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 			if diff < 0 {
 				diff = -diff
 			}
-			if diff <= 5*1024*1024 {
+			isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-10*1024*1024
+			if diff <= 5*1024*1024 || isNearEOF {
 				matchedSession = session
 				break
 			}
@@ -291,13 +294,32 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		}
 		matchedSession.ActiveConns = len(matchedSession.Conns)
 		matchedSession.LastActive = time.Now()
-		matchedSession.Offset = conn.Offset
+		
+		isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-10*1024*1024
+		wasNotPreceded := matchedSession.MaxOffset < conn.TotalSize-15*1024*1024
+		readLimitNotExceeded := (conn.Offset - conn.StartOffset) <= 2*1024*1024
+		isProbe := isNearEOF && wasNotPreceded && readLimitNotExceeded
+
+		if !isProbe {
+			matchedSession.Offset = conn.Offset
+			if conn.Offset > matchedSession.MaxOffset {
+				matchedSession.MaxOffset = conn.Offset
+			}
+		}
 		matchedSession.InCache = conn.InCache
 		matchedSession.StarvingBlock = conn.StarvingBlock
 	} else {
 		if r.Sessions == nil {
 			r.Sessions = make(map[string]*ClientSession)
 		}
+		isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-10*1024*1024
+		isProbe := isNearEOF && (conn.Offset-conn.StartOffset) <= 2*1024*1024
+
+		var initialMaxOffset int64
+		if !isProbe {
+			initialMaxOffset = conn.Offset
+		}
+
 		newSession := &ClientSession{
 			ID:            connID,
 			Key:           conn.Key,
@@ -305,6 +327,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 			RemoteAddr:    conn.RemoteAddr,
 			UserAgent:     conn.UserAgent,
 			Offset:        conn.Offset,
+			MaxOffset:     initialMaxOffset,
 			TotalSize:     conn.TotalSize,
 			StartTime:     time.Now().Unix(),
 			LastActive:    time.Now(),
@@ -346,7 +369,12 @@ func (r *CacheRegistry) UpdateConnectionOffset(connID string, offset int64) {
 			if r.Sessions != nil {
 				for _, session := range r.Sessions {
 					if _, exists := session.Conns[connID]; exists {
-						session.Offset = offset
+						isNearEOF := conn.TotalSize > 0 && offset >= conn.TotalSize-10*1024*1024
+						sessionIsNearEOF := session.TotalSize > 0 && session.Offset >= session.TotalSize-10*1024*1024
+
+						if len(session.Conns) <= 1 || !isNearEOF || sessionIsNearEOF {
+							session.Offset = offset
+						}
 						session.LastActive = time.Now()
 						break
 					}
@@ -438,6 +466,13 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 					}
 					if now.Sub(info.Opened) > 2*time.Second {
 						if cc, ok := r.Connections[id]; ok {
+							isNearEOF := cc.TotalSize > 0 && cc.Offset >= cc.TotalSize-10*1024*1024
+							isProbe := isNearEOF && (cc.Offset-cc.StartOffset) <= 2*1024*1024
+							var initialMaxOffset int64
+							if !isProbe {
+								initialMaxOffset = cc.Offset
+							}
+
 							newSession := &ClientSession{
 								ID:            cc.ID,
 								Key:           cc.Key,
@@ -445,6 +480,7 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 								RemoteAddr:    cc.RemoteAddr,
 								UserAgent:     cc.UserAgent,
 								Offset:        cc.Offset,
+								MaxOffset:     initialMaxOffset,
 								TotalSize:     cc.TotalSize,
 								StartTime:     cc.StartTime,
 								LastActive:    now,
@@ -460,8 +496,41 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 						}
 					}
 				}
-				session.ActiveConns = len(session.Conns)
 			}
+		}
+
+		// Calculate non-probe active connections count and set session offset/active conns
+		for _, session := range r.Sessions {
+			var oldestNonProbeOffset int64 = -1
+			var oldestNonProbeTime time.Time
+			nonProbeCount := 0
+
+			for id, info := range session.Conns {
+				cc, ok := r.Connections[id]
+				if !ok {
+					continue
+				}
+				isNearEOF := cc.TotalSize > 0 && cc.Offset >= cc.TotalSize-10*1024*1024
+				wasNotPreceded := session.MaxOffset < cc.TotalSize-15*1024*1024
+				readLimitNotExceeded := (cc.Offset - cc.StartOffset) <= 2*1024*1024
+				isProbe := isNearEOF && wasNotPreceded && readLimitNotExceeded
+
+				if !isProbe {
+					nonProbeCount++
+					if oldestNonProbeTime.IsZero() || info.Opened.Before(oldestNonProbeTime) {
+						oldestNonProbeTime = info.Opened
+						oldestNonProbeOffset = cc.Offset
+					}
+				}
+			}
+
+			if oldestNonProbeOffset != -1 {
+				session.Offset = oldestNonProbeOffset
+				if oldestNonProbeOffset > session.MaxOffset {
+					session.MaxOffset = oldestNonProbeOffset
+				}
+			}
+			session.ActiveConns = nonProbeCount
 		}
 
 		for id, session := range r.Sessions {
@@ -474,6 +543,10 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 	var list []ClientSession
 	if r.Sessions != nil {
 		for _, session := range r.Sessions {
+			// Filter out pure probes: sessions with no non-probe connections and no play history
+			if session.MaxOffset == 0 && session.ActiveConns == 0 {
+				continue
+			}
 			list = append(list, *session)
 		}
 	}
