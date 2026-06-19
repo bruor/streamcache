@@ -541,8 +541,8 @@
 
             <div class="card">
                 <div class="card-title">
-                    <span>Active Client Connections</span>
-                    <span style="font-size: 0.85rem; color: var(--text-sub);" id="connections-count">0 Connected</span>
+                    <span>Active Client Sessions</span>
+                    <span style="font-size: 0.85rem; color: var(--text-sub);" id="connections-count">0 Sessions</span>
                 </div>
                 <div id="connections-container">
                     <div class="empty-state">No active client connections.</div>
@@ -793,11 +793,11 @@
 
                 // Update active connections
                 const connections = data.active_connections || [];
-                connectionsCountEl.innerText = `${connections.length} Connected`;
+                connectionsCountEl.innerText = `${connections.length} Sessions`;
 
                 if (connections.length === 0) {
                     connectionsContainer.innerHTML = `
-                        <div class="empty-state">No active client connections.</div>
+                        <div class="empty-state">No active client sessions.</div>
                     `;
                 } else {
                     let connHtml = "";
