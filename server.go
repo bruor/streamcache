@@ -294,7 +294,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		}
 
 		isCompleted := len(fileState.BlockStates) > 0 && completed == len(fileState.BlockStates)
-		if isCompleted {
+		if isCompleted && fileState.UpstreamStatus != "Committing" {
 			fileState.Lock.Unlock()
 			continue
 		}

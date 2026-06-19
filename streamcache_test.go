@@ -1915,3 +1915,67 @@ func TestSequentialLastBlockPrefetch(t *testing.T) {
 		t.Errorf("Expected second request range to be %s, got %s", expectedSequentialRange, ranges[1])
 	}
 }
+
+func TestCommittingStateIncluded(t *testing.T) {
+	// Initialize / clear registry
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	key := "test_committing_filter.mkv"
+	state := &FileCacheState{
+		Key:            key,
+		URL:            "http://example.com/test.mkv",
+		BlockStates:    []int{BlockCompleted, BlockCompleted},
+		UpstreamStatus: "Committing",
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	// Perform a mock HTTP request to /debug/state
+	req, err := http.NewRequest("GET", "/debug/state", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(handleDebugState)
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected status code 200, got %d", rr.Code)
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &data); err != nil {
+		t.Fatal(err)
+	}
+
+	activeDownloads, ok := data["active_downloads"].([]interface{})
+	if !ok {
+		t.Fatal("active_downloads is not a list")
+	}
+
+	found := false
+	for _, item := range activeDownloads {
+		m, ok := item.(map[string]interface{})
+		if ok && m["key"] == key {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("Expected committing file %s to be included in active_downloads, but it was filtered out", key)
+	}
+}
+

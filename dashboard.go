@@ -132,7 +132,7 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 	for k, fileState := range GlobalRegistry.Files {
 		fileState.Lock.Lock()
 
-		// Skip completed files from active downloads list
+		// Skip completed files from active downloads list, unless they are still committing
 		isCompleted := len(fileState.BlockStates) > 0
 		for _, status := range fileState.BlockStates {
 			if status != BlockCompleted {
@@ -140,7 +140,7 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 				break
 			}
 		}
-		if isCompleted {
+		if isCompleted && fileState.UpstreamStatus != "Committing" {
 			fileState.Lock.Unlock()
 			continue
 		}
