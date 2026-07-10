@@ -17,7 +17,8 @@ type Config struct {
 	MinDiskFreeBytes         int64
 	CacheRevalidateInterval  time.Duration
 	AllowedHosts             []string
-	SchedulerMinBytes        int64
+	SchedulerMinBlocks       int
+	MaxPrefetchTailBlocks    int
 	SchedulerMinTime         time.Duration
 	DisableFadvise           bool
 	UpstreamReadTimeout      time.Duration
@@ -38,7 +39,8 @@ func LoadConfig() {
 		CacheMaxBytes:           getEnvSize("CACHE_MAX_BYTES", 50*1024*1024*1024), // 50GB
 		MinDiskFreeBytes:        getEnvSize("MIN_DISK_FREE_BYTES", 10*1024*1024*1024), // 10GB
 		CacheRevalidateInterval: getEnvDuration("CACHE_REVALIDATE_INTERVAL", 1*time.Hour),
-		SchedulerMinBytes:       getEnvSize("SCHEDULER_MIN_BYTES", 16*1024*1024), // 16MB
+		SchedulerMinBlocks:      getEnvInt("SCHEDULER_MIN_BLOCKS", 4), // 4 blocks (16MB default)
+		MaxPrefetchTailBlocks:   getEnvInt("MAX_PREFETCH_TAILBLOCKS", 10), // Max 10 blocks (40MB default)
 		SchedulerMinTime:        getEnvDuration("SCHEDULER_MIN_TIME", 2*time.Second),
 		DisableFadvise:          getEnvBool("DISABLE_FADVISE", false),
 		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 30*time.Second),
@@ -66,7 +68,7 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinBlocks=%d, MaxPrefetchTailBlocks=%d",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.BlockSize/(1024*1024),
@@ -78,6 +80,8 @@ func LoadConfig() {
 		cfg.ClientHydrationWait,
 		cfg.ProbeFailureCooldown,
 		cfg.ProbeTransientCooldown,
+		cfg.SchedulerMinBlocks,
+		cfg.MaxPrefetchTailBlocks,
 	)
 }
 

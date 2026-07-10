@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,7 +24,8 @@ func TestMain(m *testing.M) {
 		CacheMaxBytes:           300,
 		MinDiskFreeBytes:        1000,
 		CacheRevalidateInterval: 50 * time.Millisecond, // short for test
-		SchedulerMinBytes:       10,
+		SchedulerMinBlocks:      1,
+		MaxPrefetchTailBlocks:   10,
 		SchedulerMinTime:        20 * time.Millisecond,
 	}
 
@@ -237,12 +239,12 @@ func TestDebouncedSchedulerTimeSlicing(t *testing.T) {
 	defer cleanupAfterTest(t, state)
 
 	// Set debouncer to 0 to trigger instant preemption in single-worker setup
-	oldMinBytes := GlobalConfig.SchedulerMinBytes
+	oldMinBlocks := GlobalConfig.SchedulerMinBlocks
 	oldMinTime := GlobalConfig.SchedulerMinTime
-	GlobalConfig.SchedulerMinBytes = 0
+	GlobalConfig.SchedulerMinBlocks = 0
 	GlobalConfig.SchedulerMinTime = 0
 	defer func() {
-		GlobalConfig.SchedulerMinBytes = oldMinBytes
+		GlobalConfig.SchedulerMinBlocks = oldMinBlocks
 		GlobalConfig.SchedulerMinTime = oldMinTime
 	}()
 
@@ -1826,27 +1828,42 @@ func TestSequentialLastBlockPrefetch(t *testing.T) {
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
 
-	// Temporarily override BlockSize and SchedulerMinBytes
+	// Temporarily override BlockSize and MaxPrefetchTailBlocks
 	oldBlockSize := GlobalConfig.BlockSize
-	oldMinBytes := GlobalConfig.SchedulerMinBytes
+	oldMaxTailBlocks := GlobalConfig.MaxPrefetchTailBlocks
 	GlobalConfig.BlockSize = 100
-	GlobalConfig.SchedulerMinBytes = 200 // Grab 2 blocks (200 bytes) at the end
+	GlobalConfig.MaxPrefetchTailBlocks = 10
 	defer func() {
 		GlobalConfig.BlockSize = oldBlockSize
-		GlobalConfig.SchedulerMinBytes = oldMinBytes
+		GlobalConfig.MaxPrefetchTailBlocks = oldMaxTailBlocks
 	}()
 
 	var lock sync.Mutex
 	var requestedRanges []string
+
+	// Build a mock non-optimized MKV header pointing to Cues at offset 800
+	ebmlHeader := makeEbmlElement(ID_EBML, []byte{0x42, 0x86, 0x81, 0x01})
+	seekID := makeEbmlElement(ID_SEEKID, []byte{0x1C, 0x53, 0xBB, 0x6B})
+	seekPosVal := []byte{0x03, 0x20} // 800 in uint16 big endian
+	seekPos := makeEbmlElement(ID_SEEKPOS, seekPosVal)
+	seekPayload := append(seekID, seekPos...)
+	seek := makeEbmlElement(ID_SEEK, seekPayload)
+	seekHead := makeEbmlElement(ID_SEEKHEAD, seek)
+	segmentID := makeVintID(ID_SEGMENT)
+	segmentSize := makeVint(2000)
+	segmentHeader := append(segmentID, segmentSize...)
+	headerBytes := append(ebmlHeader, segmentHeader...)
+	headerBytes = append(headerBytes, seekHead...)
+
+	responseBytes := make([]byte, 1000)
+	copy(responseBytes, headerBytes)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lock.Lock()
 		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
 		lock.Unlock()
 
-		w.Header().Set("Content-Range", "bytes 0-999/1000")
-		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write(make([]byte, 1000))
+		http.ServeContent(w, r, "test_prefetch.mkv", time.Time{}, bytes.NewReader(responseBytes))
 	}))
 	defer server.Close()
 
@@ -1903,16 +1920,16 @@ func TestSequentialLastBlockPrefetch(t *testing.T) {
 		t.Fatalf("Expected at least 2 requests (1 prefetch, 1 sequential), got %d", len(ranges))
 	}
 
-	// The first request must be the last 2 blocks (blocks 8 and 9) range: bytes=800-999
-	expectedPrefetchRange := "bytes=800-999"
-	if ranges[0] != expectedPrefetchRange {
-		t.Errorf("Expected first request range (prefetch) to be %s, got %s", expectedPrefetchRange, ranges[0])
+	// The first request must be the sequential stream starting from 0: bytes=0-999
+	expectedSequentialRange := "bytes=0-999"
+	if ranges[0] != expectedSequentialRange {
+		t.Errorf("Expected first request range to be %s, got %s", expectedSequentialRange, ranges[0])
 	}
 
-	// The second request should be block 0 range starting from 0: bytes=0-999
-	expectedSequentialRange := "bytes=0-999"
-	if ranges[1] != expectedSequentialRange {
-		t.Errorf("Expected second request range to be %s, got %s", expectedSequentialRange, ranges[1])
+	// The second request should be the pre-fetched tail blocks (blocks 8 and 9): bytes=800-999
+	expectedPrefetchRange := "bytes=800-999"
+	if ranges[1] != expectedPrefetchRange {
+		t.Errorf("Expected second request range (prefetch) to be %s, got %s", expectedPrefetchRange, ranges[1])
 	}
 }
 
