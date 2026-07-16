@@ -293,6 +293,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 					hasMdatSize := false
 					hasCues := false
 					cuesOffset := int64(0)
+					prefetchBlocks := 0
 
 					isMkv := n >= 4 && binary.BigEndian.Uint32(data[0:4]) == 0x1A45DFA3
 					isMp4 := false
@@ -314,7 +315,6 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 					var tailStartBlock int = -1
 					if isMp4 && !isFastStart {
-						var prefetchBlocks int = 0
 						if hasMdatSize && moovOffset > 0 {
 							moovBytes := state.TotalSize - moovOffset
 							prefetchBlocks = int((moovBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
@@ -333,7 +333,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						tailStartBlock = state.TotalBlocks - prefetchBlocks
 					} else if isMkv && hasCues && cuesOffset > 0 {
 						cuesBytes := state.TotalSize - cuesOffset
-						prefetchBlocks := int((cuesBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
+						prefetchBlocks = int((cuesBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
 
 						if prefetchBlocks > GlobalConfig.MaxPrefetchTailBlocks {
 							prefetchBlocks = GlobalConfig.MaxPrefetchTailBlocks
@@ -345,7 +345,15 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						tailStartBlock = 0
 					}
 
-					if tailStartBlock >= 0 && tailStartBlock < state.TotalBlocks {
+					// Only pre-fetch if the start block is far enough from the beginning (lockout blocks).
+					// If the calculated tailStartBlock falls inside the initial block download run
+					// guaranteed by SchedulerMinBlocks, the sequential worker will pull it anyway.
+					lockoutBlocks := GlobalConfig.SchedulerMinBlocks * 2
+					if lockoutBlocks < 2 {
+						lockoutBlocks = 2
+					}
+
+					if tailStartBlock >= lockoutBlocks && prefetchBlocks < state.TotalBlocks/2 && tailStartBlock < state.TotalBlocks {
 						needPrefetch := false
 						state.Lock.Lock()
 						for b := tailStartBlock; b < state.TotalBlocks; b++ {
