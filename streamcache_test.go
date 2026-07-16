@@ -1926,8 +1926,8 @@ func TestSequentialLastBlockPrefetch(t *testing.T) {
 		t.Errorf("Expected first request range to be %s, got %s", expectedSequentialRange, ranges[0])
 	}
 
-	// The second request should be the pre-fetched tail blocks (blocks 8 and 9): bytes=800-999
-	expectedPrefetchRange := "bytes=800-999"
+	// The second request should be the pre-fetched tail blocks (blocks 7, 8, and 9 due to 1 block safety padding): bytes=700-999
+	expectedPrefetchRange := "bytes=700-999"
 	if ranges[1] != expectedPrefetchRange {
 		t.Errorf("Expected second request range (prefetch) to be %s, got %s", expectedPrefetchRange, ranges[1])
 	}

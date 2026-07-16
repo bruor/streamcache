@@ -307,19 +307,24 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						}
 					}
 
+					padding := GlobalConfig.SchedulerMinBlocks
+					if padding < 1 {
+						padding = 1
+					}
+
 					var tailStartBlock int = -1
 					if isMp4 && !isFastStart {
 						var prefetchBlocks int = 0
 						if hasMdatSize && moovOffset > 0 {
 							moovBytes := state.TotalSize - moovOffset
-							prefetchBlocks = int((moovBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize)
+							prefetchBlocks = int((moovBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
 						} else {
 							// Estimate based on 0.15% of file size, floor of 16MB
 							estimatedBytes := state.TotalSize * 15 / 10000
 							if estimatedBytes < 16*1024*1024 {
 								estimatedBytes = 16*1024*1024
 							}
-							prefetchBlocks = int((estimatedBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize)
+							prefetchBlocks = int((estimatedBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
 						}
 
 						if prefetchBlocks > GlobalConfig.MaxPrefetchTailBlocks {
@@ -328,7 +333,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						tailStartBlock = state.TotalBlocks - prefetchBlocks
 					} else if isMkv && hasCues && cuesOffset > 0 {
 						cuesBytes := state.TotalSize - cuesOffset
-						prefetchBlocks := int((cuesBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize)
+						prefetchBlocks := int((cuesBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
 
 						if prefetchBlocks > GlobalConfig.MaxPrefetchTailBlocks {
 							prefetchBlocks = GlobalConfig.MaxPrefetchTailBlocks
