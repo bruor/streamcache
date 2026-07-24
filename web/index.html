@@ -669,7 +669,7 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
-        // --- HTML5 Canvas Progress Bar Renderer ---
+        // --- HTML5 Canvas Multi-Row Block Grid Renderer ---
         function renderCanvas(canvas, fileData) {
             if (!canvas || !fileData || !fileData.block_states) return;
             const ctx = canvas.getContext('2d');
@@ -677,71 +677,68 @@
             const rect = canvas.getBoundingClientRect();
             
             const displayWidth = rect.width || canvas.clientWidth || 300;
-            const displayHeight = 14;
+            const total = fileData.total_blocks || fileData.block_states.length;
+            if (total === 0) return;
             
-            if (canvas.width !== Math.floor(displayWidth * dpr)) {
+            const gap = 2.5;
+            const targetBlockSize = 12; // Target size for individual block tiles
+            
+            let cols = Math.floor((displayWidth + gap) / (targetBlockSize + gap));
+            if (cols < 1) cols = 1;
+            if (total < cols) cols = total;
+            
+            const rows = Math.ceil(total / cols);
+            const blockWidth = (displayWidth - (cols - 1) * gap) / cols;
+            const blockHeight = Math.max(10, Math.min(14, blockWidth));
+            const displayHeight = rows * blockHeight + (rows - 1) * gap;
+            
+            if (canvas.width !== Math.floor(displayWidth * dpr) || canvas.height !== Math.floor(displayHeight * dpr)) {
                 canvas.width = Math.floor(displayWidth * dpr);
                 canvas.height = Math.floor(displayHeight * dpr);
+                canvas.style.height = `${displayHeight}px`;
             }
             
             ctx.save();
             ctx.scale(dpr, dpr);
             ctx.clearRect(0, 0, displayWidth, displayHeight);
             
-            const total = fileData.total_blocks || fileData.block_states.length;
-            if (total === 0) {
-                ctx.restore();
-                return;
-            }
-            
-            const blockWidth = displayWidth / total;
-            
             for (let i = 0; i < total; i++) {
+                const row = Math.floor(i / cols);
+                const col = i % cols;
+                const x = col * (blockWidth + gap);
+                const y = row * (blockHeight + gap);
+                
                 const st = fileData.block_states[i];
                 if (st === 2) {
                     ctx.fillStyle = '#39ff14'; // accent-green
                 } else if (st === 1) {
                     ctx.fillStyle = '#00f0ff'; // accent-secondary
                 } else {
-                    ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+                    ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
                 }
-                const x = i * blockWidth;
-                const w = Math.max(1, blockWidth);
-                ctx.fillRect(x, 0, w, displayHeight);
+                
+                // Draw rounded rectangle block tile
+                const radius = 1.5;
+                const w = blockWidth;
+                const h = blockHeight;
+                ctx.beginPath();
+                ctx.moveTo(x + radius, y);
+                ctx.lineTo(x + w - radius, y);
+                ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+                ctx.lineTo(x + w, y + h - radius);
+                ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+                ctx.lineTo(x + radius, y + h);
+                ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+                ctx.lineTo(x, y + radius);
+                ctx.quadraticCurveTo(x, y, x + radius, y);
+                ctx.closePath();
+                ctx.fill();
             }
             ctx.restore();
         }
 
         function paintCanvasBlocks(canvas, fileData, blocks, state) {
-            if (!canvas || !fileData) return;
-            const ctx = canvas.getContext('2d');
-            const dpr = window.devicePixelRatio || 1;
-            const rect = canvas.getBoundingClientRect();
-            const displayWidth = rect.width || canvas.clientWidth || 300;
-            const displayHeight = 14;
-            const total = fileData.total_blocks || fileData.block_states.length;
-            if (total === 0) return;
-            
-            const blockWidth = displayWidth / total;
-            
-            ctx.save();
-            ctx.scale(dpr, dpr);
-            
-            if (state === 2) {
-                ctx.fillStyle = '#39ff14';
-            } else if (state === 1) {
-                ctx.fillStyle = '#00f0ff';
-            } else {
-                ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
-            }
-            
-            blocks.forEach(i => {
-                const x = i * blockWidth;
-                const w = Math.max(1, blockWidth);
-                ctx.fillRect(x, 0, w, displayHeight);
-            });
-            
-            ctx.restore();
+            renderCanvas(canvas, fileData);
         }
 
         function calculateCompletedBlocks(fileData) {
