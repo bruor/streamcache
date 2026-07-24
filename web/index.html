@@ -680,8 +680,8 @@
             const total = fileData.total_blocks || fileData.block_states.length;
             if (total === 0) return;
             
-            const gap = 2.5;
-            const targetBlockSize = 12; // Target size for individual block tiles
+            const gap = 1.5;
+            const targetBlockSize = 6; // Target size for individual block tiles (approx 1/2 previous size)
             
             let cols = Math.floor((displayWidth + gap) / (targetBlockSize + gap));
             if (cols < 1) cols = 1;
@@ -689,7 +689,7 @@
             
             const rows = Math.ceil(total / cols);
             const blockWidth = (displayWidth - (cols - 1) * gap) / cols;
-            const blockHeight = Math.max(10, Math.min(14, blockWidth));
+            const blockHeight = Math.max(5, Math.min(7, blockWidth));
             const displayHeight = rows * blockHeight + (rows - 1) * gap;
             
             if (canvas.width !== Math.floor(displayWidth * dpr) || canvas.height !== Math.floor(displayHeight * dpr)) {
