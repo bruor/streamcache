@@ -197,36 +197,14 @@
             margin-bottom: 1rem;
         }
 
-        .block-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(8px, 1fr));
-            gap: 2px;
-            margin-top: 0.8rem;
+        .block-canvas {
+            width: 100%;
+            height: 14px;
+            border-radius: 4px;
             background: rgba(0, 0, 0, 0.4);
-            padding: 6px;
-            border-radius: 6px;
             border: 1px solid var(--card-border);
-        }
-
-        .block {
-            aspect-ratio: 1/1;
-            border-radius: 1.5px;
-            background-color: rgba(255, 255, 255, 0.05);
-        }
-
-        .block.completed {
-            background-color: var(--accent-green);
-            box-shadow: 0 0 2px var(--accent-green);
-        }
-
-        .block.downloading {
-            background-color: var(--accent-secondary);
-            animation: blink 1s infinite alternate;
-        }
-
-        @keyframes blink {
-            from { opacity: 0.4; }
-            to { opacity: 1; }
+            margin-top: 0.8rem;
+            display: block;
         }
 
         /* Scheduler panel */
@@ -608,7 +586,10 @@
         const consoleEl = document.getElementById('console');
         const scrollBtn = document.getElementById('console-scroll-btn');
         let autoScrollEnabled = true;
-        const maxLogLines = 1000;
+        const maxLogLines = 200;
+
+        // In-memory store for active files: key -> { url, total_size, total_blocks, block_states (Uint8Array), active_clients, ... }
+        const fileStore = {};
 
         // Listen for scroll events to toggle auto-scroll state
         consoleEl.addEventListener('scroll', () => {
@@ -633,7 +614,6 @@
         const connectionsCountEl = document.getElementById('connections-count');
 
         function appendLog(text) {
-            // Clear initial loading text node on first write
             if (consoleEl.childNodes.length === 1 && consoleEl.firstChild.nodeType === Node.TEXT_NODE && consoleEl.firstChild.textContent.startsWith("Initializing")) {
                 consoleEl.textContent = "";
             }
@@ -644,7 +624,6 @@
             
             newLines.forEach(line => {
                 if (line.trim() === '') return;
-                // Filter out block completed logs
                 if (line.includes("Block ") && line.includes("completed")) return;
                 
                 const div = document.createElement('div');
@@ -657,12 +636,9 @@
             
             if (addedCount === 0) return;
             
-            // Check if we were at the bottom before appending
             const isAtBottom = (consoleEl.scrollHeight - consoleEl.scrollTop - consoleEl.clientHeight) < 40;
-            
             consoleEl.appendChild(fragment);
             
-            // Limit to maxLogLines
             while (consoleEl.children.length > maxLogLines) {
                 consoleEl.removeChild(consoleEl.firstChild);
             }
@@ -686,11 +662,300 @@
         }
 
         function formatBytes(bytes) {
-            if (bytes === 0) return '0.00 Bytes';
+            if (!bytes || bytes === 0) return '0.00 Bytes';
             const k = 1024;
             const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
             const i = Math.floor(Math.log(bytes) / Math.log(k));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // --- HTML5 Canvas Progress Bar Renderer ---
+        function renderCanvas(canvas, fileData) {
+            if (!canvas || !fileData || !fileData.block_states) return;
+            const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.getBoundingClientRect();
+            
+            const displayWidth = rect.width || canvas.clientWidth || 300;
+            const displayHeight = 14;
+            
+            if (canvas.width !== Math.floor(displayWidth * dpr)) {
+                canvas.width = Math.floor(displayWidth * dpr);
+                canvas.height = Math.floor(displayHeight * dpr);
+            }
+            
+            ctx.save();
+            ctx.scale(dpr, dpr);
+            ctx.clearRect(0, 0, displayWidth, displayHeight);
+            
+            const total = fileData.total_blocks || fileData.block_states.length;
+            if (total === 0) {
+                ctx.restore();
+                return;
+            }
+            
+            const blockWidth = displayWidth / total;
+            
+            for (let i = 0; i < total; i++) {
+                const st = fileData.block_states[i];
+                if (st === 2) {
+                    ctx.fillStyle = '#39ff14'; // accent-green
+                } else if (st === 1) {
+                    ctx.fillStyle = '#00f0ff'; // accent-secondary
+                } else {
+                    ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+                }
+                const x = i * blockWidth;
+                const w = Math.max(1, blockWidth);
+                ctx.fillRect(x, 0, w, displayHeight);
+            }
+            ctx.restore();
+        }
+
+        function paintCanvasBlocks(canvas, fileData, blocks, state) {
+            if (!canvas || !fileData) return;
+            const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.getBoundingClientRect();
+            const displayWidth = rect.width || canvas.clientWidth || 300;
+            const displayHeight = 14;
+            const total = fileData.total_blocks || fileData.block_states.length;
+            if (total === 0) return;
+            
+            const blockWidth = displayWidth / total;
+            
+            ctx.save();
+            ctx.scale(dpr, dpr);
+            
+            if (state === 2) {
+                ctx.fillStyle = '#39ff14';
+            } else if (state === 1) {
+                ctx.fillStyle = '#00f0ff';
+            } else {
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+            }
+            
+            blocks.forEach(i => {
+                const x = i * blockWidth;
+                const w = Math.max(1, blockWidth);
+                ctx.fillRect(x, 0, w, displayHeight);
+            });
+            
+            ctx.restore();
+        }
+
+        function calculateCompletedBlocks(fileData) {
+            if (!fileData || !fileData.block_states) return 0;
+            let completed = 0;
+            for (let i = 0; i < fileData.block_states.length; i++) {
+                if (fileData.block_states[i] === 2) completed++;
+            }
+            return completed;
+        }
+
+        function updateFileBadgeAndMeta(key) {
+            const fileData = fileStore[key];
+            if (!fileData) return;
+            
+            const completed = calculateCompletedBlocks(fileData);
+            const percent = ((completed / fileData.total_blocks) * 100).toFixed(1);
+            
+            const badgeEl = document.getElementById(`badge-${key}`);
+            if (badgeEl) {
+                badgeEl.innerText = `${percent}% Complete`;
+            }
+            
+            const metaEl = document.getElementById(`meta-${key}`);
+            if (metaEl) {
+                metaEl.innerHTML = `
+                    <span>Size: ${formatBytes(fileData.total_size)}</span>
+                    <span>Blocks: ${completed}/${fileData.total_blocks}</span>
+                    ${fileData.starving_queue && fileData.starving_queue.length > 0 ? `<span style="color: var(--accent-orange); font-weight: 600;">Active Clients: ${fileData.active_clients}</span>` : `<span>Active Clients: ${fileData.active_clients}</span>`}
+                    ${fileData.upstream_status ? `<span>Upstream: <span class="upstream-status-badge ${fileData.upstream_status.toLowerCase()}">${fileData.upstream_status}</span></span>` : ''}
+                    <span>Connections (30s): ${fileData.connections_last_30s || 0}</span>
+                    ${fileData.observed_cooldown > 0 ? `<span>Observed Cooldown: ${fileData.observed_cooldown.toFixed(1)}s</span>` : ''}
+                    ${fileData.download_speed > 0 ? `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(fileData.download_speed)}/s</span>` : ''}
+                `;
+            }
+        }
+
+        // Targeted DOM Management for Download Cards
+        function updateActiveDownloadsDOM(activeFiles) {
+            activeCountEl.innerText = `${activeFiles.length} Downloading`;
+            
+            if (activeFiles.length === 0) {
+                downloadsContainer.innerHTML = `<div class="empty-state">No VOD files are currently hydrating to cache. Streams served directly from disk HIT will not appear here.</div>`;
+                // Clear store
+                Object.keys(fileStore).forEach(k => delete fileStore[k]);
+                return;
+            }
+            
+            // Remove empty state if present
+            if (downloadsContainer.querySelector('.empty-state')) {
+                downloadsContainer.innerHTML = '';
+            }
+            
+            const activeKeys = new Set(activeFiles.map(f => f.key));
+            
+            // Clean up missing downloads
+            Object.keys(fileStore).forEach(k => {
+                if (!activeKeys.has(k)) {
+                    delete fileStore[k];
+                    const card = document.getElementById(`download-card-${k}`);
+                    if (card) card.remove();
+                }
+            });
+            
+            activeFiles.forEach(file => {
+                let fileData = fileStore[file.key];
+                if (!fileData) {
+                    fileData = {
+                        key: file.key,
+                        url: file.url,
+                        total_size: file.total_size,
+                        total_blocks: file.total_blocks,
+                        block_states: new Uint8Array(file.block_states || file.total_blocks),
+                        active_clients: file.active_clients,
+                        starving_queue: file.starving_queue,
+                        download_speed: file.download_speed,
+                        upstream_status: file.upstream_status,
+                        connections_last_30s: file.connections_last_30s,
+                        observed_cooldown: file.observed_cooldown
+                    };
+                    fileStore[file.key] = fileData;
+                } else {
+                    // Update metadata fields
+                    fileData.url = file.url;
+                    fileData.total_size = file.total_size;
+                    fileData.active_clients = file.active_clients;
+                    fileData.starving_queue = file.starving_queue;
+                    fileData.download_speed = file.download_speed;
+                    fileData.upstream_status = file.upstream_status;
+                    fileData.connections_last_30s = file.connections_last_30s;
+                    fileData.observed_cooldown = file.observed_cooldown;
+                    if (file.block_states && file.block_states.length === fileData.total_blocks) {
+                        fileData.block_states.set(file.block_states);
+                    }
+                }
+                
+                let card = document.getElementById(`download-card-${file.key}`);
+                if (!card) {
+                    card = document.createElement('div');
+                    card.className = 'download-item';
+                    card.id = `download-card-${file.key}`;
+                    card.innerHTML = `
+                        <div class="download-header">
+                            <div class="download-url" title="${file.url}">${file.url}</div>
+                            <div class="download-badge" id="badge-${file.key}">0% Complete</div>
+                        </div>
+                        <div class="download-meta" id="meta-${file.key}"></div>
+                        <canvas class="block-canvas" id="canvas-${file.key}"></canvas>
+                    `;
+                    downloadsContainer.appendChild(card);
+                }
+                
+                updateFileBadgeAndMeta(file.key);
+                const canvas = document.getElementById(`canvas-${file.key}`);
+                if (canvas) {
+                    renderCanvas(canvas, fileData);
+                }
+            });
+        }
+
+        // Targeted DOM Management for Active Connections
+        function updateActiveConnectionsDOM(connections) {
+            connectionsCountEl.innerText = `${connections.length} Sessions`;
+            
+            if (connections.length === 0) {
+                connectionsContainer.innerHTML = `<div class="empty-state">No active client sessions.</div>`;
+                return;
+            }
+            
+            if (connectionsContainer.querySelector('.empty-state')) {
+                connectionsContainer.innerHTML = '';
+            }
+            
+            const connIds = new Set(connections.map(c => c.id));
+            Array.from(connectionsContainer.children).forEach(child => {
+                if (child.id && child.id.startsWith('conn-card-') && !connIds.has(child.id.replace('conn-card-', ''))) {
+                    child.remove();
+                }
+            });
+            
+            connections.forEach(conn => {
+                const elapsedSecs = Math.max(0, Math.floor(Date.now() / 1000) - conn.start_time);
+                let durationStr = `${elapsedSecs}s`;
+                if (elapsedSecs >= 60) {
+                    const mins = Math.floor(elapsedSecs / 60);
+                    const secs = elapsedSecs % 60;
+                    durationStr = `${mins}m ${secs}s`;
+                }
+
+                let statusClass = 'active';
+                let statusText = 'Active';
+                if (conn.active_conns === 0) {
+                    statusClass = 'idle';
+                    statusText = 'Buffered / Idle';
+                } else if (conn.in_cache) {
+                    statusClass = 'downloaded';
+                    statusText = 'Downloaded';
+                } else if (conn.starving_block !== -1) {
+                    statusClass = 'starving';
+                    statusText = `Starving (Block ${conn.starving_block})`;
+                }
+
+                let uaDisplay = conn.user_agent || "Unknown";
+                if (uaDisplay.length > 45) {
+                    uaDisplay = uaDisplay.substring(0, 42) + "...";
+                }
+
+                let percentageStr = "";
+                if (conn.total_size > 0) {
+                    const percent = ((conn.offset / conn.total_size) * 100).toFixed(1);
+                    percentageStr = ` (${percent}%)`;
+                }
+
+                const activeLabel = conn.active_conns !== undefined ? (conn.active_conns > 0 ? ` (${conn.active_conns} active)` : ' (Idle)') : '';
+
+                let card = document.getElementById(`conn-card-${conn.id}`);
+                if (!card) {
+                    card = document.createElement('div');
+                    card.className = 'connection-item';
+                    card.id = `conn-card-${conn.id}`;
+                    connectionsContainer.appendChild(card);
+                }
+                
+                card.innerHTML = `
+                    <div class="connection-header">
+                        <span class="connection-client-id">${conn.id}${activeLabel}</span>
+                        <span class="connection-status-badge ${statusClass}">${statusText}</span>
+                    </div>
+                    <div class="connection-details">
+                        <div class="connection-detail-row">
+                            <span>IP Address:</span>
+                            <span class="connection-detail-value">${conn.remote_addr}</span>
+                        </div>
+                        <div class="connection-detail-row">
+                            <span>User Agent:</span>
+                            <span class="connection-detail-value" title="${conn.user_agent}">${uaDisplay}</span>
+                        </div>
+                        <div class="connection-detail-row">
+                            <span>Elapsed Time:</span>
+                            <span class="connection-detail-value">${durationStr}</span>
+                        </div>
+                    </div>
+                    <div class="connection-details">
+                        <div class="connection-detail-row" style="grid-column: 1 / -1;">
+                            <span>Streaming File:</span>
+                            <span class="connection-detail-value" title="${conn.url}" style="color: var(--accent-secondary); max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; text-align: right;">${conn.url}</span>
+                        </div>
+                        <div class="connection-detail-row">
+                            <span>Current Offset:</span>
+                            <span class="connection-detail-value">${formatBytes(conn.offset)}${percentageStr}</span>
+                        </div>
+                    </div>
+                `;
+            });
         }
 
         // Establish Server-Sent Events (SSE) connection
@@ -712,12 +977,39 @@
                 setTimeout(connectSSE, 3000);
             };
 
-            // 1. Handle live logs stream
+            // 1. Live log stream
             es.addEventListener('log', function(event) {
                 appendLog(event.data);
             });
 
-            // 2. Handle state updates
+            // 2. Real-time block update events
+            es.addEventListener('block_update', function(event) {
+                try {
+                    const evtData = JSON.parse(event.data);
+                    const key = evtData.key;
+                    const blocks = evtData.blocks || [];
+                    const state = evtData.state;
+                    
+                    const fileData = fileStore[key];
+                    if (fileData) {
+                        blocks.forEach(b => {
+                            if (b >= 0 && b < fileData.total_blocks) {
+                                fileData.block_states[b] = state;
+                            }
+                        });
+                        
+                        const canvas = document.getElementById(`canvas-${key}`);
+                        if (canvas) {
+                            paintCanvasBlocks(canvas, fileData, blocks, state);
+                        }
+                        updateFileBadgeAndMeta(key);
+                    }
+                } catch(e) {
+                    console.error("Error handling block_update:", e);
+                }
+            });
+
+            // 3. Periodic full state update & metrics sync
             es.addEventListener('state', function(event) {
                 const data = JSON.parse(event.data);
                 const maxCache = data.max_cache_size_bytes || 0;
@@ -740,143 +1032,24 @@
                     diskFreeLabel.innerText = `${formatBytes(diskFree)} Free / ${formatBytes(minDiskFree)} Min`;
                 }
 
-                // Update active downloads
-                const active = data.active_downloads || [];
-                activeCountEl.innerText = `${active.length} Downloading`;
-
-                if (active.length === 0) {
-                    downloadsContainer.innerHTML = `
-                        <div class="empty-state">No VOD files are currently hydrating to cache. Streams served directly from disk HIT will not appear here.</div>
-                    `;
-                } else {
-                    let html = "";
-                    active.forEach(file => {
-                        // Calculate download completion
-                        let completedBlocks = 0;
-                        let blockHtml = "";
-                        file.block_states.forEach(state => {
-                            let cls = "";
-                            if (state === 2) {
-                                completedBlocks++;
-                                cls = "completed";
-                            } else if (state === 1) {
-                                cls = "downloading";
-                            }
-                            blockHtml += `<div class="block ${cls}"></div>`;
-                        });
-
-                        const completionPercent = ((completedBlocks / file.total_blocks) * 100).toFixed(1);
-
-                        html += `
-                            <div class="download-item">
-                                <div class="download-header">
-                                    <div class="download-url" title="${file.url}">${file.url}</div>
-                                    <div class="download-badge">${completionPercent}% Complete</div>
-                                </div>
-                                <div class="download-meta">
-                                    <span>Size: ${formatBytes(file.total_size)}</span>
-                                    <span>Blocks: ${completedBlocks}/${file.total_blocks}</span>
-                                    ${file.starving_queue && file.starving_queue.length > 0 ? `<span style="color: var(--accent-orange); font-weight: 600;">Active Clients: ${file.active_clients}</span>` : `<span>Active Clients: ${file.active_clients}</span>`}
-                                    ${file.upstream_status ? `<span>Upstream: <span class="upstream-status-badge ${file.upstream_status.toLowerCase()}">${file.upstream_status}</span></span>` : ''}
-                                    <span>Connections (30s): ${file.connections_last_30s || 0}</span>
-                                    ${file.observed_cooldown > 0 ? `<span>Observed Cooldown: ${file.observed_cooldown.toFixed(1)}s</span>` : ''}
-                                    ${file.download_speed > 0 ? `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(file.download_speed)}/s</span>` : ''}
-                                </div>
-                                <div class="block-grid">
-                                    ${blockHtml}
-                                </div>
-                            </div>
-                        `;
-                    });
-                    downloadsContainer.innerHTML = html;
-                }
-
-                // Update active connections
-                const connections = data.active_connections || [];
-                connectionsCountEl.innerText = `${connections.length} Sessions`;
-
-                if (connections.length === 0) {
-                    connectionsContainer.innerHTML = `
-                        <div class="empty-state">No active client sessions.</div>
-                    `;
-                } else {
-                    let connHtml = "";
-                    connections.forEach(conn => {
-                        // Calculate elapsed duration
-                        const elapsedSecs = Math.max(0, Math.floor(Date.now() / 1000) - conn.start_time);
-                        let durationStr = `${elapsedSecs}s`;
-                        if (elapsedSecs >= 60) {
-                            const mins = Math.floor(elapsedSecs / 60);
-                            const secs = elapsedSecs % 60;
-                            durationStr = `${mins}m ${secs}s`;
-                        }
-
-                        // Determine status
-                        let statusClass = 'active';
-                        let statusText = 'Active';
-                        if (conn.active_conns === 0) {
-                            statusClass = 'idle';
-                            statusText = 'Buffered / Idle';
-                        } else if (conn.in_cache) {
-                            statusClass = 'downloaded';
-                            statusText = 'Downloaded';
-                        } else if (conn.starving_block !== -1) {
-                            statusClass = 'starving';
-                            statusText = `Starving (Block ${conn.starving_block})`;
-                        }
-
-                        // Format UA display
-                        let uaDisplay = conn.user_agent;
-                        if (uaDisplay.length > 45) {
-                            uaDisplay = uaDisplay.substring(0, 42) + "...";
-                        }
-
-                        // Calculate playback position percentage
-                        let percentageStr = "";
-                        if (conn.total_size > 0) {
-                            const percent = ((conn.offset / conn.total_size) * 100).toFixed(1);
-                            percentageStr = ` (${percent}%)`;
-                        }
-
-                        const activeLabel = conn.active_conns !== undefined ? (conn.active_conns > 0 ? ` (${conn.active_conns} active)` : ' (Idle)') : '';
-
-                        connHtml += `
-                            <div class="connection-item">
-                                <div class="connection-header">
-                                    <span class="connection-client-id">${conn.id}${activeLabel}</span>
-                                    <span class="connection-status-badge ${statusClass}">${statusText}</span>
-                                </div>
-                                <div class="connection-details">
-                                    <div class="connection-detail-row">
-                                        <span>IP Address:</span>
-                                        <span class="connection-detail-value">${conn.remote_addr}</span>
-                                    </div>
-                                    <div class="connection-detail-row">
-                                        <span>User Agent:</span>
-                                        <span class="connection-detail-value" title="${conn.user_agent}">${uaDisplay}</span>
-                                    </div>
-                                    <div class="connection-detail-row">
-                                        <span>Elapsed Time:</span>
-                                        <span class="connection-detail-value">${durationStr}</span>
-                                    </div>
-                                </div>
-                                <div class="connection-details">
-                                    <div class="connection-detail-row" style="grid-column: 1 / -1;">
-                                        <span>Streaming File:</span>
-                                        <span class="connection-detail-value" title="${conn.url}" style="color: var(--accent-secondary); max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; text-align: right;">${conn.url}</span>
-                                    </div>
-                                    <div class="connection-detail-row">
-                                        <span>Current Offset:</span>
-                                        <span class="connection-detail-value">${formatBytes(conn.offset)}${percentageStr}</span>
-                                    </div>
-                                </div>
-                            </div>
-                        `;
-                    });
-                    connectionsContainer.innerHTML = connHtml;
-                }
+                updateActiveDownloadsDOM(data.active_downloads || []);
+                updateActiveConnectionsDOM(data.active_connections || []);
             });
         }
+
+        // Resize handler to keep canvas render crisp
+        let resizeTimeout;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimeout);
+            resizeTimeout = setTimeout(() => {
+                Object.keys(fileStore).forEach(key => {
+                    const canvas = document.getElementById(`canvas-${key}`);
+                    if (canvas && fileStore[key]) {
+                        renderCanvas(canvas, fileStore[key]);
+                    }
+                });
+            }, 100);
+        });
 
         connectSSE();
     </script>

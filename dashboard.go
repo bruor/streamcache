@@ -13,9 +13,14 @@ import (
 	"time"
 )
 
+type SSEEvent struct {
+	Type string
+	Data string
+}
+
 type LogBroker struct {
 	lock      sync.Mutex
-	listeners map[chan string]bool
+	listeners map[chan SSEEvent]bool
 	stdout    io.Writer
 }
 
@@ -23,7 +28,7 @@ var GlobalLogBroker *LogBroker
 
 func InitLogBroker() {
 	GlobalLogBroker = &LogBroker{
-		listeners: make(map[chan string]bool),
+		listeners: make(map[chan SSEEvent]bool),
 		stdout:    os.Stderr, // Duplicate logs to Stderr
 	}
 	// Direct all Go log output to our broker
@@ -37,10 +42,13 @@ func (lb *LogBroker) Write(p []byte) (n int, err error) {
 	// Broadcast to active SSE listeners
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
-	msg := string(p)
+	evt := SSEEvent{
+		Type: "log",
+		Data: string(p),
+	}
 	for listener := range lb.listeners {
 		select {
-		case listener <- msg:
+		case listener <- evt:
 		default:
 			// Client channel full, skip to avoid blocking
 		}
@@ -48,13 +56,47 @@ func (lb *LogBroker) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-func (lb *LogBroker) Register(ch chan string) {
+type BlockUpdateEvent struct {
+	Key    string `json:"key"`
+	Blocks []int  `json:"blocks"`
+	State  int    `json:"state"`
+}
+
+func (lb *LogBroker) BroadcastBlockUpdate(key string, blocks []int, state int) {
+	if len(blocks) == 0 {
+		return
+	}
+	evtData, err := json.Marshal(BlockUpdateEvent{
+		Key:    key,
+		Blocks: blocks,
+		State:  state,
+	})
+	if err != nil {
+		return
+	}
+
+	evt := SSEEvent{
+		Type: "block_update",
+		Data: string(evtData),
+	}
+
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+	for listener := range lb.listeners {
+		select {
+		case listener <- evt:
+		default:
+		}
+	}
+}
+
+func (lb *LogBroker) Register(ch chan SSEEvent) {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
 	lb.listeners[ch] = true
 }
 
-func (lb *LogBroker) Unregister(ch chan string) {
+func (lb *LogBroker) Unregister(ch chan SSEEvent) {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
 	delete(lb.listeners, ch)
@@ -73,22 +115,22 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logChan := make(chan string, 100)
-	GlobalLogBroker.Register(logChan)
-	defer GlobalLogBroker.Unregister(logChan)
+	eventChan := make(chan SSEEvent, 200)
+	GlobalLogBroker.Register(eventChan)
+	defer GlobalLogBroker.Unregister(eventChan)
 
 	// Send initial state
 	sendStateUpdate(w, flusher)
 
-	stateTicker := time.NewTicker(1 * time.Second)
+	stateTicker := time.NewTicker(5 * time.Second)
 	defer stateTicker.Stop()
 
 	// Handle SSE Stream
 	for {
 		select {
-		case logMsg := <-logChan:
+		case evt := <-eventChan:
 			// Format as SSE data
-			_, err := fmt.Fprintf(w, "event: log\ndata: %s\n\n", logMsg)
+			_, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.Type, evt.Data)
 			if err != nil {
 				return
 			}

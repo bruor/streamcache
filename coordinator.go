@@ -720,10 +720,15 @@ func runDownloadWorker(
 			if rerr == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
 				state.Lock.Lock()
 				state.UpstreamStatus = "Downloading"
+				var downloadingBlocks []int
 				for b := w.startBlock; b < state.TotalBlocks; b++ {
 					if state.BlockStates[b] != BlockCompleted {
 						state.BlockStates[b] = BlockDownloading
+						downloadingBlocks = append(downloadingBlocks, b)
 					}
+				}
+				if len(downloadingBlocks) > 0 && GlobalLogBroker != nil {
+					GlobalLogBroker.BroadcastBlockUpdate(state.Key, downloadingBlocks, BlockDownloading)
 				}
 				state.Lock.Unlock()
 
@@ -772,6 +777,9 @@ func runDownloadWorker(
 							}
 							if prefetchStart+bytesRead >= bEnd && state.BlockStates[b] == BlockDownloading {
 								state.BlockStates[b] = BlockCompleted
+								if GlobalLogBroker != nil {
+									GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{b}, BlockCompleted)
+								}
 								for _, ch := range state.Clients {
 									safeSignal(ch)
 								}
@@ -944,6 +952,9 @@ func runDownloadWorker(
 		state.Lock.Lock()
 		state.BlockStates[currentBlock] = BlockDownloading
 		state.Lock.Unlock()
+		if GlobalLogBroker != nil {
+			GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{currentBlock}, BlockDownloading)
+		}
 
 		blockBytesWritten := int64(0)
 		buffer := make([]byte, 512*1024)
@@ -1024,6 +1035,9 @@ func runDownloadWorker(
 			state.Lock.Lock()
 			state.BlockStates[currentBlock] = BlockCompleted
 			log.Printf("[Worker-%d] Block %d completed", w.id, currentBlock)
+			if GlobalLogBroker != nil {
+				GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{currentBlock}, BlockCompleted)
+			}
 
 			for _, ch := range state.Clients {
 				safeSignal(ch)
