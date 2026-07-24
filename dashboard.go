@@ -150,7 +150,42 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (lb *LogBroker) BroadcastStateUpdate() {
+	payload, err := buildStatePayload()
+	if err != nil {
+		return
+	}
+
+	evt := SSEEvent{
+		Type: "state",
+		Data: string(payload),
+	}
+
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+	for listener := range lb.listeners {
+		select {
+		case listener <- evt:
+		default:
+		}
+	}
+}
+
 func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
+	payload, err := buildStatePayload()
+	if err != nil {
+		return err
+	}
+
+	_, err = fmt.Fprintf(w, "event: state\ndata: %s\n\n", string(payload))
+	if err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func buildStatePayload() ([]byte, error) {
 	activeSessions := GlobalRegistry.GetActiveSessions()
 
 	GlobalRegistry.Lock.RLock()
@@ -241,7 +276,6 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		compI := calculateCompleteness(activeFiles[i].BlockStates)
 		compJ := calculateCompleteness(activeFiles[j].BlockStates)
 		if compI == compJ {
-			// Secondary sort: Key name alphabetically ascending
 			return activeFiles[i].Key < activeFiles[j].Key
 		}
 		return compI > compJ
@@ -263,17 +297,7 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 		"active_connections":     activeSessions,
 	}
 
-	payload, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
-
-	_, err = fmt.Fprintf(w, "event: state\ndata: %s\n\n", string(payload))
-	if err != nil {
-		return err
-	}
-	flusher.Flush()
-	return nil
+	return json.Marshal(data)
 }
 
 func calculateCompleteness(blocks []int) float64 {

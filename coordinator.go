@@ -29,6 +29,10 @@ func StartCoordinator(state *FileCacheState, initialHeader http.Header) {
 	state.WriterActive = true
 	state.Lock.Unlock()
 
+	if GlobalLogBroker != nil {
+		GlobalLogBroker.BroadcastStateUpdate()
+	}
+
 	go runCoordinator(state, initialHeader)
 }
 
