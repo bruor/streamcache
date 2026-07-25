@@ -2233,4 +2233,64 @@ func TestClientSessionMapping(t *testing.T) {
 	}
 }
 
+func TestCoordinatorResuscitationOnClientStarvation(t *testing.T) {
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(make([]byte, GlobalConfig.BlockSize*2))
+	}))
+	defer server.Close()
+
+	key := "test_resuscitation.mkv"
+	state := &FileCacheState{
+		Key:          key,
+		URL:          server.URL,
+		Path:         filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:    GlobalConfig.BlockSize * 2,
+		TotalBlocks:  2,
+		BlockStates:  []int{BlockNotStarted, BlockNotStarted},
+		Clients:      make(map[string]chan struct{}),
+		Starving:     make(map[string]int),
+		NotifyChan:   make(chan struct{}, 10),
+		WriterActive: false,
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	req := httptest.NewRequest("GET", "/stream", nil)
+	reader := NewCacheReader(context.Background(), state, req)
+	defer reader.Close()
+
+	// Read block 0 which should trigger waitForBlock and resuscitate coordinator
+	buf := make([]byte, 100)
+	n, err := reader.Read(buf)
+	if err != nil {
+		t.Fatalf("Expected read to succeed after resuscitation, got err: %v", err)
+	}
+	if n != 100 {
+		t.Fatalf("Expected 100 bytes read, got %d", n)
+	}
+
+	state.Lock.Lock()
+	active := state.WriterActive
+	state.Lock.Unlock()
+
+	if !active {
+		t.Errorf("Expected coordinator WriterActive to be true after resuscitation")
+	}
+}
+
+
 

@@ -270,6 +270,13 @@ func (r *CacheReader) waitForBlock(blockIndex int) error {
 			return nil
 		}
 
+		if !r.state.WriterActive {
+			log.Printf("[Reader] Upstream coordinator inactive for %s while block %d is required. Resuscitation triggered.", r.state.Key, blockIndex)
+			r.state.Lock.Unlock()
+			StartCoordinator(r.state, nil)
+			r.state.Lock.Lock()
+		}
+
 		// If the block is not started, we trigger an on-demand download request
 		if status == BlockNotStarted {
 			r.state.BlockStates[blockIndex] = BlockDownloading
