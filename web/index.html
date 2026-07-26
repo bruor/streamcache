@@ -680,8 +680,60 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
-        // --- HTML5 Canvas Multi-Row Block Grid Renderer ---
-        function renderCanvas(canvas, fileData) {
+        // --- HTML5 Canvas Multi-Row Block Grid Renderer with Animated Pulse ---
+        let isPulseAnimating = false;
+
+        function checkAndTriggerPulseAnimation() {
+            if (isPulseAnimating) return;
+            let hasDownloading = false;
+            for (const key in fileStore) {
+                const fd = fileStore[key];
+                if (fd && fd.block_states) {
+                    for (let i = 0; i < fd.block_states.length; i++) {
+                        if (fd.block_states[i] === 1) {
+                            hasDownloading = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasDownloading) break;
+            }
+
+            if (hasDownloading) {
+                isPulseAnimating = true;
+                requestAnimationFrame(pulseAnimationLoop);
+            }
+        }
+
+        function pulseAnimationLoop(timestamp) {
+            let hasDownloading = false;
+            for (const key in fileStore) {
+                const fd = fileStore[key];
+                if (!fd || !fd.block_states) continue;
+                let fileHasDownloading = false;
+                for (let i = 0; i < fd.block_states.length; i++) {
+                    if (fd.block_states[i] === 1) {
+                        fileHasDownloading = true;
+                        hasDownloading = true;
+                        break;
+                    }
+                }
+                if (fileHasDownloading) {
+                    const canvas = document.getElementById(`canvas-${key}`);
+                    if (canvas) {
+                        renderCanvas(canvas, fd, timestamp);
+                    }
+                }
+            }
+
+            if (hasDownloading) {
+                requestAnimationFrame(pulseAnimationLoop);
+            } else {
+                isPulseAnimating = false;
+            }
+        }
+
+        function renderCanvas(canvas, fileData, timestamp) {
             if (!canvas || !fileData || !fileData.block_states) return;
             const ctx = canvas.getContext('2d');
             const dpr = window.devicePixelRatio || 1;
@@ -692,7 +744,7 @@
             if (total === 0) return;
             
             const gap = 1.5;
-            const targetBlockSize = 6; // Target size for individual block tiles (approx 1/2 previous size)
+            const targetBlockSize = 6; // Target size for individual block tiles
             
             let cols = Math.floor((displayWidth + gap) / (targetBlockSize + gap));
             if (cols < 1) cols = 1;
@@ -713,6 +765,9 @@
             ctx.scale(dpr, dpr);
             ctx.clearRect(0, 0, displayWidth, displayHeight);
             
+            const now = timestamp || performance.now();
+            const pulse = 0.625 + 0.375 * Math.sin((now / 1000) * Math.PI * 2);
+
             for (let i = 0; i < total; i++) {
                 const row = Math.floor(i / cols);
                 const col = i % cols;
@@ -722,10 +777,16 @@
                 const st = fileData.block_states[i];
                 if (st === 2) {
                     ctx.fillStyle = '#39ff14'; // accent-green
+                    ctx.shadowColor = 'transparent';
+                    ctx.shadowBlur = 0;
                 } else if (st === 1) {
-                    ctx.fillStyle = '#00f0ff'; // accent-secondary
+                    ctx.fillStyle = `rgba(0, 240, 255, ${pulse.toFixed(3)})`; // pulsing cyan
+                    ctx.shadowColor = '#00f0ff';
+                    ctx.shadowBlur = Math.round(4 * pulse);
                 } else {
                     ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+                    ctx.shadowColor = 'transparent';
+                    ctx.shadowBlur = 0;
                 }
                 
                 // Draw rounded rectangle block tile
@@ -750,6 +811,7 @@
 
         function paintCanvasBlocks(canvas, fileData, blocks, state) {
             renderCanvas(canvas, fileData);
+            checkAndTriggerPulseAnimation();
         }
 
         function calculateCompletedBlocks(fileData) {
@@ -878,6 +940,7 @@
                     renderCanvas(canvas, fileData);
                 }
             });
+            checkAndTriggerPulseAnimation();
         }
 
         async function cancelHydration(key) {
