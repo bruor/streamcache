@@ -48,7 +48,7 @@ Streamcache is configured using environment variables. Default fallback values a
 | `SCHEDULER_MIN_BLOCKS` | `4` | Minimum blocks to download before a worker can be pre-empted (protecting CDNs from connection thrashing). Set to `0` to disable. |
 | `MAX_PREFETCH_TAILBLOCKS` | `10` | Maximum number of tail blocks to pre-fetch for non-optimized or unsupported media files (protecting upstream network). |
 | `SCHEDULER_MIN_TIME` | `2s` | Minimum duration to stream a block before switching targets. Set to `0` or `none` to disable. |
-| `UPSTREAM_READ_TIMEOUT` | `30s` | Read timeout for upstream connections. Stalled reads from the CDN exceeding this duration are aborted and retried. |
+| `UPSTREAM_READ_TIMEOUT` | `0s` (unlimited) | Read timeout for stalled upstream reads. Default is `0s` (unlimited/no timeout), allowing IPTV providers with pause/burst throttling to remain connected. Can be set to a duration (e.g. `30s`, `90s`) to tune down if needed. |
 | `MAX_UPSTREAM_WORKERS` | `2` | Maximum concurrent upstream downloader threads per VOD file. |
 | `CLIENT_HYDRATION_WAIT` | `2s` | Duration the proxy waits for active hydration to catch up before spawning a new connection (Jump Suppression). |
 | `PROBE_FAILURE_COOLDOWN` | `10m` | Cooldown duration for caching catastrophic/permanent probe failures (e.g. HTML blocks, HTTP 403/404) to block retries. |

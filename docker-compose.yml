@@ -32,8 +32,8 @@ services:
       # Cache change validation period
       - CACHE_REVALIDATE_INTERVAL=1h
       
-      # Timeout for stalled upstream reads (e.g. 30s)
-      - UPSTREAM_READ_TIMEOUT=30s
+      # Timeout for stalled upstream reads (default is 0s / unlimited; uncomment and set e.g. 30s or 90s to tune down if needed)
+      # - UPSTREAM_READ_TIMEOUT=30s
       
       # Maximum concurrent upstream downloader threads per VOD file
       - MAX_UPSTREAM_WORKERS=2
