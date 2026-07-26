@@ -87,9 +87,14 @@ type FileCacheState struct {
 	Starving     map[string]int // Map of clientID -> starving block index
 	File         *os.File       // Open handle to writing file
 	NotifyChan   chan struct{}  // Channel to wake coordinator on client starvation
-	BytesDownloadedSec int64
-	DownloadSpeed      int64
-	UpstreamStatus     string
+	BytesDownloadedSec   int64
+	TotalBytesDownloaded int64
+	HydrationStartTime   int64
+	DownloadSpeed        int64
+	AvgDownloadSpeed     int64
+	SmoothDownloadSpeed  float64
+	ZeroSpeedSec         int
+	UpstreamStatus       string
 	RecentConnections  map[string]*ConnectionInfo
 	ObservedCooldown   float64
 	ActiveWorkers      []*Worker
@@ -190,14 +195,57 @@ func startDiskFreeMonitor() {
 func (r *CacheRegistry) startSpeedMonitor() {
 	ticker := time.NewTicker(1 * time.Second)
 	for range ticker.C {
+		now := time.Now().Unix()
+		shouldBroadcast := false
 		r.Lock.RLock()
 		for _, fileState := range r.Files {
 			fileState.Lock.Lock()
-			fileState.DownloadSpeed = fileState.BytesDownloadedSec
+			instantSpeed := float64(fileState.BytesDownloadedSec)
 			fileState.BytesDownloadedSec = 0
+
+			// Exponential Moving Average (EMA) smoothing with alpha = 0.3
+			if fileState.SmoothDownloadSpeed == 0 {
+				fileState.SmoothDownloadSpeed = instantSpeed
+			} else {
+				fileState.SmoothDownloadSpeed = (0.3 * instantSpeed) + (0.7 * fileState.SmoothDownloadSpeed)
+			}
+			fileState.DownloadSpeed = int64(fileState.SmoothDownloadSpeed)
+
+			// Calculate overall average download speed
+			if fileState.HydrationStartTime > 0 {
+				elapsed := now - fileState.HydrationStartTime
+				if elapsed < 1 {
+					elapsed = 1
+				}
+				fileState.AvgDownloadSpeed = fileState.TotalBytesDownloaded / elapsed
+			}
+
+			// Zero-speed provider throttling detection
+			if fileState.WriterActive {
+				if instantSpeed == 0 {
+					fileState.ZeroSpeedSec++
+					if fileState.ZeroSpeedSec >= 3 && fileState.UpstreamStatus == "Downloading" {
+						fileState.UpstreamStatus = "Throttled"
+						shouldBroadcast = true
+					}
+				} else {
+					fileState.ZeroSpeedSec = 0
+					if fileState.UpstreamStatus == "Throttled" {
+						fileState.UpstreamStatus = "Downloading"
+						shouldBroadcast = true
+					}
+				}
+			} else {
+				fileState.ZeroSpeedSec = 0
+			}
+
 			fileState.Lock.Unlock()
 		}
 		r.Lock.RUnlock()
+
+		if shouldBroadcast && GlobalLogBroker != nil {
+			GlobalLogBroker.BroadcastStateUpdate()
+		}
 	}
 }
 

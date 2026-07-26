@@ -115,6 +115,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 	state.Lock.Lock()
 	state.File = file
+	if state.HydrationStartTime == 0 {
+		state.HydrationStartTime = time.Now().Unix()
+	}
 	state.Lock.Unlock()
 
 	parentCtx, parentCancel := context.WithCancel(context.Background())
@@ -708,7 +711,7 @@ func runDownloadWorker(
 		log.Printf("[Worker-%d] Retry %d/8. Sleeping %s before retrying...", w.id, consecutiveFailures, backoff)
 		
 		state.Lock.Lock()
-		state.UpstreamStatus = "Throttled"
+		state.UpstreamStatus = "Retrying"
 		state.Lock.Unlock()
 
 		coordinatorSleepMu.RLock()
@@ -1051,6 +1054,7 @@ func runDownloadWorker(
 				atomic.AddInt64(&w.connBytesWritten, int64(n))
 
 				atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
+				atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
 				GlobalRegistry.UpdateSize(int64(n))
 			}
 

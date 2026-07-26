@@ -465,6 +465,13 @@
             animation: pulse-glow-orange 1.5s infinite;
         }
 
+        .upstream-status-badge.retrying {
+            background: rgba(255, 159, 28, 0.15);
+            color: var(--accent-orange);
+            border: 1px solid rgba(255, 159, 28, 0.35);
+            animation: pulse-glow-orange 1.5s infinite;
+        }
+
         .upstream-status-badge.downloading {
             background: rgba(0, 240, 255, 0.1);
             color: var(--accent-secondary);
@@ -521,6 +528,14 @@
     <header>
         <h1><span class="logo-dot"></span> Streamcache VOD Proxy</h1>
         <div class="system-status">
+            <div class="status-pill" style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);">
+                <span>💾</span>
+                <span id="topbar-cache-text">Cache: 0.00 GB</span>
+            </div>
+            <div class="status-pill" style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);">
+                <span>💽</span>
+                <span id="topbar-disk-text">Disk Free: 0.00 GB</span>
+            </div>
             <div class="status-pill">
                 <span id="connection-status-dot" class="status-indicator disconnected"></span>
                 <span id="connection-status-text">Connecting SSE...</span>
@@ -528,9 +543,8 @@
         </div>
     </header>
 
-    <div class="dashboard-grid">
-        <!-- Main Column: Active Downloads -->
-        <main>
+    <div class="dashboard-grid" style="display: flex; flex-direction: column; gap: 1.5rem;">
+        <main style="display: flex; flex-direction: column; gap: 1.5rem;">
             <div class="card">
                 <div class="card-title">
                     <span>Active Cache Hydrations</span>
@@ -563,47 +577,21 @@
                     </button>
                 </div>
             </div>
-        </main>
-
-        <!-- Sidebar Column: Disk Space & Diagnostics -->
-        <aside>
-            <div class="card">
-                <div class="card-title">Cache Storage Status</div>
-                <div class="disk-stats">
-                    <div class="progress-container">
-                        <div class="progress-labels">
-                            <span>Cache Usage</span>
-                            <span id="cache-usage-label">0.00 GB / 0.00 GB</span>
-                        </div>
-                        <div class="progress-bar-outer">
-                            <div id="cache-usage-bar" class="progress-bar-inner" style="width: 0%"></div>
-                        </div>
-                    </div>
-
-                    <div class="progress-container">
-                        <div class="progress-labels">
-                            <span>Physical Disk Free Space</span>
-                            <span id="disk-free-label">0.00 GB Free</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
 
             <div class="card">
                 <div class="card-title">Diagnostics API</div>
-                <div style="font-size: 0.9rem; color: var(--text-sub); display: flex; flex-direction: column; gap: 0.8rem;">
-                    <div>Exposed REST API endpoints for debugging:</div>
-                    <div style="background: rgba(0,0,0,0.3); padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); font-family: var(--font-mono); font-size: 0.8rem;">
-                        <a href="/debug/state" target="_blank" style="color: var(--accent-secondary); text-decoration: none;">GET /debug/state</a>
+                <div style="font-size: 0.85rem; color: var(--text-sub); display: flex; gap: 1rem; flex-wrap: wrap;">
+                    <div style="background: rgba(0,0,0,0.3); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); font-family: var(--font-mono); font-size: 0.8rem; flex: 1; min-width: 220px;">
+                        <a href="/debug/state" target="_blank" style="color: var(--accent-secondary); text-decoration: none; font-weight: 600;">GET /debug/state</a>
                         <span style="display:block; color: var(--text-sub); font-size: 0.75rem; margin-top: 2px;">Inspect active cache grids & scheduler</span>
                     </div>
-                    <div style="background: rgba(0,0,0,0.3); padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); font-family: var(--font-mono); font-size: 0.8rem;">
-                        <a href="/debug/pprof/" target="_blank" style="color: var(--accent-secondary); text-decoration: none;">GET /debug/pprof</a>
+                    <div style="background: rgba(0,0,0,0.3); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); font-family: var(--font-mono); font-size: 0.8rem; flex: 1; min-width: 220px;">
+                        <a href="/debug/pprof/" target="_blank" style="color: var(--accent-secondary); text-decoration: none; font-weight: 600;">GET /debug/pprof</a>
                         <span style="display:block; color: var(--text-sub); font-size: 0.75rem; margin-top: 2px;">Inspect Go runtime CPU/Mem profiles</span>
                     </div>
                 </div>
             </div>
-        </aside>
+        </main>
     </div>
 
     <script>
@@ -629,9 +617,8 @@
 
         const downloadsContainer = document.getElementById('downloads-container');
         const activeCountEl = document.getElementById('active-count');
-        const cacheUsageLabel = document.getElementById('cache-usage-label');
-        const cacheUsageBar = document.getElementById('cache-usage-bar');
-        const diskFreeLabel = document.getElementById('disk-free-label');
+        const topbarCacheText = document.getElementById('topbar-cache-text');
+        const topbarDiskText = document.getElementById('topbar-disk-text');
         const connectionDot = document.getElementById('connection-status-dot');
         const connectionText = document.getElementById('connection-status-text');
         const connectionsContainer = document.getElementById('connections-container');
@@ -795,7 +782,13 @@
                     ${fileData.upstream_status ? `<span>Upstream: <span class="upstream-status-badge ${fileData.upstream_status.toLowerCase()}">${fileData.upstream_status}</span></span>` : ''}
                     <span>Connections (30s): ${fileData.connections_last_30s || 0}</span>
                     ${fileData.observed_cooldown > 0 ? `<span>Observed Cooldown: ${fileData.observed_cooldown.toFixed(1)}s</span>` : ''}
-                    ${fileData.download_speed > 0 ? `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(fileData.download_speed)}/s</span>` : ''}
+                    ${fileData.download_speed > 0 ? 
+                        `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(fileData.download_speed)}/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}</span>` : 
+                        (fileData.upstream_status === 'Throttled' ? 
+                            `<span style="color: var(--accent-orange); font-weight: 600;">Speed: 0 B/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}</span>` : 
+                            `<span>Speed: 0 B/s</span>`
+                        )
+                    }
                 `;
             }
         }
@@ -851,6 +844,7 @@
                     fileData.active_clients = file.active_clients;
                     fileData.starving_queue = file.starving_queue;
                     fileData.download_speed = file.download_speed;
+                    fileData.avg_download_speed = file.avg_download_speed;
                     fileData.upstream_status = file.upstream_status;
                     fileData.connections_last_30s = file.connections_last_30s;
                     fileData.observed_cooldown = file.observed_cooldown;
@@ -1061,20 +1055,11 @@
                 const diskFree = data.disk_free_bytes || 0;
                 const minDiskFree = data.min_disk_free_bytes || 0;
                 
-                if (maxCache <= 0) {
-                    cacheUsageLabel.innerText = `${formatBytes(totalCache)} / Unlimited`;
-                    cacheUsageBar.style.width = `0%`;
-                } else {
-                    cacheUsageLabel.innerText = `${formatBytes(totalCache)} / ${formatBytes(maxCache)}`;
-                    const usagePercent = Math.min((totalCache / maxCache) * 100, 100);
-                    cacheUsageBar.style.width = `${usagePercent}%`;
-                }
-
-                if (minDiskFree <= 0) {
-                    diskFreeLabel.innerText = `${formatBytes(diskFree)} Free`;
-                } else {
-                    diskFreeLabel.innerText = `${formatBytes(diskFree)} Free / ${formatBytes(minDiskFree)} Min`;
-                }
+                const maxCacheText = maxCache > 0 ? `${formatBytes(maxCache)} Limit` : 'Unlimited';
+                topbarCacheText.innerText = `Cache: ${formatBytes(totalCache)} / ${maxCacheText}`;
+                
+                const minDiskText = minDiskFree > 0 ? ` (${formatBytes(minDiskFree)} Reserved)` : '';
+                topbarDiskText.innerText = `Disk Free: ${formatBytes(diskFree)}${minDiskText}`;
 
                 updateActiveDownloadsDOM(data.active_downloads || []);
                 updateActiveConnectionsDOM(data.active_connections || []);

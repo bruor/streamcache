@@ -2256,9 +2256,9 @@ func TestCoordinatorResuscitationOnClientStarvation(t *testing.T) {
 		Path:         filepath.Join(GlobalConfig.CacheDir, key),
 		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
 		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:    GlobalConfig.BlockSize * 2,
-		TotalBlocks:  2,
-		BlockStates:  []int{BlockNotStarted, BlockNotStarted},
+		TotalSize:    GlobalConfig.BlockSize * 100,
+		TotalBlocks:  100,
+		BlockStates:  make([]int, 100),
 		Clients:      make(map[string]chan struct{}),
 		Starving:     make(map[string]int),
 		NotifyChan:   make(chan struct{}, 10),
@@ -2363,6 +2363,68 @@ func TestCancelHydrationAPI(t *testing.T) {
 		t.Errorf("Expected meta file %s to be deleted from disk on cancellation", metaPath)
 	}
 }
+
+func TestEMASpeedSmoothingAndAverageSpeed(t *testing.T) {
+	key := "test_ema_speed.mkv"
+	now := time.Now().Unix()
+	state := &FileCacheState{
+		Key:                  key,
+		URL:                  "http://example.com/test.mkv",
+		TotalSize:            100000,
+		TotalBlocks:          2,
+		BlockStates:          []int{BlockNotStarted, BlockNotStarted},
+		WriterActive:         true,
+		UpstreamStatus:       "Downloading",
+		HydrationStartTime:   now - 10,
+		TotalBytesDownloaded: 500000,
+		BytesDownloadedSec:   100000,
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, key)
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// Simulate startSpeedMonitor logic for 1 cycle
+	state.Lock.Lock()
+	instantSpeed := float64(state.BytesDownloadedSec)
+	state.BytesDownloadedSec = 0
+
+	state.SmoothDownloadSpeed = instantSpeed
+	state.DownloadSpeed = int64(state.SmoothDownloadSpeed)
+
+	elapsed := now - state.HydrationStartTime
+	if elapsed > 0 {
+		state.AvgDownloadSpeed = state.TotalBytesDownloaded / elapsed
+	}
+	state.Lock.Unlock()
+
+	if state.DownloadSpeed != 100000 {
+		t.Errorf("Expected initial smooth download speed 100000, got %d", state.DownloadSpeed)
+	}
+
+	if state.AvgDownloadSpeed != 50000 {
+		t.Errorf("Expected avg download speed 50000 (500000/10s), got %d", state.AvgDownloadSpeed)
+	}
+
+	// Next cycle: 0 bytes downloaded (simulating pause)
+	state.Lock.Lock()
+	instantSpeed2 := float64(state.BytesDownloadedSec)
+	state.BytesDownloadedSec = 0
+	state.SmoothDownloadSpeed = (0.3 * instantSpeed2) + (0.7 * state.SmoothDownloadSpeed)
+	state.DownloadSpeed = int64(state.SmoothDownloadSpeed)
+	state.Lock.Unlock()
+
+	if state.DownloadSpeed != 70000 {
+		t.Errorf("Expected EMA smoothed download speed 70000 after 0 B/s cycle, got %d", state.DownloadSpeed)
+	}
+}
+
 
 
 

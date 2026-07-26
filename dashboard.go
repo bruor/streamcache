@@ -201,6 +201,7 @@ func buildStatePayload() ([]byte, error) {
 		ActiveClients  int      `json:"active_clients"`
 		StarvingQueue  []int    `json:"starving_queue"`
 		DownloadSpeed  int64    `json:"download_speed"`
+		AvgDownloadSpeed int64  `json:"avg_download_speed"`
 		UpstreamStatus string   `json:"upstream_status"`
 		ConnectionsLast30s int  `json:"connections_last_30s"`
 		ObservedCooldown   float64 `json:"observed_cooldown"`
@@ -263,6 +264,7 @@ func buildStatePayload() ([]byte, error) {
 			ActiveClients:  len(fileState.Clients),
 			StarvingQueue:  starveQueue,
 			DownloadSpeed:  fileState.DownloadSpeed,
+			AvgDownloadSpeed: fileState.AvgDownloadSpeed,
 			UpstreamStatus: fileState.UpstreamStatus,
 			ConnectionsLast30s: activeCount + closedInLast30sCount,
 			ObservedCooldown:   fileState.ObservedCooldown,
