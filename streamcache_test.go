@@ -2425,6 +2425,85 @@ func TestEMASpeedSmoothingAndAverageSpeed(t *testing.T) {
 	}
 }
 
+func TestCancellationAndResuscitation(t *testing.T) {
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	testBytes := make([]byte, GlobalConfig.BlockSize*4)
+	for i := range testBytes {
+		testBytes[i] = byte(i % 256)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/x-matroska")
+		w.Header().Set("Accept-Ranges", "bytes")
+		http.ServeContent(w, r, "video.mkv", time.Now(), bytes.NewReader(testBytes))
+	}))
+	defer server.Close()
+
+	key := "test_cancel_resuscitate.mkv"
+	state := &FileCacheState{
+		Key:          key,
+		URL:          server.URL,
+		Path:         filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:    int64(len(testBytes)),
+		TotalBlocks:  4,
+		BlockStates:  make([]int, 4),
+		Clients:      make(map[string]chan struct{}),
+		Starving:     make(map[string]int),
+		NotifyChan:   make(chan struct{}, 10),
+		WriterActive: false,
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	req := httptest.NewRequest("GET", "/stream", nil)
+	reader1 := NewCacheReader(context.Background(), state, req)
+
+	// Start coordinator
+	StartCoordinator(state, nil)
+
+	// Cancel coordinator while client reader1 is active
+	CancelCoordinator(state)
+
+	// Close client reader1
+	reader1.Close()
+
+	// Verify reader1 close cleaned up state or reset blocks
+	state.Lock.Lock()
+	for i, st := range state.BlockStates {
+		if st == BlockDownloading {
+			t.Errorf("Block %d still in BlockDownloading state after cancellation", i)
+		}
+	}
+	state.Lock.Unlock()
+
+	// New client reader2 starts playback again
+	req2 := httptest.NewRequest("GET", "/stream", nil)
+	reader2 := NewCacheReader(context.Background(), state, req2)
+	defer reader2.Close()
+
+	buf := make([]byte, 100)
+	n, err := reader2.Read(buf)
+	if err != nil {
+		t.Fatalf("Expected reader2.Read to succeed after cancellation resuscitation, got: %v", err)
+	}
+	if n != 100 {
+		t.Fatalf("Expected 100 bytes read, got %d", n)
+	}
+}
+
+
 
 
 

@@ -42,6 +42,11 @@ func CancelCoordinator(state *FileCacheState) {
 	cancel := state.Cancel
 	state.Cancel = nil
 	state.UpstreamStatus = "Cancelled"
+	for i, st := range state.BlockStates {
+		if st == BlockDownloading {
+			state.BlockStates[i] = BlockNotStarted
+		}
+	}
 	clientsCount := len(state.Clients)
 	fileToClose := state.File
 	state.File = nil
@@ -228,6 +233,12 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 		} else {
 			// Incomplete download
+			state.Lock.Lock()
+			for i, st := range state.BlockStates {
+				if st == BlockDownloading {
+					state.BlockStates[i] = BlockNotStarted
+				}
+			}
 			var fileToClose *os.File
 			shouldCleanUpIncomplete := len(state.Clients) == 0
 			if shouldCleanUpIncomplete {

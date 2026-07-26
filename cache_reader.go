@@ -277,25 +277,19 @@ func (r *CacheReader) waitForBlock(blockIndex int) error {
 			r.state.Lock.Lock()
 		}
 
-		// If the block is not started, we trigger an on-demand download request
+		// Mark client as starving and trigger on-demand download request
 		if status == BlockNotStarted {
 			r.state.BlockStates[blockIndex] = BlockDownloading
-			r.state.Starving[r.clientID] = blockIndex
-			r.state.Lock.Unlock()
+		}
+		r.state.Starving[r.clientID] = blockIndex
+		r.state.Lock.Unlock()
 
-			GlobalRegistry.UpdateConnectionStarvation(r.clientID, blockIndex)
+		GlobalRegistry.UpdateConnectionStarvation(r.clientID, blockIndex)
 
-			// Signal the Coordinator to wake up and evaluate the Jump request
-			select {
-			case r.state.NotifyChan <- struct{}{}:
-			default:
-			}
-		} else {
-			// Mark client as starving for this block
-			r.state.Starving[r.clientID] = blockIndex
-			r.state.Lock.Unlock()
-
-			GlobalRegistry.UpdateConnectionStarvation(r.clientID, blockIndex)
+		// Signal the Coordinator to wake up and evaluate the Jump request
+		select {
+		case r.state.NotifyChan <- struct{}{}:
+		default:
 		}
 
 		// Block and wait for a completion update OR request cancellation
