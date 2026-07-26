@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -80,6 +81,7 @@ type FileCacheState struct {
 	LastValidated int64
 
 	Lock         sync.Mutex
+	Cancel       context.CancelFunc
 	WriterActive bool
 	Clients      map[string]chan struct{}
 	Starving     map[string]int // Map of clientID -> starving block index

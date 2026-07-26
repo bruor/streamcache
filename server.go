@@ -33,6 +33,7 @@ func StartServer() {
 	// Admin / Dashboard static route
 	mux.HandleFunc("/", handleDashboardUI)
 	mux.HandleFunc("/dashboard/sse", handleSSE)
+	mux.HandleFunc("/api/hydration/cancel", handleCancelHydration)
 
 	// Live Diagnostics Suite
 	mux.HandleFunc("/debug/state", handleDebugState)
@@ -441,5 +442,48 @@ func migrateLegacyFile(legacyPath, newPath, targetURL string) error {
 	metaPath := newPath + ".json"
 	return recreateMetadata(newPath, metaPath, targetURL)
 }
+
+func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		var body struct {
+			Key string `json:"key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			key = body.Key
+		}
+	}
+
+	if key == "" {
+		http.Error(w, "Missing 'key' parameter", http.StatusBadRequest)
+		return
+	}
+
+	GlobalRegistry.Lock.RLock()
+	fileState, exists := GlobalRegistry.Files[key]
+	GlobalRegistry.Lock.RUnlock()
+
+	if !exists || fileState == nil {
+		http.Error(w, "Hydration not found for specified key", http.StatusNotFound)
+		return
+	}
+
+	log.Printf("[Server] Received admin cancel request for hydration: %s", key)
+	CancelCoordinator(fileState)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Hydration cancelled successfully",
+		"key":     key,
+	})
+}
+
 
 

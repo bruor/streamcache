@@ -183,6 +183,30 @@
             animation: pulse-glow 1.5s infinite;
         }
 
+        .cancel-hydration-btn {
+            background-color: rgba(255, 69, 58, 0.15);
+            color: #ff453a;
+            border: 1px solid rgba(255, 69, 58, 0.35);
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }
+
+        .cancel-hydration-btn:hover {
+            background-color: rgba(255, 69, 58, 0.3);
+            border-color: rgba(255, 69, 58, 0.6);
+            color: #fff;
+            box-shadow: 0 0 8px rgba(255, 69, 58, 0.4);
+        }
+
+        .cancel-hydration-btn:active {
+            transform: scale(0.96);
+        }
+
         @keyframes pulse-glow {
             0% { box-shadow: 0 0 0 0 rgba(138, 43, 226, 0.4); }
             70% { box-shadow: 0 0 0 8px rgba(138, 43, 226, 0); }
@@ -843,7 +867,10 @@
                     card.innerHTML = `
                         <div class="download-header">
                             <div class="download-url" title="${file.url}">${file.url}</div>
-                            <div class="download-badge" id="badge-${file.key}">0% Complete</div>
+                            <div class="download-badge-container" style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
+                                <div class="download-badge" id="badge-${file.key}">0% Complete</div>
+                                <button class="cancel-hydration-btn" onclick="cancelHydration('${file.key}')" title="Cancel this in-progress hydration">Cancel Hydration</button>
+                            </div>
                         </div>
                         <div class="download-meta" id="meta-${file.key}"></div>
                         <canvas class="block-canvas" id="canvas-${file.key}"></canvas>
@@ -857,6 +884,26 @@
                     renderCanvas(canvas, fileData);
                 }
             });
+        }
+
+        async function cancelHydration(key) {
+            if (!confirm("Are you sure you want to cancel this hydration and stop downloading?")) {
+                return;
+            }
+            try {
+                const response = await fetch(`/api/hydration/cancel?key=${encodeURIComponent(key)}`, {
+                    method: 'POST'
+                });
+                if (response.ok) {
+                    appendLog(`\n[Admin] Cancelled hydration for key: ${key}`);
+                } else {
+                    const text = await response.text();
+                    alert(`Failed to cancel hydration: ${text}`);
+                }
+            } catch (e) {
+                console.error("Error cancelling hydration:", e);
+                alert(`Error cancelling hydration: ${e.message}`);
+            }
         }
 
         // Targeted DOM Management for Active Connections

@@ -2292,5 +2292,78 @@ func TestCoordinatorResuscitationOnClientStarvation(t *testing.T) {
 	}
 }
 
+func TestCancelHydrationAPI(t *testing.T) {
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	key := "test_cancel_api.mkv"
+	partPath := filepath.Join(GlobalConfig.TmpDir, key+".part")
+	metaPath := filepath.Join(GlobalConfig.CacheDir, key+".json")
+	_ = os.WriteFile(partPath, []byte("partial data"), 0644)
+	_ = os.WriteFile(metaPath, []byte("{}"), 0644)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	state := &FileCacheState{
+		Key:          key,
+		URL:          "http://example.com/test.mkv",
+		Path:         filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:     partPath,
+		MetaPath:     metaPath,
+		TotalSize:    1000,
+		TotalBlocks:  2,
+		BlockStates:  []int{BlockNotStarted, BlockNotStarted},
+		Clients:      make(map[string]chan struct{}),
+		Starving:     make(map[string]int),
+		NotifyChan:   make(chan struct{}, 10),
+		WriterActive: true,
+		Cancel:       cancel,
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	// Perform POST request to cancel API
+	req := httptest.NewRequest("POST", "/api/hydration/cancel?key="+key, nil)
+	rr := httptest.NewRecorder()
+
+	handleCancelHydration(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("Expected HTTP 200 OK from cancel API, got status %d", rr.Code)
+	}
+
+	// Verify context was cancelled
+	select {
+	case <-ctx.Done():
+		// Success
+	default:
+		t.Errorf("Expected coordinator context to be cancelled")
+	}
+
+	// Verify file was removed from registry
+	GlobalRegistry.Lock.Lock()
+	_, exists := GlobalRegistry.Files[key]
+	GlobalRegistry.Lock.Unlock()
+	if exists {
+		t.Errorf("Expected file state to be removed from registry after cancellation with 0 clients")
+	}
+
+	// Verify partial files on disk were cleaned up
+	if FileExists(partPath) {
+		t.Errorf("Expected part file %s to be deleted from disk on cancellation", partPath)
+	}
+	if FileExists(metaPath) {
+		t.Errorf("Expected meta file %s to be deleted from disk on cancellation", metaPath)
+	}
+}
+
+
 
 

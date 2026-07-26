@@ -36,6 +36,49 @@ func StartCoordinator(state *FileCacheState, initialHeader http.Header) {
 	go runCoordinator(state, initialHeader)
 }
 
+// CancelCoordinator cancels an active coordinator, stopping workers and deleting partial files if no clients exist
+func CancelCoordinator(state *FileCacheState) {
+	state.Lock.Lock()
+	cancel := state.Cancel
+	state.Cancel = nil
+	state.UpstreamStatus = "Cancelled"
+	clientsCount := len(state.Clients)
+	fileToClose := state.File
+	state.File = nil
+	state.WriterActive = false
+	partPath := state.PartPath
+	metaPath := state.MetaPath
+	key := state.Key
+	state.Lock.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	if fileToClose != nil {
+		_ = fileToClose.Close()
+	}
+
+	if clientsCount == 0 {
+		if FileExists(partPath) {
+			_ = os.Remove(partPath)
+		}
+		if FileExists(metaPath) {
+			_ = os.Remove(metaPath)
+		}
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, key)
+		GlobalRegistry.Lock.Unlock()
+		log.Printf("[Coord] Manually cancelled hydration and removed partial cache files: %s", key)
+	} else {
+		log.Printf("[Coord] Manually cancelled hydration for %s (%d active clients remain)", key, clientsCount)
+	}
+
+	if GlobalLogBroker != nil {
+		GlobalLogBroker.BroadcastStateUpdate()
+	}
+}
+
 type Worker struct {
 	id                int
 	startBlock        int
@@ -75,12 +118,17 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	state.Lock.Unlock()
 
 	parentCtx, parentCancel := context.WithCancel(context.Background())
+	state.Lock.Lock()
+	state.Cancel = parentCancel
+	state.Lock.Unlock()
+
 	workerIdGen := 0
 	sniffed := false
 
 	defer func() {
 		parentCancel()
 		state.Lock.Lock()
+		state.Cancel = nil
 
 		// We check if all blocks are completed to ensure we only finalize fully completed files.
 		isCompleted := len(state.BlockStates) > 0
