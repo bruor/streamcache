@@ -2416,12 +2416,18 @@ func TestEMASpeedSmoothingAndAverageSpeed(t *testing.T) {
 	state.Lock.Lock()
 	instantSpeed2 := float64(state.BytesDownloadedSec)
 	state.BytesDownloadedSec = 0
-	state.SmoothDownloadSpeed = (0.3 * instantSpeed2) + (0.7 * state.SmoothDownloadSpeed)
+	if instantSpeed2 == 0 {
+		state.SmoothDownloadSpeed = 0
+	} else if state.SmoothDownloadSpeed == 0 {
+		state.SmoothDownloadSpeed = instantSpeed2
+	} else {
+		state.SmoothDownloadSpeed = (0.5 * instantSpeed2) + (0.5 * state.SmoothDownloadSpeed)
+	}
 	state.DownloadSpeed = int64(state.SmoothDownloadSpeed)
 	state.Lock.Unlock()
 
-	if state.DownloadSpeed != 70000 {
-		t.Errorf("Expected EMA smoothed download speed 70000 after 0 B/s cycle, got %d", state.DownloadSpeed)
+	if state.DownloadSpeed != 0 {
+		t.Errorf("Expected fast-snap download speed 0 after 0 B/s cycle, got %d", state.DownloadSpeed)
 	}
 }
 

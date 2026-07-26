@@ -215,10 +215,16 @@
 
         .download-meta {
             display: flex;
+            align-items: center;
+            flex-wrap: wrap;
             gap: 1.5rem;
             font-size: 0.85rem;
             color: var(--text-sub);
             margin-bottom: 1rem;
+        }
+
+        .download-meta-speed {
+            margin-left: auto;
         }
 
         .block-canvas {
@@ -844,6 +850,7 @@
                     ${fileData.upstream_status ? `<span>Upstream: <span class="upstream-status-badge ${fileData.upstream_status.toLowerCase()}">${fileData.upstream_status}</span></span>` : ''}
                     <span>Connections (30s): ${fileData.connections_last_30s || 0}</span>
                     ${fileData.observed_cooldown > 0 ? `<span>Observed Cooldown: ${fileData.observed_cooldown.toFixed(1)}s</span>` : ''}
+                    <span class="download-meta-speed">
                     ${fileData.download_speed > 0 ? 
                         `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(fileData.download_speed)}/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}</span>` : 
                         (fileData.upstream_status === 'Throttled' ? 
@@ -851,6 +858,7 @@
                             `<span>Speed: 0 B/s</span>`
                         )
                     }
+                    </span>
                 `;
             }
         }

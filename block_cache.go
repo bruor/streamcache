@@ -203,11 +203,13 @@ func (r *CacheRegistry) startSpeedMonitor() {
 			instantSpeed := float64(fileState.BytesDownloadedSec)
 			fileState.BytesDownloadedSec = 0
 
-			// Exponential Moving Average (EMA) smoothing with alpha = 0.3
-			if fileState.SmoothDownloadSpeed == 0 {
+			// Fast-Snap Speed Engine: instant drop to 0 and instant jump on start
+			if instantSpeed == 0 {
+				fileState.SmoothDownloadSpeed = 0
+			} else if fileState.SmoothDownloadSpeed == 0 {
 				fileState.SmoothDownloadSpeed = instantSpeed
 			} else {
-				fileState.SmoothDownloadSpeed = (0.3 * instantSpeed) + (0.7 * fileState.SmoothDownloadSpeed)
+				fileState.SmoothDownloadSpeed = (0.5 * instantSpeed) + (0.5 * fileState.SmoothDownloadSpeed)
 			}
 			fileState.DownloadSpeed = int64(fileState.SmoothDownloadSpeed)
 
