@@ -509,23 +509,138 @@
             100% { box-shadow: 0 0 0 0 rgba(255, 0, 0, 0); }
         }
 
+        body {
+            background-color: var(--bg-color);
+            background-image: radial-gradient(circle at 10% 20%, rgba(138, 43, 226, 0.15) 0%, transparent 40%),
+                              radial-gradient(circle at 90% 80%, rgba(0, 240, 255, 0.1) 0%, transparent 40%);
+            color: var(--text-main);
+            font-family: var(--font-family);
+            min-height: 100vh;
+            padding: 2rem;
+            max-width: 100vw;
+            overflow-x: hidden;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--card-border);
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 0.75rem;
+            }
+
+            header {
+                flex-direction: column;
+                align-items: flex-start;
+                margin-bottom: 1rem;
+                padding-bottom: 1rem;
+                gap: 0.75rem;
+            }
+
+            h1 {
+                font-size: 1.5rem !important;
+            }
+
+            .system-status {
+                width: 100%;
+                flex-wrap: wrap;
+                gap: 0.5rem;
+            }
+
+            .status-pill {
+                width: 100%;
+            }
+
+            .download-header {
+                flex-direction: column;
+                align-items: flex-start !important;
+                gap: 0.5rem;
+            }
+
+            .download-url {
+                max-width: 100% !important;
+                white-space: normal !important;
+                word-break: break-all;
+            }
+
+            .download-badge-container {
+                align-items: flex-start !important;
+                width: 100%;
+                flex-direction: row !important;
+                justify-content: space-between;
+            }
+        }
+
+        .cache-status-pill {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 6px 14px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .cache-status-info {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            font-size: 0.82rem;
+            line-height: 1.25;
+        }
+
+        .cache-status-title {
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--accent-secondary);
+        }
+
+        #topbar-cache-text {
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        #topbar-disk-text {
+            color: var(--text-sub);
+            font-size: 0.78rem;
+        }
+
         .connection-details {
             display: flex;
             flex-direction: column;
             gap: 0.4rem;
             font-size: 0.85rem;
             color: var(--text-sub);
+            min-width: 0;
+            overflow: hidden;
         }
 
         .connection-detail-row {
             display: flex;
             justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
+            min-width: 0;
+            overflow: hidden;
         }
 
         .connection-detail-value {
             color: var(--text-main);
             font-weight: 500;
             word-break: break-all;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
     </style>
 </head>
@@ -534,15 +649,14 @@
     <header>
         <h1><span class="logo-dot"></span> Streamcache VOD Proxy</h1>
         <div class="system-status">
-            <div class="status-pill" style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);">
-                <span>💾</span>
-                <span id="topbar-cache-text">Cache: 0.00 GB</span>
+            <div class="status-pill cache-status-pill">
+                <span style="font-size: 1.2rem;">💾</span>
+                <div class="cache-status-info">
+                    <div id="topbar-cache-text">Cache: 0.00 GB</div>
+                    <div id="topbar-disk-text">Disk Free: 0.00 GB</div>
+                </div>
             </div>
-            <div class="status-pill" style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);">
-                <span>💽</span>
-                <span id="topbar-disk-text">Disk Free: 0.00 GB</span>
-            </div>
-            <div class="status-pill">
+            <div class="status-pill" style="padding: 6px 14px; border-radius: 12px;">
                 <span id="connection-status-dot" class="status-indicator disconnected"></span>
                 <span id="connection-status-text">Connecting SSE...</span>
             </div>
@@ -1052,15 +1166,15 @@
                             <span>Elapsed Time:</span>
                             <span class="connection-detail-value">${durationStr}</span>
                         </div>
-                    </div>
-                    <div class="connection-details">
-                        <div class="connection-detail-row" style="grid-column: 1 / -1;">
-                            <span>Streaming File:</span>
-                            <span class="connection-detail-value" title="${conn.url}" style="color: var(--accent-secondary); max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; text-align: right;">${conn.url}</span>
-                        </div>
                         <div class="connection-detail-row">
                             <span>Current Offset:</span>
                             <span class="connection-detail-value">${formatBytes(conn.offset)}${percentageStr}</span>
+                        </div>
+                    </div>
+                    <div class="connection-details" style="grid-column: 1 / -1; border-top: 1px solid rgba(255, 255, 255, 0.05); padding-top: 0.4rem; margin-top: 0.2rem;">
+                        <div class="connection-detail-row" style="flex-direction: column; align-items: flex-start; gap: 4px;">
+                            <span>Streaming File:</span>
+                            <span class="connection-detail-value" title="${conn.url}" style="color: var(--accent-secondary); font-family: var(--font-mono); font-size: 0.78rem; word-break: break-all; width: 100%; display: block;">${conn.url}</span>
                         </div>
                     </div>
                 `;
