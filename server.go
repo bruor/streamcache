@@ -223,8 +223,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			LastValidated:  time.Now().Unix(),
 			Clients:        make(map[string]chan struct{}),
 			Starving:       make(map[string]int),
-			NotifyChan:     make(chan struct{}, 10),
-			UpstreamStatus: "Idle",
+			NotifyChan:               make(chan struct{}, 10),
+			UpstreamStatus:           "Idle",
+			PendingTailPrefetchBlock: -1,
 		}
 
 		// Save initial sparse metadata

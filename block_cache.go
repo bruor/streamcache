@@ -99,6 +99,7 @@ type FileCacheState struct {
 	ObservedCooldown   float64
 	ActiveWorkers      []*Worker
 	WorkersLock        sync.Mutex
+	PendingTailPrefetchBlock int
 }
 
 type ConnectionInfo struct {

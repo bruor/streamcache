@@ -2509,6 +2509,100 @@ func TestCancellationAndResuscitation(t *testing.T) {
 	}
 }
 
+func TestSingleWorkerTailPrefetch(t *testing.T) {
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldBlockSize := GlobalConfig.BlockSize
+	oldMaxTailBlocks := GlobalConfig.MaxPrefetchTailBlocks
+
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.MaxUpstreamWorkers = 1
+	GlobalConfig.BlockSize = 100
+	GlobalConfig.MaxPrefetchTailBlocks = 10
+
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
+		GlobalConfig.BlockSize = oldBlockSize
+		GlobalConfig.MaxPrefetchTailBlocks = oldMaxTailBlocks
+	}()
+
+	ebmlHeader := makeEbmlElement(ID_EBML, []byte{0x42, 0x86, 0x81, 0x01})
+	seekID := makeEbmlElement(ID_SEEKID, []byte{0x1C, 0x53, 0xBB, 0x6B})
+	seekPosVal := []byte{0x03, 0x20} // 800 in uint16 big endian
+	seekPos := makeEbmlElement(ID_SEEKPOS, seekPosVal)
+	seekPayload := append(seekID, seekPos...)
+	seek := makeEbmlElement(ID_SEEK, seekPayload)
+	seekHead := makeEbmlElement(ID_SEEKHEAD, seek)
+	segmentID := makeVintID(ID_SEGMENT)
+	segmentSize := makeVint(2000)
+	segmentHeader := append(segmentID, segmentSize...)
+	headerBytes := append(ebmlHeader, segmentHeader...)
+	headerBytes = append(headerBytes, seekHead...)
+
+	responseBytes := make([]byte, 1000)
+	copy(responseBytes, headerBytes)
+
+	cuesOffset := int64(800)
+	cuesHeader := []byte{0x1C, 0x53, 0xBB, 0x6B}
+	copy(responseBytes[cuesOffset:], cuesHeader)
+
+	var requestedRanges []string
+	var lock sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		lock.Unlock()
+
+		http.ServeContent(w, r, "test_single_prefetch.mkv", time.Time{}, bytes.NewReader(responseBytes))
+	}))
+	defer server.Close()
+
+	key := "test_single_prefetch.mkv"
+	state := &FileCacheState{
+		Key:                      key,
+		URL:                      server.URL,
+		Path:                     filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:                 filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:                 filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:                1000,
+		TotalBlocks:              10,
+		BlockStates:              make([]int, 10),
+		Clients:                  make(map[string]chan struct{}),
+		Starving:                 make(map[string]int),
+		NotifyChan:               make(chan struct{}, 10),
+		PendingTailPrefetchBlock: -1,
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	req := httptest.NewRequest("GET", "/stream", nil)
+	reader := NewCacheReader(context.Background(), state, req)
+	defer reader.Close()
+
+	StartCoordinator(state, nil)
+
+	buf := make([]byte, 100)
+	_, _ = reader.Read(buf)
+
+	time.Sleep(300 * time.Millisecond)
+
+	lock.Lock()
+	ranges := make([]string, len(requestedRanges))
+	copy(ranges, requestedRanges)
+	lock.Unlock()
+
+	if len(ranges) < 2 {
+		t.Fatalf("Expected at least 2 requests (1 initial/sequential, 1 inline tail prefetch), got %d", len(ranges))
+	}
+}
+
 
 
 

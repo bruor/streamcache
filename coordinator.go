@@ -232,8 +232,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				}
 			}
 		} else {
-			// Incomplete download
-			state.Lock.Lock()
+			// Incomplete download (state.Lock is already held from line 138)
 			for i, st := range state.BlockStates {
 				if st == BlockDownloading {
 					state.BlockStates[i] = BlockNotStarted
@@ -431,8 +430,19 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						state.Lock.Unlock()
 
 						if needPrefetch {
-							log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at block %d", tailStartBlock)
-							spawnPrefetchWorker(tailStartBlock)
+							if GlobalConfig.MaxUpstreamWorkers > 1 {
+								log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at block %d", tailStartBlock)
+								spawnPrefetchWorker(tailStartBlock)
+							} else {
+								log.Printf("[Coord] Sniffed non-optimized container. MaxUpstreamWorkers=1: Queuing inline tail pre-fetch starting at block %d", tailStartBlock)
+								state.Lock.Lock()
+								state.PendingTailPrefetchBlock = tailStartBlock
+								state.Lock.Unlock()
+								select {
+								case state.NotifyChan <- struct{}{}:
+								default:
+								}
+							}
 						} else {
 							log.Printf("[Coord] Metadata tail blocks already cached. Skipping pre-fetch.")
 						}
@@ -923,6 +933,20 @@ func runDownloadWorker(
 		default:
 		}
 
+		// Check for pending inline tail pre-fetch when MaxUpstreamWorkers == 1
+		state.Lock.Lock()
+		pendingTail := state.PendingTailPrefetchBlock
+		if pendingTail > 0 {
+			state.PendingTailPrefetchBlock = -1
+		}
+		state.Lock.Unlock()
+
+		if pendingTail > 0 {
+			closeConnection()
+			runInlineTailPrefetch(ctx, w, state, initialHeader, file, pendingTail)
+			continue
+		}
+
 		blockSize := GlobalConfig.BlockSize
 		blockStartOffset := int64(currentBlock) * blockSize
 		blockEndOffset := blockStartOffset + blockSize
@@ -1167,4 +1191,157 @@ func safeSignal(ch chan struct{}) {
 	case ch <- struct{}{}:
 	default:
 	}
+}
+
+func runInlineTailPrefetch(
+	ctx context.Context,
+	w *Worker,
+	state *FileCacheState,
+	initialHeader http.Header,
+	file *os.File,
+	tailStartBlock int,
+) {
+	blockSize := GlobalConfig.BlockSize
+	prefetchStart := int64(tailStartBlock) * blockSize
+	prefetchLength := state.TotalSize - prefetchStart
+	if prefetchLength <= 0 {
+		return
+	}
+
+	log.Printf("[Worker-%d] MaxUpstreamWorkers=1: Executing inline tail pre-fetch (%d bytes) starting at block %d", w.id, prefetchLength, tailStartBlock)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", state.URL, nil)
+	if err != nil {
+		log.Printf("[Worker-%d] Inline tail pre-fetch request creation failed: %v", w.id, err)
+		return
+	}
+
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
+	req.Header.Set("Range", rangeHeader)
+	if initialHeader != nil && len(initialHeader) > 0 {
+		for k, vv := range initialHeader {
+			if k != "Range" && k != "Connection" && k != "Host" {
+				for _, v := range vv {
+					req.Header.Add(k, v)
+				}
+			}
+		}
+	} else {
+		req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
+		req.Header.Set("Accept", "*/*")
+	}
+
+	state.Lock.Lock()
+	state.UpstreamStatus = "Connecting"
+	state.Lock.Unlock()
+
+	resp, rerr := UpstreamHTTPClient.Do(req)
+	if rerr != nil || (resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent) {
+		if rerr == nil {
+			_ = resp.Body.Close()
+		}
+		log.Printf("[Worker-%d] Inline tail pre-fetch request failed. Status: %v, err: %v", w.id, resp, rerr)
+		return
+	}
+	defer resp.Body.Close()
+
+	state.Lock.Lock()
+	state.UpstreamStatus = "Downloading"
+	var downloadingBlocks []int
+	for b := tailStartBlock; b < state.TotalBlocks; b++ {
+		if state.BlockStates[b] != BlockCompleted {
+			state.BlockStates[b] = BlockDownloading
+			downloadingBlocks = append(downloadingBlocks, b)
+		}
+	}
+	if len(downloadingBlocks) > 0 && GlobalLogBroker != nil {
+		GlobalLogBroker.BroadcastBlockUpdate(state.Key, downloadingBlocks, BlockDownloading)
+	}
+	state.Lock.Unlock()
+
+	buffer := make([]byte, 512*1024)
+	bytesRead := int64(0)
+	prefetchFailed := false
+
+	for bytesRead < prefetchLength {
+		select {
+		case <-ctx.Done():
+			prefetchFailed = true
+			break
+		default:
+		}
+		if prefetchFailed {
+			break
+		}
+
+		limit := int64(len(buffer))
+		if prefetchLength-bytesRead < limit {
+			limit = prefetchLength - bytesRead
+		}
+
+		n, readErr := resp.Body.Read(buffer[:limit])
+		if n > 0 {
+			writeOffset := prefetchStart + bytesRead
+			_, werr := file.WriteAt(buffer[:n], writeOffset)
+			if werr != nil {
+				log.Printf("[Worker-%d] Inline tail pre-fetch file write error: %v", w.id, werr)
+				prefetchFailed = true
+				break
+			}
+
+			if !GlobalConfig.DisableFadvise {
+				FadviseDontNeed(file.Fd(), writeOffset, int64(n))
+			}
+
+			bytesRead += int64(n)
+
+			state.Lock.Lock()
+			for b := tailStartBlock; b < state.TotalBlocks; b++ {
+				bStart := int64(b) * blockSize
+				bEnd := bStart + blockSize
+				if bEnd > state.TotalSize {
+					bEnd = state.TotalSize
+				}
+				if prefetchStart+bytesRead >= bEnd && state.BlockStates[b] == BlockDownloading {
+					state.BlockStates[b] = BlockCompleted
+					if GlobalLogBroker != nil {
+						GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{b}, BlockCompleted)
+					}
+					for _, ch := range state.Clients {
+						safeSignal(ch)
+					}
+				}
+			}
+			state.Lock.Unlock()
+		}
+
+		if readErr != nil {
+			if bytesRead < prefetchLength {
+				log.Printf("[Worker-%d] Inline tail pre-fetch read error: %v", w.id, readErr)
+			}
+			break
+		}
+	}
+
+	state.Lock.Lock()
+	for b := tailStartBlock; b < state.TotalBlocks; b++ {
+		bStart := int64(b) * blockSize
+		bEnd := bStart + blockSize
+		if bEnd > state.TotalSize {
+			bEnd = state.TotalSize
+		}
+		if prefetchStart+bytesRead >= bEnd {
+			state.BlockStates[b] = BlockCompleted
+		} else {
+			if state.BlockStates[b] != BlockCompleted {
+				state.BlockStates[b] = BlockNotStarted
+			}
+		}
+	}
+	for _, ch := range state.Clients {
+		safeSignal(ch)
+	}
+	state.Lock.Unlock()
+
+	log.Printf("[Worker-%d] Inline tail pre-fetch finished. Resuming sequential stream.", w.id)
 }
