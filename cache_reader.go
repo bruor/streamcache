@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 )
+
+var globalClientIDSeq uint64
 
 type CacheReader struct {
 	state    *FileCacheState
@@ -23,8 +25,8 @@ type CacheReader struct {
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
 	state.Lock.Lock()
 
-	// Generate a unique client ID
-	clientID := fmt.Sprintf("client-%d", rand.Intn(1000000))
+	// Generate a unique client ID using atomic counter
+	clientID := fmt.Sprintf("client-%d", atomic.AddUint64(&globalClientIDSeq, 1))
 	state.Clients[clientID] = make(chan struct{}, 1)
 
 	var remoteAddr, userAgent string

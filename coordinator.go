@@ -365,11 +365,17 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 					if isMkv {
 						hasCues, cuesOffset = GetMkvCuesOffset(data)
+						state.Lock.Lock()
+						state.ContentType = "video/x-matroska"
+						state.Lock.Unlock()
 					} else if n >= 8 {
 						firstBoxType := string(data[4:8])
 						if firstBoxType == "ftyp" || firstBoxType == "free" || firstBoxType == "moov" || firstBoxType == "mdat" {
 							isMp4 = true
 							isFastStart, moovOffset, hasMdatSize = IsMp4FastStart(data)
+							state.Lock.Lock()
+							state.ContentType = "video/mp4"
+							state.Lock.Unlock()
 						}
 					}
 
@@ -852,6 +858,10 @@ func runDownloadWorker(
 
 						bytesRead += int64(n)
 
+						atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
+						atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
+						GlobalRegistry.UpdateSize(int64(n))
+
 						state.Lock.Lock()
 						for b := w.startBlock; b < state.TotalBlocks; b++ {
 							bStart := int64(b) * blockSize
@@ -1306,6 +1316,10 @@ func runInlineTailPrefetch(
 			}
 
 			bytesRead += int64(n)
+
+			atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
+			atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
+			GlobalRegistry.UpdateSize(int64(n))
 
 			state.Lock.Lock()
 			for b := tailStartBlock; b < state.TotalBlocks; b++ {

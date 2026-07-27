@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -48,6 +47,8 @@ func StartServer() {
 		log.Fatalf("[Server] Failed to start server: %v", err)
 	}
 }
+
+var globalConnIDSeq uint64
 
 func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	var targetURL string
@@ -120,8 +121,8 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				defer file.Close()
 
-				// Generate unique connection ID
-				connID := fmt.Sprintf("conn-%d", rand.Intn(10000000))
+				// Generate unique connection ID using atomic counter
+				connID := fmt.Sprintf("conn-%d", atomic.AddUint64(&globalConnIDSeq, 1))
 				remoteAddr := r.RemoteAddr
 				userAgent := r.Header.Get("User-Agent")
 				if userAgent == "" {
@@ -165,6 +166,15 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 				w.Header().Set("X-Cache", "HIT")
 				w.Header().Set("Accept-Ranges", "bytes")
+
+				// Set Content-Type from metadata if available, otherwise extension fallback
+				metaPath := cacheFilePath + ".json"
+				if metaBytes, err := os.ReadFile(metaPath); err == nil {
+					var meta FileMeta
+					if json.Unmarshal(metaBytes, &meta) == nil && meta.ContentType != "" {
+						w.Header().Set("Content-Type", meta.ContentType)
+					}
+				}
 				http.ServeContent(w, r, cacheFileName, time.Now(), tracker)
 				return
 			}
@@ -183,9 +193,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Probe the upstream CDN to fetch total size, ETag, and Last-Modified headers
+		// Probe the upstream CDN to fetch total size, Content-Type, ETag, and Last-Modified headers
 		log.Printf("[Server] Cache MISS for %s. Probing upstream CDN for metadata...", key)
-		totalSize, etag, lastMod, _, err := probeUpstream(r.Context(), targetURL, r.Header, nil)
+		totalSize, probeContentType, etag, lastMod, _, err := probeUpstream(r.Context(), targetURL, r.Header, nil)
 		if err != nil {
 			log.Printf("[Server] Upstream probe failed: %v", err)
 			cooldown := GlobalConfig.ProbeTransientCooldown
@@ -201,6 +211,11 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Fall back to MIME type by file extension if upstream didn't provide a specific video content-type
+		if probeContentType == "" || strings.HasPrefix(strings.ToLower(probeContentType), "text/html") || probeContentType == "application/octet-stream" {
+			probeContentType = getMimeTypeByExt(ext)
+		}
+
 		// Create metadata companion file
 		metaPath := cacheFilePath + ".json"
 		partPath := filepath.Join(GlobalConfig.TmpDir, cacheFileName+".part")
@@ -210,19 +225,20 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 		// Create FileCacheState
 		state = &FileCacheState{
-			Key:            cacheFileName,
-			URL:            targetURL,
-			Path:           cacheFilePath,
-			PartPath:       partPath,
-			MetaPath:       metaPath,
-			TotalSize:      totalSize,
-			TotalBlocks:    totalBlocks,
-			BlockStates:    blockStates,
-			ETag:           etag,
-			LastModified:   lastMod,
-			LastValidated:  time.Now().Unix(),
-			Clients:        make(map[string]chan struct{}),
-			Starving:       make(map[string]int),
+			Key:                      cacheFileName,
+			URL:                      targetURL,
+			Path:                     cacheFilePath,
+			PartPath:                 partPath,
+			MetaPath:                 metaPath,
+			TotalSize:                totalSize,
+			TotalBlocks:              totalBlocks,
+			BlockStates:              blockStates,
+			ContentType:              probeContentType,
+			ETag:                     etag,
+			LastModified:             lastMod,
+			LastValidated:            time.Now().Unix(),
+			Clients:                  make(map[string]chan struct{}),
+			Starving:                 make(map[string]int),
 			NotifyChan:               make(chan struct{}, 10),
 			UpstreamStatus:           "Idle",
 			PendingTailPrefetchBlock: -1,
@@ -232,6 +248,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		meta := FileMeta{
 			URL:           targetURL,
 			TotalSize:     totalSize,
+			ContentType:   probeContentType,
 			ETag:          etag,
 			LastModified:  lastMod,
 			LastValidated: time.Now().Unix(),
@@ -271,7 +288,11 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// Stream growing media content to client using http.ServeContent
 	w.Header().Set("X-Cache", "MISS")
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Type", "video/x-matroska")
+	state.Lock.Lock()
+	if state.ContentType != "" {
+		w.Header().Set("Content-Type", state.ContentType)
+	}
+	state.Lock.Unlock()
 	http.ServeContent(w, r, cacheFileName, time.Now(), reader)
 }
 
@@ -484,6 +505,26 @@ func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
 		"message": "Hydration cancelled successfully",
 		"key":     key,
 	})
+}
+
+func getMimeTypeByExt(ext string) string {
+	ext = strings.ToLower(ext)
+	switch ext {
+	case ".mp4", ".m4v":
+		return "video/mp4"
+	case ".mkv":
+		return "video/x-matroska"
+	case ".ts":
+		return "video/mp2t"
+	case ".avi":
+		return "video/x-msvideo"
+	case ".mov":
+		return "video/quicktime"
+	case ".webm":
+		return "video/webm"
+	default:
+		return "video/x-matroska"
+	}
 }
 
 

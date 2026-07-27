@@ -22,13 +22,14 @@ const (
 )
 
 type FileMeta struct {
-	URL          string `json:"url"`
-	TotalSize    int64  `json:"total_size"`
-	ETag         string `json:"etag"`
-	LastModified string `json:"last_modified"`
+	URL           string `json:"url"`
+	TotalSize     int64  `json:"total_size"`
+	ContentType   string `json:"content_type,omitempty"`
+	ETag          string `json:"etag"`
+	LastModified  string `json:"last_modified"`
 	LastValidated int64  `json:"last_validated"` // Unix timestamp
-	Completed    bool   `json:"completed"`
-	BlockStates  []int  `json:"block_states,omitempty"`
+	Completed     bool   `json:"completed"`
+	BlockStates   []int  `json:"block_states,omitempty"`
 }
 
 type ClientConnection struct {
@@ -76,6 +77,7 @@ type FileCacheState struct {
 	TotalSize    int64
 	TotalBlocks  int
 	BlockStates  []int
+	ContentType  string
 	ETag         string
 	LastModified string
 	LastValidated int64
@@ -168,8 +170,8 @@ func (r *CacheRegistry) RecordFailedProbe(key string, duration time.Duration) {
 }
 
 func (r *CacheRegistry) IsProbeFailed(key string) bool {
-	r.Lock.RLock()
-	defer r.Lock.RUnlock()
+	r.Lock.Lock()
+	defer r.Lock.Unlock()
 	if r.FailedProbes == nil {
 		return false
 	}
@@ -178,6 +180,7 @@ func (r *CacheRegistry) IsProbeFailed(key string) bool {
 		return false
 	}
 	if time.Now().After(expiry) {
+		delete(r.FailedProbes, key)
 		return false
 	}
 	return true

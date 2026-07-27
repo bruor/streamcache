@@ -66,9 +66,7 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 
 	log.Printf("[Revalidate] Cache validation expired for %s (Age: %s). Probing CDN upstream...", key, age.Truncate(time.Second))
 
-	log.Printf("[Revalidate] Cache validation expired for %s (Age: %s). Probing CDN upstream...", key, age.Truncate(time.Second))
-
-	upstreamSize, upstreamETag, upstreamLastModified, notModified, err := probeUpstream(context.Background(), url, playerHeader, &meta)
+	upstreamSize, _, upstreamETag, upstreamLastModified, notModified, err := probeUpstream(context.Background(), url, playerHeader, &meta)
 	if err != nil {
 		log.Printf("[Revalidate] Network probe failed for %s: %v. Soft-failing and serving cache.", key, err)
 		return true, nil
@@ -181,16 +179,8 @@ func recreateMetadata(filePath, metaPath, url string) error {
 	return os.WriteFile(metaPath, metaBytes, 0644)
 }
 
-// probeUpstream attempts to determine the file's size, ETag, and Last-Modified headers.
-// It leverages conditional request headers if meta is provided, and dynamically falls back
-// to a standard GET request if Range GET requests fail or are blocked.
-// Returns:
-//   - int64: total size of the file (0 if notModified is true)
-//   - string: ETag from upstream
-//   - string: Last-Modified from upstream
-//   - bool: true if response was 304 Not Modified
-//   - error: error if it failed completely
-func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, bool, error) {
+// probeUpstream attempts to determine the file's size, Content-Type, ETag, and Last-Modified headers.
+func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, string, bool, error) {
 	originalHost := GetCleanHost(targetURL)
 	preferredMethod := GetProbeMethod(originalHost)
 
@@ -200,52 +190,50 @@ func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Head
 
 	// If preferred method is range, try Range: bytes=0-0 first
 	if preferredMethod == ProbeMethodRange {
-		size, etag, lm, notModified, err := tryRangeProbe(ctx, targetURL, playerHeader, meta)
+		size, ctype, etag, lm, notModified, err := tryRangeProbe(ctx, targetURL, playerHeader, meta)
 		if err == nil {
-			// Succeeded with range. Ensure cache is set.
 			SetProbeMethod(originalHost, ProbeMethodRange)
-			return size, etag, lm, notModified, nil
+			return size, ctype, etag, lm, notModified, nil
 		}
 		if isCatastrophicProbeError(err) {
 			log.Printf("[Probe] Range probe hit catastrophic failure on host %s: %v. Aborting immediately.", originalHost, err)
-			return 0, "", "", false, err
+			return 0, "", "", "", false, err
 		}
 		log.Printf("[Probe] Range probe failed for host %s: %v. Trying standard GET fallback...", originalHost, err)
 		lastErr = err
 	}
 
 	// Try standard GET fallback (or if standard GET is preferred)
-	size, etag, lm, notModified, err := tryStandardProbe(ctx, targetURL, playerHeader, meta)
+	size, ctype, etag, lm, notModified, err := tryStandardProbe(ctx, targetURL, playerHeader, meta)
 	if err == nil {
-		// Succeeded with standard. Update cache.
 		SetProbeMethod(originalHost, ProbeMethodStandard)
-		return size, etag, lm, notModified, nil
+		return size, ctype, etag, lm, notModified, nil
 	}
 	if isCatastrophicProbeError(err) {
 		log.Printf("[Probe] Standard probe hit catastrophic failure on host %s: %v. Aborting immediately.", originalHost, err)
-		return 0, "", "", false, err
+		return 0, "", "", "", false, err
 	}
 
 	// If standard GET failed but we haven't tried Range probe yet, try Range probe as final fallback
 	if preferredMethod == ProbeMethodStandard {
 		log.Printf("[Probe] Standard probe failed for host %s: %v. Trying Range probe fallback...", originalHost, err)
-		size, etag, lm, notModified, rerr := tryRangeProbe(ctx, targetURL, playerHeader, meta)
+		size, ctype, etag, lm, notModified, rerr := tryRangeProbe(ctx, targetURL, playerHeader, meta)
 		if rerr == nil {
 			SetProbeMethod(originalHost, ProbeMethodRange)
-			return size, etag, lm, notModified, nil
+			return size, ctype, etag, lm, notModified, nil
 		}
 		lastErr = rerr
 	} else {
 		lastErr = err
 	}
 
-	return 0, "", "", false, fmt.Errorf("all probe methods failed; last error: %w", lastErr)
+	return 0, "", "", "", false, fmt.Errorf("all probe methods failed; last error: %w", lastErr)
 }
 
-func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, bool, error) {
+func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 	if err != nil {
-		return 0, "", "", false, err
+		return 0, "", "", "", false, err
 	}
 
 	req.Header.Set("Range", "bytes=0-0")
@@ -268,21 +256,21 @@ func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Head
 
 	resp, err := UpstreamHTTPClient.Do(req)
 	if err != nil {
-		return 0, "", "", false, err
+		return 0, "", "", "", false, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotModified {
-		return 0, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), true, nil
+		return 0, "", resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), true, nil
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return 0, "", "", false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return 0, "", "", "", false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	contentType := resp.Header.Get("Content-Type")
 	if strings.HasPrefix(strings.ToLower(contentType), "text/html") {
-		return 0, "", "", false, fmt.Errorf("upstream returned HTML content type %q (likely a CDN block or redirect)", contentType)
+		return 0, "", "", "", false, fmt.Errorf("upstream returned HTML content type %q (likely a CDN block or redirect)", contentType)
 	}
 
 	// Cache successful target host
@@ -293,16 +281,16 @@ func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Head
 
 	size, err := parseTotalSizeFromHeaders(resp.Header)
 	if err != nil {
-		return 0, "", "", false, err
+		return 0, "", "", "", false, err
 	}
 
-	return size, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), false, nil
+	return size, contentType, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), false, nil
 }
 
-func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, bool, error) {
+func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
 	if err != nil {
-		return 0, "", "", false, err
+		return 0, "", "", "", false, err
 	}
 
 	if playerHeader != nil {
@@ -324,21 +312,21 @@ func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.H
 
 	resp, err := UpstreamHTTPClient.Do(req)
 	if err != nil {
-		return 0, "", "", false, err
+		return 0, "", "", "", false, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotModified {
-		return 0, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), true, nil
+		return 0, "", resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), true, nil
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, "", "", false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return 0, "", "", "", false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	contentType := resp.Header.Get("Content-Type")
 	if strings.HasPrefix(strings.ToLower(contentType), "text/html") {
-		return 0, "", "", false, fmt.Errorf("upstream returned HTML content type %q (likely a CDN block or redirect)", contentType)
+		return 0, "", "", "", false, fmt.Errorf("upstream returned HTML content type %q (likely a CDN block or redirect)", contentType)
 	}
 
 	// Cache successful target host
@@ -357,19 +345,19 @@ func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.H
 			if len(matches) > 1 {
 				size, err := strconv.ParseInt(matches[1], 10, 64)
 				if err == nil {
-					return size, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), false, nil
+					return size, contentType, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), false, nil
 				}
 			}
 		}
-		return 0, "", "", false, fmt.Errorf("Content-Length header is missing in standard probe")
+		return 0, "", "", "", false, fmt.Errorf("Content-Length header is missing in standard probe")
 	}
 
 	size, err := strconv.ParseInt(contentLengthStr, 10, 64)
 	if err != nil {
-		return 0, "", "", false, fmt.Errorf("invalid Content-Length value %q: %w", contentLengthStr, err)
+		return 0, "", "", "", false, fmt.Errorf("invalid Content-Length value %q: %w", contentLengthStr, err)
 	}
 
-	return size, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), false, nil
+	return size, contentType, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), false, nil
 }
 
 func isHTMLProbeError(err error) bool {

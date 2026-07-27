@@ -1286,7 +1286,7 @@ func TestRobustProbe(t *testing.T) {
 
 	// Perform the probe
 	ctx := context.Background()
-	size, etag, lm, notModified, err := probeUpstream(ctx, server.URL, nil, nil)
+	size, _, etag, lm, notModified, err := probeUpstream(ctx, server.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("probeUpstream failed: %v", err)
 	}
@@ -1316,7 +1316,7 @@ func TestRobustProbe(t *testing.T) {
 	requestCountBefore := requestCount
 	lock.Unlock()
 
-	size2, _, _, _, err := probeUpstream(ctx, server.URL, nil, nil)
+	size2, _, _, _, _, err := probeUpstream(ctx, server.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("second probeUpstream failed: %v", err)
 	}
@@ -1682,7 +1682,7 @@ func TestProbeHTMLTypeRejection(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, _, _, _, err := probeUpstream(context.Background(), server.URL, nil, nil)
+	_, _, _, _, _, err := probeUpstream(context.Background(), server.URL, nil, nil)
 	if err == nil {
 		t.Fatal("Expected probe to fail when Content-Type is HTML, but it succeeded")
 	}
@@ -1704,7 +1704,7 @@ func TestProbeCatastrophicAbort(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, _, _, _, err := probeUpstream(context.Background(), server.URL, nil, nil)
+	_, _, _, _, _, err := probeUpstream(context.Background(), server.URL, nil, nil)
 	if err == nil {
 		t.Fatal("Expected probe to fail")
 	}
@@ -1759,7 +1759,7 @@ func TestProbeFailureNegativeCaching(t *testing.T) {
 			return
 		}
 
-		_, _, _, _, err := probeUpstream(r.Context(), targetURL, r.Header, nil)
+		_, _, _, _, _, err := probeUpstream(r.Context(), targetURL, r.Header, nil)
 		if err != nil {
 			cooldown := GlobalConfig.ProbeTransientCooldown
 			if isHTMLProbeError(err) || isPermanentProbeError(err) {
