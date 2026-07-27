@@ -562,6 +562,14 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 							break
 						}
 
+						// If the worker is currently pre-fetching tail blocks inline and sb is within the tail range:
+						if atomic.LoadInt32(&w.isPrefetching) == 1 && sb >= wCurrent {
+							log.Printf("[Coord] Worker %d is pre-fetching tail blocks (at %d, client starving at %d). Suppressing pre-emption.", 
+								w.id, wCurrent, sb)
+							suppressed = true
+							break
+						}
+
 						// 2. If the worker is further behind, check if it will reach sb sequentially
 						if wCurrent < sb {
 							// Check if there are any completed blocks in between
@@ -1207,6 +1215,10 @@ func runInlineTailPrefetch(
 	if prefetchLength <= 0 {
 		return
 	}
+
+	atomic.StoreInt32(&w.isPrefetching, 1)
+	w.currentBlock = tailStartBlock
+	defer atomic.StoreInt32(&w.isPrefetching, 0)
 
 	log.Printf("[Worker-%d] MaxUpstreamWorkers=1: Executing inline tail pre-fetch (%d bytes) starting at block %d", w.id, prefetchLength, tailStartBlock)
 
