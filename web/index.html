@@ -225,6 +225,29 @@
             border: 1px solid rgba(0, 240, 255, 0.3);
         }
 
+        .session-origin-badge {
+            font-family: var(--font-mono);
+            font-size: 0.72rem;
+            font-weight: 700;
+            padding: 2px 7px;
+            border-radius: 4px;
+            white-space: nowrap;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+
+        .session-origin-badge.disk {
+            background: rgba(57, 255, 20, 0.12);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 255, 20, 0.35);
+        }
+
+        .session-origin-badge.cdn {
+            background: rgba(0, 240, 255, 0.12);
+            color: var(--accent-secondary);
+            border: 1px solid rgba(0, 240, 255, 0.35);
+        }
+
         .download-speed-badge {
             background: rgba(0, 240, 255, 0.12);
             color: var(--accent-secondary);
@@ -1284,12 +1307,29 @@
                 if (conn.active_conns === 0) {
                     statusClass = 'idle';
                     statusText = 'Buffered / Idle';
-                } else if (conn.in_cache) {
-                    statusClass = 'downloaded';
-                    statusText = 'Downloaded';
                 } else if (conn.starving_block !== -1) {
                     statusClass = 'starving';
                     statusText = `Starving (Block ${conn.starving_block})`;
+                }
+
+                let originBadge = '';
+                if (conn.in_cache) {
+                    originBadge = `<span class="session-origin-badge disk">DISK</span>`;
+                } else {
+                    let hydrationBadge = '';
+                    const fileData = fileStore[conn.key];
+                    if (fileData && fileData.total_blocks > 0) {
+                        const completed = calculateCompletedBlocks(fileData);
+                        const percent = ((completed / fileData.total_blocks) * 100).toFixed(1);
+                        const rawStatus = fileData.upstream_status || 'Downloading';
+                        const statusLower = rawStatus.toLowerCase();
+                        let statusText = `${percent}%`;
+                        if (rawStatus === 'Committing' || rawStatus === 'Throttled' || rawStatus === 'Retrying' || rawStatus === 'Connecting') {
+                            statusText = `${percent}% ${rawStatus}`;
+                        }
+                        hydrationBadge = `<span class="download-badge ${statusLower}" style="font-size: 0.72rem; padding: 2px 7px; margin-left: 4px;">${statusText}</span>`;
+                    }
+                    originBadge = `<span class="session-origin-badge cdn">CDN</span>${hydrationBadge}`;
                 }
 
                 let uaDisplay = conn.user_agent || "Unknown";
@@ -1315,7 +1355,10 @@
                 
                 card.innerHTML = `
                     <div class="connection-header">
-                        <span class="connection-client-id">${conn.id}${activeLabel}</span>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span class="connection-client-id">${conn.id}${activeLabel}</span>
+                            ${originBadge}
+                        </div>
                         <span class="connection-status-badge ${statusClass}">${statusText}</span>
                     </div>
                     <div class="connection-grid">

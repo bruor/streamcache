@@ -122,8 +122,8 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				defer file.Close()
 
-				// Generate unique connection ID using atomic counter
-				connID := fmt.Sprintf("conn-%d", atomic.AddUint64(&globalConnIDSeq, 1))
+				// Generate unique client ID using atomic counter
+				connID := fmt.Sprintf("client-%d", atomic.AddUint64(&globalClientIDSeq, 1))
 				remoteAddr := r.RemoteAddr
 				userAgent := r.Header.Get("User-Agent")
 				if userAgent == "" {
