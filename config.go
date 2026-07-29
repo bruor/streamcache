@@ -43,7 +43,7 @@ func LoadConfig() {
 		MaxPrefetchTailBlocks:   getEnvInt("MAX_PREFETCH_TAILBLOCKS", 10), // Max 10 blocks (40MB default)
 		SchedulerMinTime:        getEnvDuration("SCHEDULER_MIN_TIME", 2*time.Second),
 		DisableFadvise:          getEnvBool("DISABLE_FADVISE", false),
-		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 0),
+		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 10*time.Second),
 		MaxUpstreamWorkers:      getEnvInt("MAX_UPSTREAM_WORKERS", 2),
 		ClientHydrationWait:     getEnvDuration("CLIENT_HYDRATION_WAIT", 2*time.Second),
 		ProbeFailureCooldown:    getEnvDuration("PROBE_FAILURE_COOLDOWN", 10*time.Minute),

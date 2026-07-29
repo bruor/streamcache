@@ -1086,7 +1086,29 @@ func runDownloadWorker(
 				limit = blockLength - blockBytesWritten
 			}
 
-			n, err := activeRespBody.Read(buffer[:limit])
+			readDone := make(chan struct{})
+			var n int
+			var err error
+
+			go func() {
+				n, err = activeRespBody.Read(buffer[:limit])
+				close(readDone)
+			}()
+
+			select {
+			case <-readDone:
+			case <-time.After(10 * time.Second):
+				log.Printf("[Worker-%d] Upstream TCP read stalled (0 B/s for >10s), breaking connection to reconnect...", w.id)
+				closeConnection()
+				blockFailed = true
+				break
+			case <-ctx.Done():
+				closeConnection()
+				return
+			}
+			if blockFailed {
+				break
+			}
 			if n > 0 {
 				writeOffset := blockStartOffset + blockBytesWritten
 				_, werr := file.WriteAt(buffer[:n], writeOffset)
@@ -1217,9 +1239,19 @@ func runInlineTailPrefetch(
 	file *os.File,
 	tailStartBlock int,
 ) {
+	maxTailBlocks := 4
+	tailEndBlock := tailStartBlock + maxTailBlocks
+	if tailEndBlock > state.TotalBlocks {
+		tailEndBlock = state.TotalBlocks
+	}
+
 	blockSize := GlobalConfig.BlockSize
 	prefetchStart := int64(tailStartBlock) * blockSize
-	prefetchLength := state.TotalSize - prefetchStart
+	prefetchEnd := int64(tailEndBlock) * blockSize
+	if prefetchEnd > state.TotalSize {
+		prefetchEnd = state.TotalSize
+	}
+	prefetchLength := prefetchEnd - prefetchStart
 	if prefetchLength <= 0 {
 		return
 	}
@@ -1228,7 +1260,8 @@ func runInlineTailPrefetch(
 	w.currentBlock = tailStartBlock
 	defer atomic.StoreInt32(&w.isPrefetching, 0)
 
-	log.Printf("[Worker-%d] MaxUpstreamWorkers=1: Executing inline tail pre-fetch (%d bytes) starting at block %d", w.id, prefetchLength, tailStartBlock)
+	log.Printf("[Worker-%d] MaxUpstreamWorkers=1: Executing inline tail pre-fetch (%d bytes, blocks %d..%d) starting at block %d",
+		w.id, prefetchLength, tailStartBlock, tailEndBlock-1, tailStartBlock)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", state.URL, nil)
 	if err != nil {
@@ -1236,7 +1269,7 @@ func runInlineTailPrefetch(
 		return
 	}
 
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, prefetchEnd-1)
 	req.Header.Set("Range", rangeHeader)
 	if initialHeader != nil && len(initialHeader) > 0 {
 		for k, vv := range initialHeader {
@@ -1266,7 +1299,7 @@ func runInlineTailPrefetch(
 	state.SetUpstreamStatus("Downloading")
 	state.Lock.Lock()
 	var downloadingBlocks []int
-	for b := tailStartBlock; b < state.TotalBlocks; b++ {
+	for b := tailStartBlock; b < tailEndBlock; b++ {
 		if state.BlockStates[b] != BlockCompleted {
 			state.BlockStates[b] = BlockDownloading
 			downloadingBlocks = append(downloadingBlocks, b)
@@ -1318,7 +1351,7 @@ func runInlineTailPrefetch(
 			GlobalRegistry.UpdateSize(int64(n))
 
 			state.Lock.Lock()
-			for b := tailStartBlock; b < state.TotalBlocks; b++ {
+			for b := tailStartBlock; b < tailEndBlock; b++ {
 				bStart := int64(b) * blockSize
 				bEnd := bStart + blockSize
 				if bEnd > state.TotalSize {
