@@ -183,9 +183,6 @@
         }
 
         .download-badge {
-            background: rgba(57, 255, 20, 0.12);
-            color: var(--accent-green);
-            border: 1px solid rgba(57, 255, 20, 0.3);
             font-family: var(--font-mono);
             font-size: 0.82rem;
             font-weight: 700;
@@ -194,6 +191,38 @@
             white-space: nowrap;
             text-align: center;
             box-sizing: border-box;
+            background: rgba(57, 255, 20, 0.12);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 255, 20, 0.35);
+            transition: all 0.2s ease;
+        }
+
+        .download-badge.downloading {
+            background: rgba(57, 255, 20, 0.12);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 255, 20, 0.35);
+        }
+
+        .download-badge.committing {
+            background: rgba(189, 94, 255, 0.18);
+            color: #bd5eff;
+            border: 1px solid rgba(189, 94, 255, 0.4);
+            animation: pulse-glow-purple 1.5s infinite;
+        }
+
+        .download-badge.throttled,
+        .download-badge.retrying,
+        .download-badge.connecting {
+            background: rgba(255, 159, 28, 0.15);
+            color: var(--accent-orange);
+            border: 1px solid rgba(255, 159, 28, 0.35);
+            animation: pulse-glow-orange 1.5s infinite;
+        }
+
+        .download-badge.idle {
+            background: rgba(0, 240, 255, 0.12);
+            color: var(--accent-secondary);
+            border: 1px solid rgba(0, 240, 255, 0.3);
         }
 
         .download-speed-badge {
@@ -567,6 +596,12 @@
             0% { box-shadow: 0 0 0 0 rgba(255, 159, 28, 0.4); }
             70% { box-shadow: 0 0 0 8px rgba(255, 159, 28, 0); }
             100% { box-shadow: 0 0 0 0 rgba(255, 159, 28, 0); }
+        }
+
+        @keyframes pulse-glow-purple {
+            0% { box-shadow: 0 0 0 0 rgba(189, 94, 255, 0.4); }
+            70% { box-shadow: 0 0 0 8px rgba(189, 94, 255, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(189, 94, 255, 0); }
         }
 
         .upstream-status-badge {
@@ -1043,10 +1078,18 @@
             
             const completed = calculateCompletedBlocks(fileData);
             const percent = ((completed / fileData.total_blocks) * 100).toFixed(1);
+            const rawStatus = fileData.upstream_status || 'Downloading';
+            const statusLower = rawStatus.toLowerCase();
             
+            let statusText = `${percent}%`;
+            if (rawStatus === 'Committing' || rawStatus === 'Throttled' || rawStatus === 'Retrying' || rawStatus === 'Connecting') {
+                statusText = `${percent}% ${rawStatus}`;
+            }
+
             const badgeEl = document.getElementById(`badge-${key}`);
             if (badgeEl) {
-                badgeEl.innerText = `${percent}%`;
+                badgeEl.innerText = statusText;
+                badgeEl.className = `download-badge ${statusLower}`;
             }
 
             const speedEl = document.getElementById(`speed-badge-${key}`);
@@ -1082,10 +1125,6 @@
                         <div class="download-meta-card">
                             <span class="download-meta-label">Active Clients</span>
                             <span class="download-meta-value" ${fileData.starving_queue && fileData.starving_queue.length > 0 ? 'style="color: var(--accent-orange); font-weight: 600;"' : ''}>${fileData.active_clients}</span>
-                        </div>
-                        <div class="download-meta-card">
-                            <span class="download-meta-label">Upstream</span>
-                            <span class="download-meta-value">${fileData.upstream_status ? `<span class="upstream-status-badge ${fileData.upstream_status.toLowerCase()}">${fileData.upstream_status}</span>` : 'Idle'}</span>
                         </div>
                         <div class="download-meta-card">
                             <span class="download-meta-label">Connections (30s)</span>
