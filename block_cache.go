@@ -330,6 +330,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 	r.Connections[connID] = conn
 
 	// Find a matching session
+	now := time.Now()
 	var matchedSession *ClientSession
 	if r.Sessions != nil {
 		var bestSession *ClientSession
