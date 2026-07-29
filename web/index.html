@@ -1104,10 +1104,7 @@
             const rawStatus = fileData.upstream_status || 'Downloading';
             const statusLower = rawStatus.toLowerCase();
             
-            let statusText = `${percent}%`;
-            if (rawStatus === 'Committing' || rawStatus === 'Throttled' || rawStatus === 'Retrying' || rawStatus === 'Connecting') {
-                statusText = `${percent}% ${rawStatus}`;
-            }
+            let statusText = `${rawStatus} ${percent}%`;
 
             const badgeEl = document.getElementById(`badge-${key}`);
             if (badgeEl) {
@@ -1323,10 +1320,7 @@
                         const percent = ((completed / fileData.total_blocks) * 100).toFixed(1);
                         const rawStatus = fileData.upstream_status || 'Downloading';
                         const statusLower = rawStatus.toLowerCase();
-                        let statusText = `${percent}%`;
-                        if (rawStatus === 'Committing' || rawStatus === 'Throttled' || rawStatus === 'Retrying' || rawStatus === 'Connecting') {
-                            statusText = `${percent}% ${rawStatus}`;
-                        }
+                        let statusText = `${rawStatus} ${percent}%`;
                         hydrationBadge = `<span class="download-badge ${statusLower}" style="font-size: 0.72rem; padding: 2px 7px; margin-left: 4px;">${statusText}</span>`;
                     }
                     originBadge = `<span class="session-origin-badge cdn">CDN</span>${hydrationBadge}`;
@@ -1389,6 +1383,15 @@
 
         let currentServerInstanceId = null;
 
+        function triggerAutoReload(newVersion) {
+            appendLog("\n[System] New proxy build detected. Auto-reloading dashboard UI...");
+            setTimeout(() => {
+                const url = new URL(window.location.href);
+                url.searchParams.set('v', newVersion);
+                window.location.href = url.toString();
+            }, 200);
+        }
+
         async function checkServerVersion() {
             try {
                 const res = await fetch(`/api/version?t=${Date.now()}`, { cache: 'no-store' });
@@ -1398,10 +1401,7 @@
                         if (currentServerInstanceId === null) {
                             currentServerInstanceId = data.version;
                         } else if (currentServerInstanceId !== data.version) {
-                            appendLog("\n[System] New proxy build detected. Reloading dashboard UI...");
-                            setTimeout(() => {
-                                window.location.reload(true);
-                            }, 200);
+                            triggerAutoReload(data.version);
                         }
                     }
                 }
@@ -1470,10 +1470,7 @@
                     if (currentServerInstanceId === null) {
                         currentServerInstanceId = data.server_instance_id;
                     } else if (currentServerInstanceId !== data.server_instance_id) {
-                        appendLog("\n[System] New proxy build detected. Reloading dashboard UI...");
-                        setTimeout(() => {
-                            window.location.reload(true);
-                        }, 200);
+                        triggerAutoReload(data.server_instance_id);
                         return;
                     }
                 }

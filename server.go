@@ -407,9 +407,10 @@ func handleDashboardUI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, private")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, private, s-maxage=0")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
+		w.Header().Set("Clear-Site-Data", "\"cache\"")
 		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", ServerInstanceID))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(content)
