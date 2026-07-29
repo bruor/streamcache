@@ -1340,9 +1340,24 @@
                 }
             });
 
+            let currentServerInstanceId = null;
+
             // 3. Periodic full state update & metrics sync
             es.addEventListener('state', function(event) {
                 const data = JSON.parse(event.data);
+
+                if (data.server_instance_id) {
+                    if (currentServerInstanceId === null) {
+                        currentServerInstanceId = data.server_instance_id;
+                    } else if (currentServerInstanceId !== data.server_instance_id) {
+                        appendLog("\n[System] New proxy version/build detected. Reloading dashboard UI...");
+                        setTimeout(() => {
+                            window.location.reload(true);
+                        }, 300);
+                        return;
+                    }
+                }
+
                 const maxCache = data.max_cache_size_bytes || 0;
                 const totalCache = data.total_cache_size_bytes || 0;
                 const diskFree = data.disk_free_bytes || 0;

@@ -390,6 +390,9 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 func handleDashboardUI(w http.ResponseWriter, r *http.Request) {
 	// Root endpoint serves index.html dashboard
 	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
 		http.ServeFile(w, r, "./web/index.html")
 		return
 	}

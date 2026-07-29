@@ -25,6 +25,7 @@ type LogBroker struct {
 }
 
 var GlobalLogBroker *LogBroker
+var ServerInstanceID = fmt.Sprintf("%d", time.Now().UnixNano())
 
 func InitLogBroker() {
 	GlobalLogBroker = &LogBroker{
@@ -291,6 +292,7 @@ func buildStatePayload() ([]byte, error) {
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
+		"server_instance_id":      ServerInstanceID,
 		"total_cache_size_bytes": GlobalRegistry.TotalCacheSize,
 		"max_cache_size_bytes":   GlobalConfig.CacheMaxBytes,
 		"disk_free_bytes":        freeSpace,
