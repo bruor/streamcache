@@ -627,11 +627,18 @@
 
         .connection-detail-row {
             display: flex;
-            justify-content: space-between;
             align-items: center;
             gap: 0.5rem;
             min-width: 0;
             overflow: hidden;
+        }
+
+        .connection-detail-label {
+            color: var(--text-sub);
+            font-size: 0.82rem;
+            white-space: nowrap;
+            flex-shrink: 0;
+            min-width: 105px;
         }
 
         .connection-detail-value {
@@ -1155,25 +1162,27 @@
                     </div>
                     <div class="connection-details">
                         <div class="connection-detail-row">
-                            <span>IP Address:</span>
+                            <span class="connection-detail-label">IP Address:</span>
                             <span class="connection-detail-value">${conn.remote_addr}</span>
                         </div>
                         <div class="connection-detail-row">
-                            <span>User Agent:</span>
+                            <span class="connection-detail-label">User Agent:</span>
                             <span class="connection-detail-value" title="${conn.user_agent}">${uaDisplay}</span>
                         </div>
+                    </div>
+                    <div class="connection-details">
                         <div class="connection-detail-row">
-                            <span>Elapsed Time:</span>
+                            <span class="connection-detail-label">Elapsed Time:</span>
                             <span class="connection-detail-value">${durationStr}</span>
                         </div>
                         <div class="connection-detail-row">
-                            <span>Current Offset:</span>
+                            <span class="connection-detail-label">Current Offset:</span>
                             <span class="connection-detail-value">${formatBytes(conn.offset)}${percentageStr}</span>
                         </div>
                     </div>
                     <div class="connection-details" style="grid-column: 1 / -1; border-top: 1px solid rgba(255, 255, 255, 0.05); padding-top: 0.4rem; margin-top: 0.2rem;">
                         <div class="connection-detail-row" style="flex-direction: column; align-items: flex-start; gap: 4px;">
-                            <span>Streaming File:</span>
+                            <span class="connection-detail-label">Streaming File:</span>
                             <span class="connection-detail-value" title="${conn.url}" style="color: var(--accent-secondary); font-family: var(--font-mono); font-size: 0.78rem; word-break: break-all; width: 100%; display: block;">${conn.url}</span>
                         </div>
                     </div>
