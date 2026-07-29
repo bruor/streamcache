@@ -189,6 +189,8 @@
             padding: 3px 10px;
             border-radius: 6px;
             white-space: nowrap;
+            text-align: center;
+            box-sizing: border-box;
         }
 
         .download-speed-badge {
@@ -201,6 +203,9 @@
             padding: 3px 10px;
             border-radius: 6px;
             white-space: nowrap;
+            text-align: center;
+            box-sizing: border-box;
+            transition: min-width 0.2s ease;
         }
 
         .cancel-hydration-btn {
@@ -1043,13 +1048,19 @@
 
             const speedEl = document.getElementById(`speed-badge-${key}`);
             if (speedEl) {
-                if (fileData.download_speed > 0) {
-                    speedEl.innerText = `${formatBytes(fileData.download_speed)}/s`;
-                } else if (fileData.upstream_status === 'Throttled') {
-                    speedEl.innerText = `0 B/s (Throttled)`;
-                } else {
-                    speedEl.innerText = `0 B/s`;
-                }
+                let currentStr = fileData.download_speed > 0 ? `${formatBytes(fileData.download_speed)}/s` : '0 B/s';
+                let avgStr = fileData.avg_download_speed > 0 ? ` (Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : '';
+                let statusStr = fileData.upstream_status === 'Throttled' ? ' [Throttled]' : '';
+                speedEl.innerText = `${currentStr}${avgStr}${statusStr}`;
+
+                requestAnimationFrame(() => {
+                    const currentWidth = speedEl.getBoundingClientRect().width;
+                    const storedMaxWidth = speedEl.dataset.maxWidth ? parseFloat(speedEl.dataset.maxWidth) : 0;
+                    if (currentWidth > storedMaxWidth) {
+                        speedEl.dataset.maxWidth = currentWidth;
+                        speedEl.style.minWidth = `${Math.ceil(currentWidth)}px`;
+                    }
+                });
             }
             
             const metaEl = document.getElementById(`meta-${key}`);
