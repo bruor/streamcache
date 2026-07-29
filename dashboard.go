@@ -58,19 +58,27 @@ func (lb *LogBroker) Write(p []byte) (n int, err error) {
 }
 
 type BlockUpdateEvent struct {
-	Key    string `json:"key"`
-	Blocks []int  `json:"blocks"`
-	State  int    `json:"state"`
+	Key            string `json:"key"`
+	Blocks         []int  `json:"blocks"`
+	State          int    `json:"state"`
+	UpstreamStatus string `json:"upstream_status,omitempty"`
 }
 
 func (lb *LogBroker) BroadcastBlockUpdate(key string, blocks []int, state int) {
 	if len(blocks) == 0 {
 		return
 	}
+	var upstreamStatus string
+	if fileState, exists := GlobalRegistry.Files[key]; exists {
+		fileState.Lock.Lock()
+		upstreamStatus = fileState.UpstreamStatus
+		fileState.Lock.Unlock()
+	}
 	evtData, err := json.Marshal(BlockUpdateEvent{
-		Key:    key,
-		Blocks: blocks,
-		State:  state,
+		Key:            key,
+		Blocks:         blocks,
+		State:          state,
+		UpstreamStatus: upstreamStatus,
 	})
 	if err != nil {
 		return

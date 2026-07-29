@@ -1445,6 +1445,9 @@
                     
                     const fileData = fileStore[key];
                     if (fileData) {
+                        if (evtData.upstream_status) {
+                            fileData.upstream_status = evtData.upstream_status;
+                        }
                         blocks.forEach(b => {
                             if (b >= 0 && b < fileData.total_blocks) {
                                 fileData.block_states[b] = state;

@@ -41,7 +41,7 @@ func CancelCoordinator(state *FileCacheState) {
 	state.Lock.Lock()
 	cancel := state.Cancel
 	state.Cancel = nil
-	state.UpstreamStatus = "Cancelled"
+	state.SetUpstreamStatus("Cancelled")
 	for i, st := range state.BlockStates {
 		if st == BlockDownloading {
 			state.BlockStates[i] = BlockNotStarted
@@ -148,17 +148,17 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		}
 
 		if isCompleted {
-			state.UpstreamStatus = "Committing"
+			state.SetUpstreamStatus("Committing")
 			state.Lock.Unlock()
 			if file != nil {
 				log.Printf("[Coord] Committing and flushing cache file to disk: %s", state.Key)
 				_ = file.Sync()
 			}
-			state.Lock.Lock()
-			state.UpstreamStatus = "Completed"
+			state.SetUpstreamStatus("Completed")
 			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+			state.Lock.Lock()
 		} else {
-			state.UpstreamStatus = "Idle"
+			state.SetUpstreamStatus("Idle")
 		}
 
 		if isCompleted {
@@ -745,9 +745,7 @@ func runDownloadWorker(
 		
 		log.Printf("[Worker-%d] Retry %d/8. Sleeping %s before retrying...", w.id, consecutiveFailures, backoff)
 		
-		state.Lock.Lock()
-		state.UpstreamStatus = "Retrying"
-		state.Lock.Unlock()
+		state.SetUpstreamStatus("Retrying")
 
 		coordinatorSleepMu.RLock()
 		sleepFn := coordinatorSleepFn
@@ -802,14 +800,12 @@ func runDownloadWorker(
 				req.Header.Set("Accept", "*/*")
 			}
 
-			state.Lock.Lock()
-			state.UpstreamStatus = "Connecting"
-			state.Lock.Unlock()
+			state.SetUpstreamStatus("Connecting")
 
 			resp, rerr := UpstreamHTTPClient.Do(req)
 			if rerr == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+				state.SetUpstreamStatus("Downloading")
 				state.Lock.Lock()
-				state.UpstreamStatus = "Downloading"
 				var downloadingBlocks []int
 				for b := w.startBlock; b < state.TotalBlocks; b++ {
 					if state.BlockStates[b] != BlockCompleted {
@@ -1004,9 +1000,7 @@ func runDownloadWorker(
 				req.Header.Set("Accept", "*/*")
 			}
 
-			state.Lock.Lock()
-			state.UpstreamStatus = "Connecting"
-			state.Lock.Unlock()
+			state.SetUpstreamStatus("Connecting")
 
 			log.Printf("[Worker-%d] Connecting upstream for block %d (Range: %s)", w.id, currentBlock, rangeHeader)
 			resp, err := UpstreamHTTPClient.Do(req)
@@ -1030,9 +1024,7 @@ func runDownloadWorker(
 
 			activeRespBody = resp.Body
 			
-			state.Lock.Lock()
-			state.UpstreamStatus = "Downloading"
-			state.Lock.Unlock()
+			state.SetUpstreamStatus("Downloading")
 			
 			consecutiveFailures = 0
 			backoff = 2 * time.Second
@@ -1259,9 +1251,7 @@ func runInlineTailPrefetch(
 		req.Header.Set("Accept", "*/*")
 	}
 
-	state.Lock.Lock()
-	state.UpstreamStatus = "Connecting"
-	state.Lock.Unlock()
+	state.SetUpstreamStatus("Connecting")
 
 	resp, rerr := UpstreamHTTPClient.Do(req)
 	if rerr != nil || (resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent) {
@@ -1273,8 +1263,8 @@ func runInlineTailPrefetch(
 	}
 	defer resp.Body.Close()
 
+	state.SetUpstreamStatus("Downloading")
 	state.Lock.Lock()
-	state.UpstreamStatus = "Downloading"
 	var downloadingBlocks []int
 	for b := tailStartBlock; b < state.TotalBlocks; b++ {
 		if state.BlockStates[b] != BlockCompleted {

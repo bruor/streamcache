@@ -110,6 +110,19 @@ type ConnectionInfo struct {
 	Closed time.Time // IsZero if still active
 }
 
+func (s *FileCacheState) SetUpstreamStatus(status string) {
+	s.Lock.Lock()
+	if s.UpstreamStatus != status {
+		s.UpstreamStatus = status
+		s.Lock.Unlock()
+		if GlobalLogBroker != nil {
+			GlobalLogBroker.BroadcastStateUpdate()
+		}
+		return
+	}
+	s.Lock.Unlock()
+}
+
 func (s *FileCacheState) RecordConnStart(connID string) {
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
