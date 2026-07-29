@@ -219,51 +219,57 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		// Pre-evict cache space to ensure sufficient disk space and cache quota before starting hydration
 		GlobalRegistry.PreEvict(totalSize)
 
-		// Create metadata companion file
 		metaPath := cacheFilePath + ".json"
 		partPath := filepath.Join(GlobalConfig.TmpDir, cacheFileName+".part")
-
 		totalBlocks := int(math.Ceil(float64(totalSize) / float64(GlobalConfig.BlockSize)))
-		blockStates := make([]int, totalBlocks)
 
-		// Create FileCacheState
-		state = &FileCacheState{
-			Key:                      cacheFileName,
-			URL:                      targetURL,
-			Path:                     cacheFilePath,
-			PartPath:                 partPath,
-			MetaPath:                 metaPath,
-			TotalSize:                totalSize,
-			TotalBlocks:              totalBlocks,
-			BlockStates:              blockStates,
-			ContentType:              probeContentType,
-			ETag:                     etag,
-			LastModified:             lastMod,
-			LastValidated:            time.Now().Unix(),
-			Clients:                  make(map[string]chan struct{}),
-			Starving:                 make(map[string]int),
-			NotifyChan:               make(chan struct{}, 10),
-			UpstreamStatus:           "Idle",
-			PendingTailPrefetchBlock: -1,
-		}
-
-		// Save initial sparse metadata
-		meta := FileMeta{
-			URL:           targetURL,
-			TotalSize:     totalSize,
-			ContentType:   probeContentType,
-			ETag:          etag,
-			LastModified:  lastMod,
-			LastValidated: time.Now().Unix(),
-			Completed:     false,
-			BlockStates:   blockStates,
-		}
-		metaBytes, _ := json.Marshal(meta)
-		_ = os.WriteFile(metaPath, metaBytes, 0644)
-
+		// Double-check if another concurrent request created FileCacheState during probe/pre-evict
 		GlobalRegistry.Lock.Lock()
-		GlobalRegistry.Files[cacheFileName] = state
-		GlobalRegistry.Lock.Unlock()
+		existingState, exists := GlobalRegistry.Files[cacheFileName]
+		if exists {
+			state = existingState
+			GlobalRegistry.Lock.Unlock()
+		} else {
+			blockStates := make([]int, totalBlocks)
+
+			// Create FileCacheState
+			state = &FileCacheState{
+				Key:                      cacheFileName,
+				URL:                      targetURL,
+				Path:                     cacheFilePath,
+				PartPath:                 partPath,
+				MetaPath:                 metaPath,
+				TotalSize:                totalSize,
+				TotalBlocks:              totalBlocks,
+				BlockStates:              blockStates,
+				ContentType:              probeContentType,
+				ETag:                     etag,
+				LastModified:             lastMod,
+				LastValidated:            time.Now().Unix(),
+				Clients:                  make(map[string]chan struct{}),
+				Starving:                 make(map[string]int),
+				NotifyChan:               make(chan struct{}, 10),
+				UpstreamStatus:           "Idle",
+				PendingTailPrefetchBlock: -1,
+			}
+
+			// Save initial sparse metadata
+			meta := FileMeta{
+				URL:           targetURL,
+				TotalSize:     totalSize,
+				ContentType:   probeContentType,
+				ETag:          etag,
+				LastModified:  lastMod,
+				LastValidated: time.Now().Unix(),
+				Completed:     false,
+				BlockStates:   blockStates,
+			}
+			metaBytes, _ := json.Marshal(meta)
+			_ = os.WriteFile(metaPath, metaBytes, 0644)
+
+			GlobalRegistry.Files[cacheFileName] = state
+			GlobalRegistry.Lock.Unlock()
+		}
 	} else {
 		GlobalRegistry.Lock.Unlock()
 	}

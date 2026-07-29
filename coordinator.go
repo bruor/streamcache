@@ -956,6 +956,12 @@ func runDownloadWorker(
 		pendingTail := state.PendingTailPrefetchBlock
 		if pendingTail > 0 {
 			state.PendingTailPrefetchBlock = -1
+			if state.BlockStates[currentBlock] != BlockCompleted {
+				state.BlockStates[currentBlock] = BlockNotStarted
+				if GlobalLogBroker != nil {
+					GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{currentBlock}, BlockNotStarted)
+				}
+			}
 		}
 		state.Lock.Unlock()
 
@@ -1350,6 +1356,7 @@ func runInlineTailPrefetch(
 	}
 
 	state.Lock.Lock()
+	var resetBlocks []int
 	for b := tailStartBlock; b < state.TotalBlocks; b++ {
 		bStart := int64(b) * blockSize
 		bEnd := bStart + blockSize
@@ -1361,8 +1368,12 @@ func runInlineTailPrefetch(
 		} else {
 			if state.BlockStates[b] != BlockCompleted {
 				state.BlockStates[b] = BlockNotStarted
+				resetBlocks = append(resetBlocks, b)
 			}
 		}
+	}
+	if len(resetBlocks) > 0 && GlobalLogBroker != nil {
+		GlobalLogBroker.BroadcastBlockUpdate(state.Key, resetBlocks, BlockNotStarted)
 	}
 	for _, ch := range state.Clients {
 		safeSignal(ch)
