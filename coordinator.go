@@ -1086,29 +1086,7 @@ func runDownloadWorker(
 				limit = blockLength - blockBytesWritten
 			}
 
-			readDone := make(chan struct{})
-			var n int
-			var err error
-
-			go func() {
-				n, err = activeRespBody.Read(buffer[:limit])
-				close(readDone)
-			}()
-
-			select {
-			case <-readDone:
-			case <-time.After(10 * time.Second):
-				log.Printf("[Worker-%d] Upstream TCP read stalled (0 B/s for >10s), breaking connection to reconnect...", w.id)
-				closeConnection()
-				blockFailed = true
-				break
-			case <-ctx.Done():
-				closeConnection()
-				return
-			}
-			if blockFailed {
-				break
-			}
+			n, err := activeRespBody.Read(buffer[:limit])
 			if n > 0 {
 				writeOffset := blockStartOffset + blockBytesWritten
 				_, werr := file.WriteAt(buffer[:n], writeOffset)
