@@ -275,6 +275,14 @@ func TestRevalidationChangeDetection(t *testing.T) {
 	if err != nil || valid {
 		t.Errorf("Expected revalidation to detect modification and return valid=false, got valid=%t, err=%v", valid, err)
 	}
+	// Wait for async background deletion of old media (up to 1s)
+	for i := 0; i < 100; i++ {
+		if !FileExists(filePath) && !FileExists(metaPath) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	if FileExists(filePath) || FileExists(metaPath) {
 		t.Errorf("Expected cached file and companion JSON to be evicted (deleted)")
 	}
@@ -2361,6 +2369,8 @@ func TestCoordinatorResuscitationOnClientStarvation(t *testing.T) {
 	if !active {
 		t.Errorf("Expected coordinator WriterActive to be true after resuscitation")
 	}
+
+	CancelCoordinator(state)
 }
 
 func TestCancelHydrationAPI(t *testing.T) {
@@ -2568,7 +2578,6 @@ func TestCancellationAndResuscitation(t *testing.T) {
 	// New client reader2 starts playback again
 	req2 := httptest.NewRequest("GET", "/stream", nil)
 	reader2 := NewCacheReader(context.Background(), state, req2)
-	defer reader2.Close()
 
 	buf := make([]byte, 100)
 	n, err := reader2.Read(buf)
@@ -2578,6 +2587,9 @@ func TestCancellationAndResuscitation(t *testing.T) {
 	if n != 100 {
 		t.Fatalf("Expected 100 bytes read, got %d", n)
 	}
+
+	_ = reader2.Close()
+	CancelCoordinator(state)
 }
 
 func TestSingleWorkerTailPrefetch(t *testing.T) {
