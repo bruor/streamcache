@@ -675,35 +675,18 @@ func (r *CacheRegistry) LoadExistingCache() {
 func (r *CacheRegistry) UpdateSize(delta int64) {
 	r.Lock.Lock()
 	r.TotalCacheSize += delta
-	currentSize := r.TotalCacheSize
+	r.Lock.Unlock()
+}
 
-	// Check if eviction is already running
+func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
+	r.Lock.Lock()
 	if r.Evicting {
 		r.Lock.Unlock()
 		return
 	}
-
-	// Quick check if eviction is potentially needed
-	var cacheBytesToFree int64
-	if GlobalConfig.CacheMaxBytes > 0 && currentSize > GlobalConfig.CacheMaxBytes {
-		cacheBytesToFree = currentSize - GlobalConfig.CacheMaxBytes
-	}
-
-	// We also check if disk free space limit is enabled
-	needEvictCheck := cacheBytesToFree > 0 || GlobalConfig.MinDiskFreeBytes > 0
-
-	if !needEvictCheck {
-		r.Lock.Unlock()
-		return
-	}
-
 	r.Evicting = true
 	r.Lock.Unlock()
 
-	go r.runEviction()
-}
-
-func (r *CacheRegistry) runEviction() {
 	defer func() {
 		r.Lock.Lock()
 		r.Evicting = false
@@ -716,18 +699,19 @@ func (r *CacheRegistry) runEviction() {
 
 	cacheDir := GlobalConfig.CacheDir
 
-	// Calculate how much we need to free based on cache limit
+	// Calculate how much space we need to free based on cache limit if incoming file is added
 	var cacheBytesToFree int64
-	if GlobalConfig.CacheMaxBytes > 0 && currentSize > GlobalConfig.CacheMaxBytes {
-		cacheBytesToFree = currentSize - GlobalConfig.CacheMaxBytes
+	if GlobalConfig.CacheMaxBytes > 0 && (currentSize+incomingSizeBytes) > GlobalConfig.CacheMaxBytes {
+		cacheBytesToFree = (currentSize + incomingSizeBytes) - GlobalConfig.CacheMaxBytes
 	}
 
-	// Calculate how much we need to free based on disk space limit
+	// Calculate how much space we need to free based on disk space limit
 	var diskBytesToFree int64
 	freeSpace, spaceErr := GetDiskFreeSpace(cacheDir)
 	if spaceErr == nil && GlobalConfig.MinDiskFreeBytes > 0 {
-		if freeSpace < uint64(GlobalConfig.MinDiskFreeBytes) {
-			diskBytesToFree = int64(uint64(GlobalConfig.MinDiskFreeBytes) - freeSpace)
+		requiredFree := uint64(incomingSizeBytes) + uint64(GlobalConfig.MinDiskFreeBytes)
+		if freeSpace < requiredFree {
+			diskBytesToFree = int64(requiredFree - freeSpace)
 		}
 	}
 
@@ -740,10 +724,17 @@ func (r *CacheRegistry) runEviction() {
 		return
 	}
 
-	log.Printf("[Evictor] Real-time eviction triggered. Cache size: %.2f GB (limit: %.2f GB), Free Disk Space: %.2f GB (min: %.2f GB). Need to free %.2f MB.",
+	log.Printf("[Evictor] Pre-eviction triggered for incoming file (%.2f MB). Cache size: %.2f GB (limit: %.2f GB), Free Disk Space: %.2f GB (min: %.2f GB). Need to free %.2f MB.",
+		float64(incomingSizeBytes)/(1024*1024),
 		float64(currentSize)/(1024*1024*1024), float64(GlobalConfig.CacheMaxBytes)/(1024*1024*1024),
 		float64(freeSpace)/(1024*1024*1024), float64(GlobalConfig.MinDiskFreeBytes)/(1024*1024*1024),
 		float64(bytesToFree)/(1024*1024))
+
+	r.evictInactiveFiles(bytesToFree)
+}
+
+func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
+	cacheDir := GlobalConfig.CacheDir
 
 	// Collect completed files in cache directory
 	entries, err := os.ReadDir(cacheDir)

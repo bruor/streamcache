@@ -122,16 +122,8 @@ func TestOnDemandEviction(t *testing.T) {
 		GlobalConfig.CacheMaxBytes = oldMax
 	}()
 
-	// Trigger eviction via size update (asynchronous)
-	GlobalRegistry.UpdateSize(5)
-
-	// Wait for async eviction to complete (up to 1s)
-	for i := 0; i < 100; i++ {
-		if !FileExists(filepath.Join(GlobalConfig.CacheDir, "a")) && !FileExists(filepath.Join(GlobalConfig.CacheDir, "b")) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Trigger pre-eviction for an incoming 5-byte file
+	GlobalRegistry.PreEvict(5)
 
 	// Check which files exist. We expect 'a' and 'b' (oldest) to be evicted.
 	// Only 'c' and 'd' should remain.
@@ -146,6 +138,69 @@ func TestOnDemandEviction(t *testing.T) {
 	}
 	if !FileExists(filepath.Join(GlobalConfig.CacheDir, "d")) {
 		t.Errorf("Expected file 'd' to remain (newest)")
+	}
+}
+
+func TestRevalidateEvictsOldMediaFirst(t *testing.T) {
+	defer cleanupAfterTest(t, nil)
+
+	// Setup mock upstream server that changes ETag on second call
+	etag := "etag-v1"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Range", "bytes 0-99/100")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("12345"))
+	}))
+	defer server.Close()
+
+	key := "test_reprobe.mp4"
+	filePath := filepath.Join(GlobalConfig.CacheDir, key)
+	metaPath := filePath + ".json"
+
+	_ = os.WriteFile(filePath, make([]byte, 100), 0644)
+	meta := FileMeta{
+		URL:           server.URL,
+		TotalSize:     100,
+		ETag:          "etag-v1",
+		LastValidated: time.Now().Add(-2 * time.Hour).Unix(),
+		Completed:     true,
+	}
+	metaBytes, _ := json.Marshal(meta)
+	_ = os.WriteFile(metaPath, metaBytes, 0644)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.TotalCacheSize = 100
+	GlobalRegistry.Lock.Unlock()
+
+	// Change etag on server to simulate media content modification
+	etag = "etag-v2"
+
+	oldInterval := GlobalConfig.CacheRevalidateInterval
+	GlobalConfig.CacheRevalidateInterval = 1 * time.Second
+	defer func() {
+		GlobalConfig.CacheRevalidateInterval = oldInterval
+	}()
+
+	valid, err := Revalidate(key, server.URL, nil)
+	if err != nil {
+		t.Fatalf("Revalidate error: %v", err)
+	}
+	if valid {
+		t.Errorf("Expected Revalidate to return false for modified media")
+	}
+
+	// Verify old media was evicted immediately by Revalidate
+	if FileExists(filePath) || FileExists(metaPath) {
+		t.Errorf("Expected old media and metadata to be evicted immediately upon change detection")
+	}
+
+	// TotalCacheSize should be reduced by 100
+	GlobalRegistry.Lock.RLock()
+	size := GlobalRegistry.TotalCacheSize
+	GlobalRegistry.Lock.RUnlock()
+	if size != 0 {
+		t.Errorf("Expected TotalCacheSize to be 0 after old media eviction, got %d", size)
 	}
 }
 

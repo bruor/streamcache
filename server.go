@@ -216,6 +216,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			probeContentType = getMimeTypeByExt(ext)
 		}
 
+		// Pre-evict cache space to ensure sufficient disk space and cache quota before starting hydration
+		GlobalRegistry.PreEvict(totalSize)
+
 		// Create metadata companion file
 		metaPath := cacheFilePath + ".json"
 		partPath := filepath.Join(GlobalConfig.TmpDir, cacheFileName+".part")
