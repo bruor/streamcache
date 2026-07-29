@@ -172,15 +172,35 @@
             text-overflow: ellipsis;
         }
 
+        .download-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: nowrap;
+        }
+
         .download-badge {
-            background-color: var(--accent-primary);
-            color: var(--text-main);
-            font-size: 0.75rem;
-            font-weight: 600;
-            padding: 2px 8px;
-            border-radius: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            animation: pulse-glow 1.5s infinite;
+            background: rgba(57, 255, 20, 0.12);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 255, 20, 0.3);
+            font-family: var(--font-mono);
+            font-size: 0.82rem;
+            font-weight: 700;
+            padding: 3px 10px;
+            border-radius: 6px;
+            white-space: nowrap;
+        }
+
+        .download-speed-badge {
+            background: rgba(0, 240, 255, 0.12);
+            color: var(--accent-secondary);
+            border: 1px solid rgba(0, 240, 255, 0.3);
+            font-family: var(--font-mono);
+            font-size: 0.82rem;
+            font-weight: 700;
+            padding: 3px 10px;
+            border-radius: 6px;
+            white-space: nowrap;
         }
 
         .cancel-hydration-btn {
@@ -1018,20 +1038,22 @@
             
             const badgeEl = document.getElementById(`badge-${key}`);
             if (badgeEl) {
-                badgeEl.innerText = `${percent}% Complete`;
+                badgeEl.innerText = `${percent}%`;
+            }
+
+            const speedEl = document.getElementById(`speed-badge-${key}`);
+            if (speedEl) {
+                if (fileData.download_speed > 0) {
+                    speedEl.innerText = `${formatBytes(fileData.download_speed)}/s`;
+                } else if (fileData.upstream_status === 'Throttled') {
+                    speedEl.innerText = `0 B/s (Throttled)`;
+                } else {
+                    speedEl.innerText = `0 B/s`;
+                }
             }
             
             const metaEl = document.getElementById(`meta-${key}`);
             if (metaEl) {
-                let speedHtml = '';
-                if (fileData.download_speed > 0) {
-                    speedHtml = `Speed: ${formatBytes(fileData.download_speed)}/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}`;
-                } else if (fileData.upstream_status === 'Throttled') {
-                    speedHtml = `<span style="color: var(--accent-orange);">Speed: 0 B/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}</span>`;
-                } else {
-                    speedHtml = `Speed: 0 B/s`;
-                }
-
                 metaEl.innerHTML = `
                     <div class="download-meta-grid">
                         <div class="download-meta-card">
@@ -1059,10 +1081,6 @@
                             <span class="download-meta-label">Cooldown</span>
                             <span class="download-meta-value" style="color: var(--accent-orange);">${fileData.observed_cooldown.toFixed(1)}s</span>
                         </div>` : ''}
-                    </div>
-                    <div class="download-speed-banner">
-                        <span class="download-meta-label">CDN Download Speed</span>
-                        <span class="download-speed-value">${speedHtml}</span>
                     </div>
                 `;
             }
@@ -1136,13 +1154,14 @@
                     card.innerHTML = `
                         <div class="download-header">
                             <div class="download-url" title="${file.url}">${file.url}</div>
-                            <div class="download-badge-container" style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
-                                <div class="download-badge" id="badge-${file.key}">0% Complete</div>
+                            <div class="download-controls">
                                 <button class="cancel-hydration-btn" onclick="cancelHydration('${file.key}')" title="Cancel this in-progress hydration">Cancel Hydration</button>
+                                <div class="download-badge" id="badge-${file.key}">0.0%</div>
+                                <div class="download-speed-badge" id="speed-badge-${file.key}">0 B/s</div>
                             </div>
                         </div>
-                        <div class="download-meta" id="meta-${file.key}"></div>
                         <canvas class="block-canvas" id="canvas-${file.key}"></canvas>
+                        <div class="download-meta" id="meta-${file.key}"></div>
                     `;
                     downloadsContainer.appendChild(card);
                 }
