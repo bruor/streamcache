@@ -346,21 +346,27 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 				continue
 			}
 
-			// If the session is idle, it is a very strong match candidate (e.g. player seeks or resumes)
+			// If the session is idle (0 active conns), it is a match candidate for player resume/seek
 			if session.ActiveConns == 0 {
 				bestSession = session
 				break
 			}
+
+			// Check if connection is an initial startup probe (within 5s of session start, or tail probe before main stream)
+			isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-15*1024*1024
+			isStartupProbe := (now.Unix()-session.StartTime <= 5) || (isNearEOF && session.MaxOffset < conn.TotalSize-15*1024*1024)
 
 			diff := conn.Offset - session.Offset
 			if diff < 0 {
 				diff = -diff
 			}
 
-			// Track the session with the smallest offset difference
-			if bestDiff == -1 || diff < bestDiff {
-				bestDiff = diff
-				bestSession = session
+			// Match to this session if it is an initial startup probe OR playback offset is close (within 15MB)
+			if isStartupProbe || diff <= 15*1024*1024 {
+				if bestDiff == -1 || diff < bestDiff {
+					bestDiff = diff
+					bestSession = session
+				}
 			}
 		}
 		matchedSession = bestSession
@@ -387,7 +393,10 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 				matchedSession.MaxOffset = conn.Offset
 			}
 		}
-		matchedSession.InCache = conn.InCache
+		// Keep InCache = false if ANY connection in this session required CDN download
+		if !conn.InCache {
+			matchedSession.InCache = false
+		}
 		matchedSession.StarvingBlock = conn.StarvingBlock
 	} else {
 		if r.Sessions == nil {
@@ -474,7 +483,9 @@ func (r *CacheRegistry) SetConnectionInCache(connID string, inCache bool) {
 			if r.Sessions != nil {
 				for _, session := range r.Sessions {
 					if _, exists := session.Conns[connID]; exists {
-						session.InCache = inCache
+						if !inCache {
+							session.InCache = false
+						}
 						session.LastActive = time.Now()
 						break
 					}
@@ -506,21 +517,7 @@ func (r *CacheRegistry) UpdateConnectionStarvation(connID string, starvingBlock 
 func (r *CacheRegistry) MarkConnectionsAsInCache(key string) {
 	r.Lock.Lock()
 	defer r.Lock.Unlock()
-	if r.Connections != nil {
-		for _, conn := range r.Connections {
-			if conn.Key == key {
-				conn.InCache = true
-			}
-		}
-	}
-	if r.Sessions != nil {
-		for _, session := range r.Sessions {
-			if session.Key == key {
-				session.InCache = true
-				session.LastActive = time.Now()
-			}
-		}
-	}
+	// Do not mutate InCache for active connections/sessions so ongoing CDN playback sessions retain their [ CDN ] origin badge!
 }
 
 func (r *CacheRegistry) GetActiveSessions() []ClientSession {
