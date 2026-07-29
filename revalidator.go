@@ -125,12 +125,14 @@ func evictCachedFile(path, metaPath string) {
 		size = info.Size()
 	}
 
-	_ = os.Remove(path)
-	_ = os.Remove(metaPath)
-
 	if size > 0 {
 		GlobalRegistry.UpdateSize(-size)
 	}
+
+	go func() {
+		_ = os.Remove(path)
+		_ = os.Remove(metaPath)
+	}()
 }
 
 func parseTotalSizeFromHeaders(header http.Header) (int64, error) {

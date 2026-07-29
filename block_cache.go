@@ -684,19 +684,8 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 		r.Lock.Unlock()
 		return
 	}
-	r.Evicting = true
-	r.Lock.Unlock()
 
-	defer func() {
-		r.Lock.Lock()
-		r.Evicting = false
-		r.Lock.Unlock()
-	}()
-
-	r.Lock.RLock()
 	currentSize := r.TotalCacheSize
-	r.Lock.RUnlock()
-
 	cacheDir := GlobalConfig.CacheDir
 
 	// Calculate how much space we need to free based on cache limit if incoming file is added
@@ -721,16 +710,53 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 	}
 
 	if bytesToFree <= 0 {
+		r.Lock.Unlock()
 		return
 	}
 
-	log.Printf("[Evictor] Pre-eviction triggered for incoming file (%.2f MB). Cache size: %.2f GB (limit: %.2f GB), Free Disk Space: %.2f GB (min: %.2f GB). Need to free %.2f MB.",
+	// Fast pre-flight check: count total size of available inactive files
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		r.Lock.Unlock()
+		return
+	}
+
+	var availableFreeable int64
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" {
+			continue
+		}
+		_, active := r.Files[entry.Name()]
+		if !active {
+			if info, err := entry.Info(); err == nil {
+				availableFreeable += info.Size()
+			}
+		}
+	}
+
+	if availableFreeable < bytesToFree {
+		log.Printf("[Evictor] WARNING: Cache pre-flight check required %.2f MB, but only %.2f MB of inactive files are available.",
+			float64(bytesToFree)/(1024*1024), float64(availableFreeable)/(1024*1024))
+	}
+
+	log.Printf("[Evictor] Fast pre-flight check passed. Spawning background evictor for incoming file (%.2f MB). Cache size: %.2f GB (limit: %.2f GB), Free Disk Space: %.2f GB (min: %.2f GB). Need to free %.2f MB.",
 		float64(incomingSizeBytes)/(1024*1024),
 		float64(currentSize)/(1024*1024*1024), float64(GlobalConfig.CacheMaxBytes)/(1024*1024*1024),
 		float64(freeSpace)/(1024*1024*1024), float64(GlobalConfig.MinDiskFreeBytes)/(1024*1024*1024),
 		float64(bytesToFree)/(1024*1024))
 
-	r.evictInactiveFiles(bytesToFree)
+	r.Evicting = true
+	r.Lock.Unlock()
+
+	// Launch file deletions asynchronously in a background thread to prevent blocking HTTP handler/stream start
+	go func() {
+		defer func() {
+			r.Lock.Lock()
+			r.Evicting = false
+			r.Lock.Unlock()
+		}()
+		r.evictInactiveFiles(bytesToFree)
+	}()
 }
 
 func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {

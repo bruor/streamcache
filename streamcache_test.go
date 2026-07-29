@@ -125,6 +125,14 @@ func TestOnDemandEviction(t *testing.T) {
 	// Trigger pre-eviction for an incoming 5-byte file
 	GlobalRegistry.PreEvict(5)
 
+	// Wait for async background eviction to complete (up to 1s)
+	for i := 0; i < 100; i++ {
+		if !FileExists(filepath.Join(GlobalConfig.CacheDir, "a")) && !FileExists(filepath.Join(GlobalConfig.CacheDir, "b")) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	// Check which files exist. We expect 'a' and 'b' (oldest) to be evicted.
 	// Only 'c' and 'd' should remain.
 	if FileExists(filepath.Join(GlobalConfig.CacheDir, "a")) {
@@ -190,9 +198,17 @@ func TestRevalidateEvictsOldMediaFirst(t *testing.T) {
 		t.Errorf("Expected Revalidate to return false for modified media")
 	}
 
-	// Verify old media was evicted immediately by Revalidate
+	// Wait for async background deletion of old media (up to 1s)
+	for i := 0; i < 100; i++ {
+		if !FileExists(filePath) && !FileExists(metaPath) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify old media was evicted by Revalidate
 	if FileExists(filePath) || FileExists(metaPath) {
-		t.Errorf("Expected old media and metadata to be evicted immediately upon change detection")
+		t.Errorf("Expected old media and metadata to be evicted upon change detection")
 	}
 
 	// TotalCacheSize should be reduced by 100
