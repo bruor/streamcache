@@ -213,18 +213,61 @@
             100% { box-shadow: 0 0 0 0 rgba(138, 43, 226, 0); }
         }
 
-        .download-meta {
-            display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 1.5rem;
-            font-size: 0.85rem;
-            color: var(--text-sub);
-            margin-bottom: 1rem;
+        .download-meta-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+            margin-bottom: 0.5rem;
         }
 
-        .download-meta-speed {
-            margin-left: auto;
+        .download-meta-card {
+            background: rgba(255, 255, 255, 0.025);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-radius: 6px;
+            padding: 0.4rem 0.6rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .download-meta-label {
+            font-size: 0.68rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-sub);
+            white-space: nowrap;
+        }
+
+        .download-meta-value {
+            font-size: 0.82rem;
+            font-weight: 500;
+            color: var(--text-main);
+            white-space: nowrap;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .download-speed-banner {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 0.45rem 0.75rem;
+            border-radius: 6px;
+            font-size: 0.82rem;
+            margin-top: 0.5rem;
+        }
+
+        .download-speed-value {
+            font-weight: 600;
+            font-family: var(--font-mono);
+            color: var(--accent-secondary);
         }
 
         .block-canvas {
@@ -980,22 +1023,47 @@
             
             const metaEl = document.getElementById(`meta-${key}`);
             if (metaEl) {
+                let speedHtml = '';
+                if (fileData.download_speed > 0) {
+                    speedHtml = `Speed: ${formatBytes(fileData.download_speed)}/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}`;
+                } else if (fileData.upstream_status === 'Throttled') {
+                    speedHtml = `<span style="color: var(--accent-orange);">Speed: 0 B/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}</span>`;
+                } else {
+                    speedHtml = `Speed: 0 B/s`;
+                }
+
                 metaEl.innerHTML = `
-                    <span>Size: ${formatBytes(fileData.total_size)}</span>
-                    <span>Blocks: ${completed}/${fileData.total_blocks}</span>
-                    ${fileData.starving_queue && fileData.starving_queue.length > 0 ? `<span style="color: var(--accent-orange); font-weight: 600;">Active Clients: ${fileData.active_clients}</span>` : `<span>Active Clients: ${fileData.active_clients}</span>`}
-                    ${fileData.upstream_status ? `<span>Upstream: <span class="upstream-status-badge ${fileData.upstream_status.toLowerCase()}">${fileData.upstream_status}</span></span>` : ''}
-                    <span>Connections (30s): ${fileData.connections_last_30s || 0}</span>
-                    ${fileData.observed_cooldown > 0 ? `<span>Observed Cooldown: ${fileData.observed_cooldown.toFixed(1)}s</span>` : ''}
-                    <span class="download-meta-speed">
-                    ${fileData.download_speed > 0 ? 
-                        `<span style="color: var(--accent-secondary); font-weight: 600;">Speed: ${formatBytes(fileData.download_speed)}/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}</span>` : 
-                        (fileData.upstream_status === 'Throttled' ? 
-                            `<span style="color: var(--accent-orange); font-weight: 600;">Speed: 0 B/s ${fileData.avg_download_speed > 0 ? `(Avg: ${formatBytes(fileData.avg_download_speed)}/s)` : ''}</span>` : 
-                            `<span>Speed: 0 B/s</span>`
-                        )
-                    }
-                    </span>
+                    <div class="download-meta-grid">
+                        <div class="download-meta-card">
+                            <span class="download-meta-label">Size</span>
+                            <span class="download-meta-value">${formatBytes(fileData.total_size)}</span>
+                        </div>
+                        <div class="download-meta-card">
+                            <span class="download-meta-label">Blocks</span>
+                            <span class="download-meta-value">${completed}/${fileData.total_blocks}</span>
+                        </div>
+                        <div class="download-meta-card">
+                            <span class="download-meta-label">Active Clients</span>
+                            <span class="download-meta-value" ${fileData.starving_queue && fileData.starving_queue.length > 0 ? 'style="color: var(--accent-orange); font-weight: 600;"' : ''}>${fileData.active_clients}</span>
+                        </div>
+                        <div class="download-meta-card">
+                            <span class="download-meta-label">Upstream</span>
+                            <span class="download-meta-value">${fileData.upstream_status ? `<span class="upstream-status-badge ${fileData.upstream_status.toLowerCase()}">${fileData.upstream_status}</span>` : 'Idle'}</span>
+                        </div>
+                        <div class="download-meta-card">
+                            <span class="download-meta-label">Connections (30s)</span>
+                            <span class="download-meta-value">${fileData.connections_last_30s || 0}</span>
+                        </div>
+                        ${fileData.observed_cooldown > 0 ? `
+                        <div class="download-meta-card">
+                            <span class="download-meta-label">Cooldown</span>
+                            <span class="download-meta-value" style="color: var(--accent-orange);">${fileData.observed_cooldown.toFixed(1)}s</span>
+                        </div>` : ''}
+                    </div>
+                    <div class="download-speed-banner">
+                        <span class="download-meta-label">CDN Download Speed</span>
+                        <span class="download-speed-value">${speedHtml}</span>
+                    </div>
                 `;
             }
         }
