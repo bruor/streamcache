@@ -32,6 +32,7 @@ func StartServer() {
 	// Admin / Dashboard static route
 	mux.HandleFunc("/", handleDashboardUI)
 	mux.HandleFunc("/dashboard/sse", handleSSE)
+	mux.HandleFunc("/api/version", handleAPIVersion)
 	mux.HandleFunc("/api/hydration/cancel", handleCancelHydration)
 
 	// Live Diagnostics Suite
@@ -387,13 +388,31 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
+func handleAPIVersion(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, private")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"version": ServerInstanceID,
+	})
+}
+
 func handleDashboardUI(w http.ResponseWriter, r *http.Request) {
 	// Root endpoint serves index.html dashboard
 	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		content, err := os.ReadFile("./web/index.html")
+		if err != nil {
+			http.Error(w, "Dashboard HTML not found", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, private")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
-		http.ServeFile(w, r, "./web/index.html")
+		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", ServerInstanceID))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
 		return
 	}
 	http.NotFound(w, r)

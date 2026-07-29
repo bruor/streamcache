@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <title>Streamcache VOD Status Page</title>
     <!-- Google Fonts Inter -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1302,6 +1305,29 @@
             });
         }
 
+        let currentServerInstanceId = null;
+
+        async function checkServerVersion() {
+            try {
+                const res = await fetch(`/api/version?t=${Date.now()}`, { cache: 'no-store' });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.version) {
+                        if (currentServerInstanceId === null) {
+                            currentServerInstanceId = data.version;
+                        } else if (currentServerInstanceId !== data.version) {
+                            appendLog("\n[System] New proxy build detected. Reloading dashboard UI...");
+                            setTimeout(() => {
+                                window.location.reload(true);
+                            }, 200);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error("Version check error:", e);
+            }
+        }
+
         // Establish Server-Sent Events (SSE) connection
         function connectSSE() {
             appendLog("\nConnecting to SSE Event Stream...");
@@ -1311,6 +1337,7 @@
                 connectionDot.className = "status-indicator connected";
                 connectionText.innerText = "Connected";
                 appendLog("\n[SSE] Connected to event stream.");
+                checkServerVersion();
             };
 
             es.onerror = function() {
@@ -1353,8 +1380,6 @@
                 }
             });
 
-            let currentServerInstanceId = null;
-
             // 3. Periodic full state update & metrics sync
             es.addEventListener('state', function(event) {
                 const data = JSON.parse(event.data);
@@ -1363,10 +1388,10 @@
                     if (currentServerInstanceId === null) {
                         currentServerInstanceId = data.server_instance_id;
                     } else if (currentServerInstanceId !== data.server_instance_id) {
-                        appendLog("\n[System] New proxy version/build detected. Reloading dashboard UI...");
+                        appendLog("\n[System] New proxy build detected. Reloading dashboard UI...");
                         setTimeout(() => {
                             window.location.reload(true);
-                        }, 300);
+                        }, 200);
                         return;
                     }
                 }
