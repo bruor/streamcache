@@ -371,31 +371,80 @@
 
         /* Active client connections styling */
         .connection-item {
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            background: rgba(0, 0, 0, 0.2);
-            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 12px;
             padding: 1rem;
             margin-bottom: 1rem;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 1rem;
-        }
-
-        @media (max-width: 600px) {
-            .connection-item {
-                grid-template-columns: 1fr;
-                gap: 0.5rem;
-            }
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
         }
 
         .connection-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            grid-column: 1 / -1;
             border-bottom: 1px solid rgba(255, 255, 255, 0.05);
             padding-bottom: 0.5rem;
-            margin-bottom: 0.2rem;
+        }
+
+        .connection-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 0.6rem;
+        }
+
+        .connection-metric-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 0.55rem 0.75rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .connection-metric-label {
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-sub);
+            white-space: nowrap;
+        }
+
+        .connection-metric-value {
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--text-main);
+            word-break: break-all;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .connection-url-card {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 0.55rem 0.75rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+            width: 100%;
+        }
+
+        .connection-url-value {
+            color: var(--accent-secondary);
+            font-family: var(--font-mono);
+            font-size: 0.78rem;
+            word-break: break-all;
+            width: 100%;
+            display: block;
         }
 
         .connection-client-id {
@@ -615,40 +664,7 @@
             font-size: 0.78rem;
         }
 
-        .connection-details {
-            display: flex;
-            flex-direction: column;
-            gap: 0.4rem;
-            font-size: 0.85rem;
-            color: var(--text-sub);
-            min-width: 0;
-            overflow: hidden;
-        }
 
-        .connection-detail-row {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            min-width: 0;
-            overflow: hidden;
-        }
-
-        .connection-detail-label {
-            color: var(--text-sub);
-            font-size: 0.82rem;
-            white-space: nowrap;
-            flex-shrink: 0;
-            min-width: 105px;
-        }
-
-        .connection-detail-value {
-            color: var(--text-main);
-            font-weight: 500;
-            word-break: break-all;
-            min-width: 0;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
     </style>
 </head>
 <body>
@@ -1160,31 +1176,27 @@
                         <span class="connection-client-id">${conn.id}${activeLabel}</span>
                         <span class="connection-status-badge ${statusClass}">${statusText}</span>
                     </div>
-                    <div class="connection-details">
-                        <div class="connection-detail-row">
-                            <span class="connection-detail-label">IP Address:</span>
-                            <span class="connection-detail-value">${conn.remote_addr}</span>
+                    <div class="connection-grid">
+                        <div class="connection-metric-card">
+                            <span class="connection-metric-label">IP Address</span>
+                            <span class="connection-metric-value">${conn.remote_addr}</span>
                         </div>
-                        <div class="connection-detail-row">
-                            <span class="connection-detail-label">User Agent:</span>
-                            <span class="connection-detail-value" title="${conn.user_agent}">${uaDisplay}</span>
+                        <div class="connection-metric-card">
+                            <span class="connection-metric-label">User Agent</span>
+                            <span class="connection-metric-value" title="${conn.user_agent}">${uaDisplay}</span>
                         </div>
-                    </div>
-                    <div class="connection-details">
-                        <div class="connection-detail-row">
-                            <span class="connection-detail-label">Elapsed Time:</span>
-                            <span class="connection-detail-value">${durationStr}</span>
+                        <div class="connection-metric-card">
+                            <span class="connection-metric-label">Elapsed Time</span>
+                            <span class="connection-metric-value">${durationStr}</span>
                         </div>
-                        <div class="connection-detail-row">
-                            <span class="connection-detail-label">Current Offset:</span>
-                            <span class="connection-detail-value">${formatBytes(conn.offset)}${percentageStr}</span>
+                        <div class="connection-metric-card">
+                            <span class="connection-metric-label">Current Offset</span>
+                            <span class="connection-metric-value">${formatBytes(conn.offset)}${percentageStr}</span>
                         </div>
                     </div>
-                    <div class="connection-details" style="grid-column: 1 / -1; border-top: 1px solid rgba(255, 255, 255, 0.05); padding-top: 0.4rem; margin-top: 0.2rem;">
-                        <div class="connection-detail-row" style="flex-direction: column; align-items: flex-start; gap: 4px;">
-                            <span class="connection-detail-label">Streaming File:</span>
-                            <span class="connection-detail-value" title="${conn.url}" style="color: var(--accent-secondary); font-family: var(--font-mono); font-size: 0.78rem; word-break: break-all; width: 100%; display: block;">${conn.url}</span>
-                        </div>
+                    <div class="connection-url-card">
+                        <span class="connection-metric-label">Streaming File</span>
+                        <span class="connection-url-value" title="${conn.url}">${conn.url}</span>
                     </div>
                 `;
             });
