@@ -310,7 +310,11 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	activeSessions := GlobalRegistry.GetActiveSessions()
 
 	GlobalRegistry.Lock.RLock()
-	defer GlobalRegistry.Lock.RUnlock()
+	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
+	for _, fileState := range GlobalRegistry.Files {
+		files = append(files, fileState)
+	}
+	GlobalRegistry.Lock.RUnlock()
 
 	type debugFile struct {
 		Key          string         `json:"key"`
@@ -324,8 +328,9 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var activeFiles []debugFile
-	for k, fileState := range GlobalRegistry.Files {
+	for _, fileState := range files {
 		fileState.Lock.Lock()
+		k := fileState.Key
 		completed := 0
 		for _, s := range fileState.BlockStates {
 			if s == BlockCompleted {

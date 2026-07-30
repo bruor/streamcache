@@ -262,6 +262,16 @@ func (r *CacheReader) waitForBlock(blockIndex int) error {
 	}
 
 	for {
+		// Check for cancellation before acquiring lock
+		select {
+		case <-r.ctx.Done():
+			r.state.Lock.Lock()
+			delete(r.state.Starving, r.clientID)
+			r.state.Lock.Unlock()
+			return r.ctx.Err()
+		default:
+		}
+
 		r.state.Lock.Lock()
 		status := r.state.BlockStates[blockIndex]
 
@@ -273,8 +283,8 @@ func (r *CacheReader) waitForBlock(blockIndex int) error {
 		}
 
 		if !r.state.WriterActive {
-			log.Printf("[Reader] Upstream coordinator inactive for %s while block %d is required. Resuscitation triggered.", r.state.Key, blockIndex)
 			r.state.Lock.Unlock()
+			log.Printf("[Reader] Upstream coordinator inactive for %s while block %d is required. Resuscitation triggered.", r.state.Key, blockIndex)
 			StartCoordinator(r.state, nil)
 			r.state.Lock.Lock()
 		}

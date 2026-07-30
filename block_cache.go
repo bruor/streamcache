@@ -215,7 +215,13 @@ func (r *CacheRegistry) startSpeedMonitor() {
 		now := time.Now().Unix()
 		shouldBroadcast := false
 		r.Lock.RLock()
+		files := make([]*FileCacheState, 0, len(r.Files))
 		for _, fileState := range r.Files {
+			files = append(files, fileState)
+		}
+		r.Lock.RUnlock()
+
+		for _, fileState := range files {
 			fileState.Lock.Lock()
 			instantSpeed := float64(fileState.BytesDownloadedSec)
 			fileState.BytesDownloadedSec = 0
@@ -260,7 +266,6 @@ func (r *CacheRegistry) startSpeedMonitor() {
 
 			fileState.Lock.Unlock()
 		}
-		r.Lock.RUnlock()
 
 		if shouldBroadcast && GlobalLogBroker != nil {
 			GlobalLogBroker.BroadcastStateUpdate()

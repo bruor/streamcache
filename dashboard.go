@@ -191,7 +191,11 @@ func buildStatePayload() ([]byte, error) {
 	activeSessions := GlobalRegistry.GetActiveSessions()
 
 	GlobalRegistry.Lock.RLock()
-	defer GlobalRegistry.Lock.RUnlock()
+	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
+	for _, fileState := range GlobalRegistry.Files {
+		files = append(files, fileState)
+	}
+	GlobalRegistry.Lock.RUnlock()
 
 	type sseFile struct {
 		Key            string   `json:"key"`
@@ -210,8 +214,9 @@ func buildStatePayload() ([]byte, error) {
 	}
 
 	var activeFiles []sseFile
-	for k, fileState := range GlobalRegistry.Files {
+	for _, fileState := range files {
 		fileState.Lock.Lock()
+		k := fileState.Key
 
 		// Skip completed files from active downloads list, unless they are still committing
 		isCompleted := len(fileState.BlockStates) > 0

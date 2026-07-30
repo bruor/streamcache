@@ -1417,7 +1417,8 @@
                     percentageStr = ` (${percent}%)`;
                 }
 
-                const activeLabel = conn.active_conns !== undefined ? (conn.active_conns > 0 ? ` (${conn.active_conns} active)` : ' (Idle)') : '';
+                const count = conn.active_conns || 0;
+                const activeLabel = ` (Conn: ${count})`;
 
                 let card = document.getElementById(`conn-card-${conn.id}`);
                 if (!card) {

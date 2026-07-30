@@ -41,7 +41,7 @@ func CancelCoordinator(state *FileCacheState) {
 	state.Lock.Lock()
 	cancel := state.Cancel
 	state.Cancel = nil
-	state.SetUpstreamStatus("Cancelled")
+	state.UpstreamStatus = "Cancelled"
 	for i, st := range state.BlockStates {
 		if st == BlockDownloading {
 			state.BlockStates[i] = BlockNotStarted
@@ -55,6 +55,10 @@ func CancelCoordinator(state *FileCacheState) {
 	metaPath := state.MetaPath
 	key := state.Key
 	state.Lock.Unlock()
+
+	if GlobalLogBroker != nil {
+		go GlobalLogBroker.BroadcastStateUpdate()
+	}
 
 	if cancel != nil {
 		cancel()
@@ -137,6 +141,17 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		parentCancel()
 		state.Lock.Lock()
 		state.Cancel = nil
+
+		// Wake up any client readers waiting on block updates
+		for _, ch := range state.Clients {
+			func() {
+				defer func() { recover() }()
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			}()
+		}
 
 		// We check if all blocks are completed to ensure we only finalize fully completed files.
 		isCompleted := len(state.BlockStates) > 0
@@ -723,6 +738,10 @@ func runDownloadWorker(
 	currentBlock := w.startBlock
 	
 	handleFailure := func(isPermanent bool, errFormat string, args ...interface{}) bool {
+		if ctx.Err() != nil {
+			log.Printf("[Worker-%d] Context canceled. Exiting worker.", w.id)
+			return true
+		}
 		log.Printf(errFormat, args...)
 		if isPermanent {
 			log.Printf("[Worker-%d] Permanent failure. Exiting worker.", w.id)

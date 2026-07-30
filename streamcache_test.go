@@ -72,6 +72,7 @@ func TestCacheReaderCancellation(t *testing.T) {
 
 	// Trigger cancellation immediately
 	cancel()
+	CancelCoordinator(state)
 
 	buf := make([]byte, 10)
 	n, err := reader.ReadAt(buf, 0)
@@ -80,6 +81,7 @@ func TestCacheReaderCancellation(t *testing.T) {
 	}
 
 	_ = reader.Close()
+	CancelCoordinator(state)
 	if len(state.Clients) != 0 {
 		t.Errorf("Expected clients list to be empty after Close, got %d", len(state.Clients))
 	}
@@ -2670,6 +2672,7 @@ func TestSingleWorkerTailPrefetch(t *testing.T) {
 	defer reader.Close()
 
 	StartCoordinator(state, nil)
+	defer CancelCoordinator(state)
 
 	buf := make([]byte, 100)
 	_, _ = reader.Read(buf)
