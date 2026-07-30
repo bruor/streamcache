@@ -169,7 +169,6 @@
             font-weight: 600;
             font-size: 0.95rem;
             word-break: break-all;
-            max-width: 80%;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -274,6 +273,7 @@
             cursor: pointer;
             transition: all 0.2s ease;
             white-space: nowrap;
+            flex-shrink: 0;
         }
 
         .cancel-hydration-btn:hover {
@@ -1227,9 +1227,11 @@
                     card.id = `download-card-${file.key}`;
                     card.innerHTML = `
                         <div class="download-header">
-                            <div class="download-url" title="${file.url}">${file.url}</div>
-                            <div class="download-controls">
+                            <div style="display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; margin-right: 12px;">
+                                <div class="download-url" title="${file.url}">${file.url}</div>
                                 <button class="cancel-hydration-btn" onclick="cancelHydration('${file.key}')" title="Cancel this in-progress hydration">Cancel Hydration</button>
+                            </div>
+                            <div class="download-controls">
                                 <div class="download-badge" id="badge-${file.key}">0.0%</div>
                                 <div class="download-speed-badge" id="speed-badge-${file.key}">0 B/s</div>
                             </div>
