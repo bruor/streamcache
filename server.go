@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
@@ -43,8 +42,9 @@ func StartServer() {
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
-	log.Printf("[Server] Starting HTTP Proxy Server on port %s", GlobalConfig.Port)
-	if err := http.ListenAndServe(GlobalConfig.Port, mux); err != nil {
+	port := GlobalConfig.GetPort()
+	log.Printf("[Server] Starting HTTP Proxy Server on port %s", port)
+	if err := http.ListenAndServe(port, mux); err != nil {
 		log.Fatalf("[Server] Failed to start server: %v", err)
 	}
 }
@@ -75,14 +75,15 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Validate Allowed Hosts
-	if len(GlobalConfig.AllowedHosts) > 0 {
+	allowedHosts := GlobalConfig.GetAllowedHosts()
+	if len(allowedHosts) > 0 {
 		parsed, err := url.Parse(targetURL)
 		if err != nil {
 			http.Error(w, "Invalid target URL format", http.StatusBadRequest)
 			return
 		}
 		allowed := false
-		for _, host := range GlobalConfig.AllowedHosts {
+		for _, host := range allowedHosts {
 			if parsed.Host == host {
 				allowed = true
 				break
@@ -98,11 +99,12 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// Generate cache key and extension (stripping query parameters)
 	key, ext := getCacheKeyAndExt(targetURL)
 	cacheFileName := key + ext
-	cacheFilePath := filepath.Join(GlobalConfig.CacheDir, cacheFileName)
+	cacheDir := GlobalConfig.GetCacheDir()
+	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
 
 	// Check for legacy extension-less file if the new file is missing
 	if !FileExists(cacheFilePath) {
-		legacyFilePath := filepath.Join(GlobalConfig.CacheDir, key)
+		legacyFilePath := filepath.Join(cacheDir, key)
 		if FileExists(legacyFilePath) {
 			log.Printf("[Server] Legacy cache file detected for %s. Migrating...", key)
 			err := migrateLegacyFile(legacyFilePath, cacheFilePath, targetURL)
@@ -199,10 +201,10 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		totalSize, probeContentType, etag, lastMod, _, err := probeUpstream(r.Context(), targetURL, r.Header, nil)
 		if err != nil {
 			log.Printf("[Server] Upstream probe failed: %v", err)
-			cooldown := GlobalConfig.ProbeTransientCooldown
+			cooldown := GlobalConfig.GetProbeTransientCooldown()
 			errType := "transient"
 			if isHTMLProbeError(err) || isPermanentProbeError(err) {
-				cooldown = GlobalConfig.ProbeFailureCooldown
+				cooldown = GlobalConfig.GetProbeFailureCooldown()
 				errType = "permanent"
 			}
 			log.Printf("[Server] Recording %s probe failure tombstone for %s (Duration: %s)", errType, key, cooldown)
@@ -221,8 +223,8 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		GlobalRegistry.PreEvict(totalSize)
 
 		metaPath := cacheFilePath + ".json"
-		partPath := filepath.Join(GlobalConfig.TmpDir, cacheFileName+".part")
-		totalBlocks := int(math.Ceil(float64(totalSize) / float64(GlobalConfig.BlockSize)))
+		partPath := filepath.Join(GlobalConfig.GetTmpDir(), cacheFileName+".part")
+		totalBlocks := int(math.Ceil(float64(totalSize) / float64(GlobalConfig.GetBlockSize())))
 
 		// Double-check if another concurrent request created FileCacheState during probe/pre-evict
 		GlobalRegistry.Lock.Lock()
@@ -344,6 +346,11 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		starvingCopy := make(map[string]int, len(fileState.Starving))
+		for clientID, blockIdx := range fileState.Starving {
+			starvingCopy[clientID] = blockIdx
+		}
+
 		activeFiles = append(activeFiles, debugFile{
 			Key:           k,
 			URL:           fileState.URL,
@@ -352,7 +359,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			ActiveBlocks:  completed,
 			ActiveWriter:  fileState.WriterActive,
 			ActiveClients: len(fileState.Clients),
-			StarvingList:  fileState.Starving,
+			StarvingList:  starvingCopy,
 		})
 		fileState.Lock.Unlock()
 	}
@@ -382,8 +389,8 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
-		"total_cache_size_bytes": GlobalRegistry.TotalCacheSize,
-		"max_cache_size_bytes":   GlobalConfig.CacheMaxBytes,
+		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
+		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
 		"disk_free_bytes":        freeSpace,
 		"active_downloads":       activeFiles,
 		"active_connections":     activeSessions,
@@ -438,8 +445,9 @@ func base64DecodeSafe(str string) ([]byte, error) {
 }
 
 type trackingReader struct {
-	file   *os.File
-	onRead func(off int64, n int)
+	file       *os.File
+	onRead     func(off int64, n int)
+	currOffset int64
 }
 
 func (tr *trackingReader) ReadAt(p []byte, off int64) (n int, err error) {
@@ -451,14 +459,19 @@ func (tr *trackingReader) ReadAt(p []byte, off int64) (n int, err error) {
 }
 
 func (tr *trackingReader) Seek(offset int64, whence int) (int64, error) {
-	return tr.file.Seek(offset, whence)
+	newPos, err := tr.file.Seek(offset, whence)
+	if err == nil {
+		atomic.StoreInt64(&tr.currOffset, newPos)
+	}
+	return newPos, err
 }
 
 func (tr *trackingReader) Read(p []byte) (n int, err error) {
-	currentOffset, _ := tr.file.Seek(0, io.SeekCurrent)
+	startOff := atomic.LoadInt64(&tr.currOffset)
 	n, err = tr.file.Read(p)
 	if n > 0 {
-		tr.onRead(currentOffset, n)
+		atomic.AddInt64(&tr.currOffset, int64(n))
+		tr.onRead(startOff, n)
 	}
 	return n, err
 }

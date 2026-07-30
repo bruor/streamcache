@@ -86,7 +86,7 @@ func (d *netDialer) DialContext(ctx context.Context, network, address string) (n
 	if err != nil {
 		return nil, err
 	}
-	return &timeoutConn{Conn: conn, readTimeout: GlobalConfig.UpstreamReadTimeout}, nil
+	return &timeoutConn{Conn: conn, readTimeout: GlobalConfig.GetUpstreamReadTimeout()}, nil
 }
 
 type timeoutConn struct {
@@ -97,10 +97,9 @@ type timeoutConn struct {
 func (c *timeoutConn) Read(b []byte) (n int, err error) {
 	if c.readTimeout > 0 {
 		_ = c.SetReadDeadline(time.Now().Add(c.readTimeout))
+		defer func() { _ = c.SetReadDeadline(time.Time{}) }()
 	}
-	n, err = c.Conn.Read(b)
-	_ = c.SetReadDeadline(time.Time{}) // clear deadline after read
-	return
+	return c.Conn.Read(b)
 }
 
 type ProbeMethod string

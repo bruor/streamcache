@@ -22,7 +22,7 @@ var contentRangeRegex = regexp.MustCompile(`/(\d+)\s*$`)
 //   - bool: true if cache is valid (serve it), false if cache is invalid/evicted (must re-download)
 //   - error: error if critical validation pipeline fails
 func Revalidate(key string, url string, playerHeader http.Header) (bool, error) {
-	filePath := filepath.Join(GlobalConfig.CacheDir, key)
+	filePath := filepath.Join(GlobalConfig.GetCacheDir(), key)
 	metaPath := filePath + ".json"
 
 	// If cached file doesn't exist, we consider it valid (we'll start a fresh download)
@@ -59,7 +59,7 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 
 	// Check if the validation time has expired
 	age := time.Since(time.Unix(meta.LastValidated, 0))
-	if age < GlobalConfig.CacheRevalidateInterval {
+	if age < GlobalConfig.GetCacheRevalidateInterval() {
 		// Fresh validation, skip network probe
 		return true, nil
 	}

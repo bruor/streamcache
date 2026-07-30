@@ -118,10 +118,14 @@ func TestOnDemandEviction(t *testing.T) {
 	GlobalRegistry.Lock.Unlock()
 
 	// Update Max Cache size limit to 25 bytes (triggers immediate eviction on next write/update)
+	GlobalConfig.Lock()
 	oldMax := GlobalConfig.CacheMaxBytes
 	GlobalConfig.CacheMaxBytes = 25
+	GlobalConfig.Unlock()
 	defer func() {
+		GlobalConfig.Lock()
 		GlobalConfig.CacheMaxBytes = oldMax
+		GlobalConfig.Unlock()
 	}()
 
 	// Trigger pre-eviction for an incoming 5-byte file
@@ -186,10 +190,14 @@ func TestRevalidateEvictsOldMediaFirst(t *testing.T) {
 	// Change etag on server to simulate media content modification
 	etag = "etag-v2"
 
+	GlobalConfig.Lock()
 	oldInterval := GlobalConfig.CacheRevalidateInterval
 	GlobalConfig.CacheRevalidateInterval = 1 * time.Second
+	GlobalConfig.Unlock()
 	defer func() {
+		GlobalConfig.Lock()
 		GlobalConfig.CacheRevalidateInterval = oldInterval
+		GlobalConfig.Unlock()
 	}()
 
 	valid, err := Revalidate(key, server.URL, nil)
@@ -320,13 +328,17 @@ func TestDebouncedSchedulerTimeSlicing(t *testing.T) {
 	defer cleanupAfterTest(t, state)
 
 	// Set debouncer to 0 to trigger instant preemption in single-worker setup
+	GlobalConfig.Lock()
 	oldMinBlocks := GlobalConfig.SchedulerMinBlocks
 	oldMinTime := GlobalConfig.SchedulerMinTime
 	GlobalConfig.SchedulerMinBlocks = 0
 	GlobalConfig.SchedulerMinTime = 0
+	GlobalConfig.Unlock()
 	defer func() {
+		GlobalConfig.Lock()
 		GlobalConfig.SchedulerMinBlocks = oldMinBlocks
 		GlobalConfig.SchedulerMinTime = oldMinTime
+		GlobalConfig.Unlock()
 	}()
 
 	// Trigger Coordinator
@@ -535,13 +547,17 @@ func TestHeaderPropagation(t *testing.T) {
 
 func TestCacheFinalizationOrder(t *testing.T) {
 	// Setup cache and tmp dirs
+	GlobalConfig.Lock()
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.Unlock()
 	defer func() {
+		GlobalConfig.Lock()
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.Unlock()
 	}()
 	defer cleanupAfterTest(t, nil)
 
@@ -2595,6 +2611,7 @@ func TestCancellationAndResuscitation(t *testing.T) {
 }
 
 func TestSingleWorkerTailPrefetch(t *testing.T) {
+	GlobalConfig.Lock()
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
@@ -2606,13 +2623,16 @@ func TestSingleWorkerTailPrefetch(t *testing.T) {
 	GlobalConfig.MaxUpstreamWorkers = 1
 	GlobalConfig.BlockSize = 100
 	GlobalConfig.MaxPrefetchTailBlocks = 10
+	GlobalConfig.Unlock()
 
 	defer func() {
+		GlobalConfig.Lock()
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
 		GlobalConfig.BlockSize = oldBlockSize
 		GlobalConfig.MaxPrefetchTailBlocks = oldMaxTailBlocks
+		GlobalConfig.Unlock()
 	}()
 
 	ebmlHeader := makeEbmlElement(ID_EBML, []byte{0x42, 0x86, 0x81, 0x01})

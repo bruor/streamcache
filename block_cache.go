@@ -166,7 +166,7 @@ func InitRegistry() {
 	GlobalRegistry.LoadExistingCache()
 
 	// Initial population of disk free space
-	space, _ := GetDiskFreeSpace(GlobalConfig.CacheDir)
+	space, _ := GetDiskFreeSpace(GlobalConfig.GetCacheDir())
 	atomic.StoreUint64(&GlobalDiskFreeBytes, space)
 	go startDiskFreeMonitor()
 
@@ -183,8 +183,8 @@ func (r *CacheRegistry) RecordFailedProbe(key string, duration time.Duration) {
 }
 
 func (r *CacheRegistry) IsProbeFailed(key string) bool {
-	r.Lock.Lock()
-	defer r.Lock.Unlock()
+	r.Lock.RLock()
+	defer r.Lock.RUnlock()
 	if r.FailedProbes == nil {
 		return false
 	}
@@ -192,19 +192,32 @@ func (r *CacheRegistry) IsProbeFailed(key string) bool {
 	if !exists {
 		return false
 	}
-	if time.Now().After(expiry) {
-		delete(r.FailedProbes, key)
-		return false
+	return time.Now().Before(expiry)
+}
+
+func (r *CacheRegistry) SweepExpiredProbes() {
+	r.Lock.Lock()
+	defer r.Lock.Unlock()
+	if r.FailedProbes == nil {
+		return
 	}
-	return true
+	now := time.Now()
+	for key, expiry := range r.FailedProbes {
+		if now.After(expiry) {
+			delete(r.FailedProbes, key)
+		}
+	}
 }
 
 func startDiskFreeMonitor() {
 	ticker := time.NewTicker(5 * time.Second)
 	for range ticker.C {
-		space, err := GetDiskFreeSpace(GlobalConfig.CacheDir)
+		space, err := GetDiskFreeSpace(GlobalConfig.GetCacheDir())
 		if err == nil {
 			atomic.StoreUint64(&GlobalDiskFreeBytes, space)
+		}
+		if GlobalRegistry != nil {
+			GlobalRegistry.SweepExpiredProbes()
 		}
 	}
 }
@@ -643,8 +656,8 @@ func (r *CacheRegistry) LoadExistingCache() {
 	r.Lock.Lock()
 	defer r.Lock.Unlock()
 
-	cacheDir := GlobalConfig.CacheDir
-	tmpDir := GlobalConfig.TmpDir
+	cacheDir := GlobalConfig.GetCacheDir()
+	tmpDir := GlobalConfig.GetTmpDir()
 
 	// Ensure directories exist
 	_ = os.MkdirAll(cacheDir, 0755)
@@ -702,19 +715,21 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 	}
 
 	currentSize := r.TotalCacheSize
-	cacheDir := GlobalConfig.CacheDir
+	cacheDir := GlobalConfig.GetCacheDir()
 
 	// Calculate how much space we need to free based on cache limit if incoming file is added
 	var cacheBytesToFree int64
-	if GlobalConfig.CacheMaxBytes > 0 && (currentSize+incomingSizeBytes) > GlobalConfig.CacheMaxBytes {
-		cacheBytesToFree = (currentSize + incomingSizeBytes) - GlobalConfig.CacheMaxBytes
+	maxBytes := GlobalConfig.GetCacheMaxBytes()
+	minDiskFree := GlobalConfig.GetMinDiskFreeBytes()
+	if maxBytes > 0 && (currentSize+incomingSizeBytes) > maxBytes {
+		cacheBytesToFree = (currentSize + incomingSizeBytes) - maxBytes
 	}
 
 	// Calculate how much space we need to free based on disk space limit
 	var diskBytesToFree int64
 	freeSpace, spaceErr := GetDiskFreeSpace(cacheDir)
-	if spaceErr == nil && GlobalConfig.MinDiskFreeBytes > 0 {
-		requiredFree := uint64(incomingSizeBytes) + uint64(GlobalConfig.MinDiskFreeBytes)
+	if spaceErr == nil && minDiskFree > 0 {
+		requiredFree := uint64(incomingSizeBytes) + uint64(minDiskFree)
 		if freeSpace < requiredFree {
 			diskBytesToFree = int64(requiredFree - freeSpace)
 		}
@@ -757,8 +772,8 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 
 	log.Printf("[Evictor] Fast pre-flight check passed. Spawning background evictor for incoming file (%.2f MB). Cache size: %.2f GB (limit: %.2f GB), Free Disk Space: %.2f GB (min: %.2f GB). Need to free %.2f MB.",
 		float64(incomingSizeBytes)/(1024*1024),
-		float64(currentSize)/(1024*1024*1024), float64(GlobalConfig.CacheMaxBytes)/(1024*1024*1024),
-		float64(freeSpace)/(1024*1024*1024), float64(GlobalConfig.MinDiskFreeBytes)/(1024*1024*1024),
+		float64(currentSize)/(1024*1024*1024), float64(maxBytes)/(1024*1024*1024),
+		float64(freeSpace)/(1024*1024*1024), float64(minDiskFree)/(1024*1024*1024),
 		float64(bytesToFree)/(1024*1024))
 
 	r.Evicting = true
@@ -776,7 +791,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 }
 
 func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
-	cacheDir := GlobalConfig.CacheDir
+	cacheDir := GlobalConfig.GetCacheDir()
 
 	// Collect completed files in cache directory
 	entries, err := os.ReadDir(cacheDir)
@@ -868,8 +883,12 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 		evictedCount, float64(freedBytes)/(1024*1024), float64(r.getTotalSize())/(1024*1024*1024))
 }
 
-func (r *CacheRegistry) getTotalSize() int64 {
+func (r *CacheRegistry) GetTotalSize() int64 {
 	r.Lock.RLock()
 	defer r.Lock.RUnlock()
 	return r.TotalCacheSize
+}
+
+func (r *CacheRegistry) getTotalSize() int64 {
+	return r.GetTotalSize()
 }

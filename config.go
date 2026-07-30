@@ -5,10 +5,12 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Config struct {
+	mu                       sync.RWMutex
 	Port                     string
 	CacheDir                 string
 	TmpDir                   string
@@ -26,6 +28,188 @@ type Config struct {
 	ClientHydrationWait      time.Duration
 	ProbeFailureCooldown     time.Duration
 	ProbeTransientCooldown   time.Duration
+}
+
+func (c *Config) Lock() {
+	if c != nil {
+		c.mu.Lock()
+	}
+}
+
+func (c *Config) Unlock() {
+	if c != nil {
+		c.mu.Unlock()
+	}
+}
+
+func (c *Config) RLock() {
+	if c != nil {
+		c.mu.RLock()
+	}
+}
+
+func (c *Config) RUnlock() {
+	if c != nil {
+		c.mu.RUnlock()
+	}
+}
+
+func (c *Config) GetBlockSize() int64 {
+	if c == nil {
+		return 4 * 1024 * 1024
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.BlockSize
+}
+
+func (c *Config) GetPort() string {
+	if c == nil {
+		return ":8080"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Port
+}
+
+func (c *Config) GetAllowedHosts() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.AllowedHosts == nil {
+		return nil
+	}
+	hosts := make([]string, len(c.AllowedHosts))
+	copy(hosts, c.AllowedHosts)
+	return hosts
+}
+
+func (c *Config) GetCacheDir() string {
+	if c == nil {
+		return "./cache/files"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.CacheDir
+}
+
+func (c *Config) GetTmpDir() string {
+	if c == nil {
+		return "./cache/tmp"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.TmpDir
+}
+
+func (c *Config) GetMaxUpstreamWorkers() int {
+	if c == nil {
+		return 2
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.MaxUpstreamWorkers
+}
+
+func (c *Config) GetMaxPrefetchTailBlocks() int {
+	if c == nil {
+		return 10
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.MaxPrefetchTailBlocks
+}
+
+func (c *Config) GetSchedulerMinBlocks() int {
+	if c == nil {
+		return 4
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.SchedulerMinBlocks
+}
+
+func (c *Config) GetSchedulerMinTime() time.Duration {
+	if c == nil {
+		return 2 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.SchedulerMinTime
+}
+
+func (c *Config) GetClientHydrationWait() time.Duration {
+	if c == nil {
+		return 2 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ClientHydrationWait
+}
+
+func (c *Config) GetDisableFadvise() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.DisableFadvise
+}
+
+func (c *Config) GetUpstreamReadTimeout() time.Duration {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.UpstreamReadTimeout
+}
+
+func (c *Config) GetCacheMaxBytes() int64 {
+	if c == nil {
+		return 50 * 1024 * 1024 * 1024
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.CacheMaxBytes
+}
+
+func (c *Config) GetMinDiskFreeBytes() int64 {
+	if c == nil {
+		return 10 * 1024 * 1024 * 1024
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.MinDiskFreeBytes
+}
+
+func (c *Config) GetCacheRevalidateInterval() time.Duration {
+	if c == nil {
+		return 1 * time.Hour
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.CacheRevalidateInterval
+}
+
+func (c *Config) GetProbeFailureCooldown() time.Duration {
+	if c == nil {
+		return 10 * time.Minute
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ProbeFailureCooldown
+}
+
+func (c *Config) GetProbeTransientCooldown() time.Duration {
+	if c == nil {
+		return 30 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ProbeTransientCooldown
 }
 
 var GlobalConfig *Config

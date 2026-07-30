@@ -299,10 +299,10 @@ func buildStatePayload() ([]byte, error) {
 
 	data := map[string]interface{}{
 		"server_instance_id":      ServerInstanceID,
-		"total_cache_size_bytes": GlobalRegistry.TotalCacheSize,
-		"max_cache_size_bytes":   GlobalConfig.CacheMaxBytes,
+		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
+		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
 		"disk_free_bytes":        freeSpace,
-		"min_disk_free_bytes":    GlobalConfig.MinDiskFreeBytes,
+		"min_disk_free_bytes":    GlobalConfig.GetMinDiskFreeBytes(),
 		"active_downloads":       activeFiles,
 		"active_connections":     activeSessions,
 	}

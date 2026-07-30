@@ -69,16 +69,21 @@ func CancelCoordinator(state *FileCacheState) {
 	}
 
 	if clientsCount == 0 {
-		if FileExists(partPath) {
-			_ = os.Remove(partPath)
-		}
-		if FileExists(metaPath) {
-			_ = os.Remove(metaPath)
-		}
 		GlobalRegistry.Lock.Lock()
-		delete(GlobalRegistry.Files, key)
-		GlobalRegistry.Lock.Unlock()
-		log.Printf("[Coord] Manually cancelled hydration and removed partial cache files: %s", key)
+		_, exists := GlobalRegistry.Files[key]
+		if exists {
+			delete(GlobalRegistry.Files, key)
+			GlobalRegistry.Lock.Unlock()
+			if FileExists(partPath) {
+				_ = os.Remove(partPath)
+			}
+			if FileExists(metaPath) {
+				_ = os.Remove(metaPath)
+			}
+			log.Printf("[Coord] Manually cancelled hydration and removed partial cache files: %s", key)
+		} else {
+			GlobalRegistry.Lock.Unlock()
+		}
 	} else {
 		log.Printf("[Coord] Manually cancelled hydration for %s (%d active clients remain)", key, clientsCount)
 	}
@@ -123,6 +128,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	_ = file.Truncate(state.TotalSize)
 
 	state.Lock.Lock()
+	if state.File != nil && state.File != file {
+		_ = state.File.Close()
+	}
 	state.File = file
 	if state.HydrationStartTime == 0 {
 		state.HydrationStartTime = time.Now().Unix()
@@ -144,13 +152,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 		// Wake up any client readers waiting on block updates
 		for _, ch := range state.Clients {
-			func() {
-				defer func() { recover() }()
-				select {
-				case ch <- struct{}{}:
-				default:
-				}
-			}()
+			safeSignal(ch)
 		}
 
 		// We check if all blocks are completed to ensure we only finalize fully completed files.
@@ -266,12 +268,17 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 
 			if shouldCleanUpIncomplete {
-				_ = os.Remove(state.PartPath)
-				_ = os.Remove(state.MetaPath)
 				GlobalRegistry.Lock.Lock()
-				delete(GlobalRegistry.Files, state.Key)
-				GlobalRegistry.Lock.Unlock()
-				log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
+				_, exists := GlobalRegistry.Files[state.Key]
+				if exists {
+					delete(GlobalRegistry.Files, state.Key)
+					GlobalRegistry.Lock.Unlock()
+					_ = os.Remove(state.PartPath)
+					_ = os.Remove(state.MetaPath)
+					log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
+				} else {
+					GlobalRegistry.Lock.Unlock()
+				}
 			}
 		}
 
@@ -394,35 +401,39 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						}
 					}
 
-					padding := GlobalConfig.SchedulerMinBlocks
+					padding := GlobalConfig.GetSchedulerMinBlocks()
 					if padding < 1 {
 						padding = 1
 					}
 
 					var tailStartBlock int = -1
 					if isMp4 && !isFastStart {
+						blockSize := GlobalConfig.GetBlockSize()
+						maxTailBlocks := GlobalConfig.GetMaxPrefetchTailBlocks()
 						if hasMdatSize && moovOffset > 0 {
 							moovBytes := state.TotalSize - moovOffset
-							prefetchBlocks = int((moovBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
+							prefetchBlocks = int((moovBytes + blockSize - 1) / blockSize) + padding
 						} else {
 							// Estimate based on 0.15% of file size, floor of 16MB
 							estimatedBytes := state.TotalSize * 15 / 10000
 							if estimatedBytes < 16*1024*1024 {
 								estimatedBytes = 16*1024*1024
 							}
-							prefetchBlocks = int((estimatedBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
+							prefetchBlocks = int((estimatedBytes + blockSize - 1) / blockSize) + padding
 						}
 
-						if prefetchBlocks > GlobalConfig.MaxPrefetchTailBlocks {
-							prefetchBlocks = GlobalConfig.MaxPrefetchTailBlocks
+						if prefetchBlocks > maxTailBlocks {
+							prefetchBlocks = maxTailBlocks
 						}
 						tailStartBlock = state.TotalBlocks - prefetchBlocks
 					} else if isMkv && hasCues && cuesOffset > 0 {
+						blockSize := GlobalConfig.GetBlockSize()
+						maxTailBlocks := GlobalConfig.GetMaxPrefetchTailBlocks()
 						cuesBytes := state.TotalSize - cuesOffset
-						prefetchBlocks = int((cuesBytes + GlobalConfig.BlockSize - 1) / GlobalConfig.BlockSize) + padding
+						prefetchBlocks = int((cuesBytes + blockSize - 1) / blockSize) + padding
 
-						if prefetchBlocks > GlobalConfig.MaxPrefetchTailBlocks {
-							prefetchBlocks = GlobalConfig.MaxPrefetchTailBlocks
+						if prefetchBlocks > maxTailBlocks {
+							prefetchBlocks = maxTailBlocks
 						}
 						tailStartBlock = state.TotalBlocks - prefetchBlocks
 					}
@@ -434,7 +445,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 					// Only pre-fetch if the start block is far enough from the beginning (lockout blocks).
 					// If the calculated tailStartBlock falls inside the initial block download run
 					// guaranteed by SchedulerMinBlocks, the sequential worker will pull it anyway.
-					lockoutBlocks := GlobalConfig.SchedulerMinBlocks * 2
+					lockoutBlocks := GlobalConfig.GetSchedulerMinBlocks() * 2
 					if lockoutBlocks < 2 {
 						lockoutBlocks = 2
 					}
@@ -451,7 +462,8 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						state.Lock.Unlock()
 
 						if needPrefetch {
-							if GlobalConfig.MaxUpstreamWorkers > 1 {
+							maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
+							if maxWorkers > 1 {
 								log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at block %d", tailStartBlock)
 								spawnPrefetchWorker(tailStartBlock)
 							} else {
@@ -619,17 +631,19 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								}
 
 								if wSpeed > 0 {
-									targetOffset := int64(sb) * GlobalConfig.BlockSize
+									blockSize := GlobalConfig.GetBlockSize()
+									hydrationWait := GlobalConfig.GetClientHydrationWait()
+									targetOffset := int64(sb) * blockSize
 									if wOffset <= targetOffset {
-										bytesRemaining := (int64(sb)+1)*GlobalConfig.BlockSize - wOffset
+										bytesRemaining := (int64(sb)+1)*blockSize - wOffset
 										eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
-										if eta < GlobalConfig.ClientHydrationWait {
+										if eta < hydrationWait {
 											log.Printf("[Coord] Client Hydration Wait active for block %d (ETA %.2fs < threshold %s). Suppressing connection jump.", 
-												sb, eta.Seconds(), GlobalConfig.ClientHydrationWait)
+												sb, eta.Seconds(), hydrationWait)
 											suppressed = true
 											break
 										}
-									}
+										}
 								}
 							}
 						}
@@ -644,9 +658,10 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 					activeCount = len(state.ActiveWorkers)
 					state.WorkersLock.Unlock()
 
-					if activeCount < GlobalConfig.MaxUpstreamWorkers {
+					maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
+					if activeCount < maxWorkers {
 						log.Printf("[Coord] Spawning new worker starting at starving block %d (Active: %d/%d)", 
-							sb, activeCount+1, GlobalConfig.MaxUpstreamWorkers)
+							sb, activeCount+1, maxWorkers)
 						spawnWorker(sb)
 					} else {
 						// Worker limit reached. Find furthest worker to pre-empt
@@ -665,12 +680,15 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								elapsed = time.Since(time.Unix(0, connStartNano))
 							}
 							
+							minTime := GlobalConfig.GetSchedulerMinTime()
+							minBlocks := GlobalConfig.GetSchedulerMinBlocks()
+							blockSize := GlobalConfig.GetBlockSize()
 							eligible := false
-							if GlobalConfig.SchedulerMinTime <= 0 && GlobalConfig.SchedulerMinBlocks <= 0 {
+							if minTime <= 0 && minBlocks <= 0 {
 								eligible = true
 							} else {
-								timeOk := GlobalConfig.SchedulerMinTime > 0 && elapsed >= GlobalConfig.SchedulerMinTime
-								bytesOk := GlobalConfig.SchedulerMinBlocks > 0 && connBytes >= int64(GlobalConfig.SchedulerMinBlocks)*GlobalConfig.BlockSize
+								timeOk := minTime > 0 && elapsed >= minTime
+								bytesOk := minBlocks > 0 && connBytes >= int64(minBlocks)*blockSize
 								eligible = timeOk || bytesOk
 							}
 
@@ -769,7 +787,19 @@ func runDownloadWorker(
 		coordinatorSleepMu.RLock()
 		sleepFn := coordinatorSleepFn
 		coordinatorSleepMu.RUnlock()
-		sleepFn(backoff)
+
+		done := make(chan struct{})
+		go func() {
+			sleepFn(backoff)
+			close(done)
+		}()
+
+		select {
+		case <-ctx.Done():
+			log.Printf("[Worker-%d] Context canceled during retry backoff. Exiting worker.", w.id)
+			return true
+		case <-done:
+		}
 
 		backoff *= 2
 		if backoff > 30*time.Second {
@@ -796,7 +826,7 @@ func runDownloadWorker(
 	defer closeConnection()
 
 	if w.isPrefetchHelper {
-		blockSize := GlobalConfig.BlockSize
+		blockSize := GlobalConfig.GetBlockSize()
 		prefetchStart := int64(w.startBlock) * blockSize
 		prefetchLength := state.TotalSize - prefetchStart
 
@@ -867,7 +897,7 @@ func runDownloadWorker(
 							break
 						}
 
-						if !GlobalConfig.DisableFadvise {
+						if !GlobalConfig.GetDisableFadvise() {
 							FadviseDontNeed(file.Fd(), writeOffset, int64(n))
 						}
 
@@ -986,7 +1016,7 @@ func runDownloadWorker(
 			continue
 		}
 
-		blockSize := GlobalConfig.BlockSize
+		blockSize := GlobalConfig.GetBlockSize()
 		blockStartOffset := int64(currentBlock) * blockSize
 		blockEndOffset := blockStartOffset + blockSize
 		if blockEndOffset > state.TotalSize {
@@ -1115,7 +1145,7 @@ func runDownloadWorker(
 					break
 				}
 
-				if !GlobalConfig.DisableFadvise {
+				if !GlobalConfig.GetDisableFadvise() {
 					FadviseDontNeed(file.Fd(), writeOffset, int64(n))
 				}
 
@@ -1236,7 +1266,7 @@ func runInlineTailPrefetch(
 	file *os.File,
 	tailStartBlock int,
 ) {
-	blockSize := GlobalConfig.BlockSize
+	blockSize := GlobalConfig.GetBlockSize()
 	prefetchStart := int64(tailStartBlock) * blockSize
 	prefetchLength := state.TotalSize - prefetchStart
 	if prefetchLength <= 0 {
@@ -1326,7 +1356,7 @@ func runInlineTailPrefetch(
 				break
 			}
 
-			if !GlobalConfig.DisableFadvise {
+			if !GlobalConfig.GetDisableFadvise() {
 				FadviseDontNeed(file.Fd(), writeOffset, int64(n))
 			}
 

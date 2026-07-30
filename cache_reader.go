@@ -194,7 +194,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		p = p[:r.state.TotalSize-off]
 	}
 
-	blockSize := GlobalConfig.BlockSize
+	blockSize := GlobalConfig.GetBlockSize()
 	startBlock := int(off / blockSize)
 	endBlock := int((off + int64(len(p)) - 1) / blockSize)
 
@@ -241,7 +241,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 
 		// Purge page cache on Linux to prevent memory bloat
-		if !GlobalConfig.DisableFadvise {
+		if !GlobalConfig.GetDisableFadvise() {
 			FadviseDontNeed(file.Fd(), off, int64(n))
 		}
 	}
@@ -306,7 +306,13 @@ func (r *CacheReader) waitForBlock(blockIndex int) error {
 
 		// Block and wait for a completion update OR request cancellation
 		select {
-		case <-clientChan:
+		case _, ok := <-clientChan:
+			if !ok {
+				r.state.Lock.Lock()
+				delete(r.state.Starving, r.clientID)
+				r.state.Lock.Unlock()
+				return errors.New("client channel closed")
+			}
 			// Woken up by coordinator write. Check block status again.
 		case <-r.ctx.Done():
 			// Client disconnected! Unregister and return cancellation error
