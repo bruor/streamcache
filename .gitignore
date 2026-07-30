@@ -1,11 +1,22 @@
-# Compiled binaries
+# Compiled binaries & build output
 streamcache
 streamcache.exe
 streamcache.test
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
 
-# Cache & temporary assemblies
+# Test & profiling outputs
+*.out
+*.prof
+
+# Cache, temporary files, and logs
 /cache/
 *.part
+*.log
 
 # Environment overrides
 .env
