@@ -68,17 +68,10 @@ func (lb *LogBroker) BroadcastBlockUpdate(key string, blocks []int, state int) {
 	if len(blocks) == 0 {
 		return
 	}
-	var upstreamStatus string
-	if fileState, exists := GlobalRegistry.Files[key]; exists {
-		fileState.Lock.Lock()
-		upstreamStatus = fileState.UpstreamStatus
-		fileState.Lock.Unlock()
-	}
 	evtData, err := json.Marshal(BlockUpdateEvent{
-		Key:            key,
-		Blocks:         blocks,
-		State:          state,
-		UpstreamStatus: upstreamStatus,
+		Key:    key,
+		Blocks: blocks,
+		State:  state,
 	})
 	if err != nil {
 		return

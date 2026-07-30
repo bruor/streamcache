@@ -116,7 +116,7 @@ func (s *FileCacheState) SetUpstreamStatus(status string) {
 		s.UpstreamStatus = status
 		s.Lock.Unlock()
 		if GlobalLogBroker != nil {
-			GlobalLogBroker.BroadcastStateUpdate()
+			go GlobalLogBroker.BroadcastStateUpdate()
 		}
 		return
 	}
