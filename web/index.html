@@ -1117,8 +1117,7 @@
                 let currentStr = fileData.download_speed > 0 ? `${formatBytes(fileData.download_speed)}/s` : '0 B/s';
                 let avgVal = fileData.avg_download_speed || 0;
                 let avgStr = avgVal > 0 ? ` (Avg: ${formatBytes(avgVal)}/s)` : '';
-                let statusStr = fileData.upstream_status === 'Throttled' ? ' [Throttled]' : '';
-                speedEl.innerText = `Speed: ${currentStr}${avgStr}${statusStr}`;
+                speedEl.innerText = `Speed: ${currentStr}${avgStr}`;
 
                 requestAnimationFrame(() => {
                     const currentWidth = speedEl.getBoundingClientRect().width;
