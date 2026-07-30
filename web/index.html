@@ -417,11 +417,38 @@
             font-family: var(--font-mono);
             font-size: 0.85rem;
             color: var(--accent-green);
-            overflow-y: auto;
+            overflow-y: hidden;
             overflow-anchor: auto;
             border: 1px solid var(--card-border);
             white-space: pre-wrap;
             box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.8);
+            cursor: pointer;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .console.focused {
+            overflow-y: auto;
+            cursor: auto;
+            border-color: rgba(0, 240, 255, 0.4);
+            box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.8), 0 0 8px rgba(0, 240, 255, 0.2);
+        }
+
+        .console-focus-badge {
+            font-family: var(--font-mono);
+            font-size: 0.72rem;
+            font-weight: 600;
+            padding: 2px 7px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text-sub);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            transition: all 0.2s ease;
+        }
+
+        .console-focus-badge.focused {
+            background: rgba(0, 240, 255, 0.12);
+            color: var(--accent-secondary);
+            border: 1px solid rgba(0, 240, 255, 0.35);
         }
 
         .console-scroll-btn {
@@ -841,7 +868,10 @@
 
             <div class="card">
                 <div class="console-header card-title" style="margin-bottom: 0.5rem; border-bottom: none;">
-                    <span>System Console & Event Logs</span>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span>System Console & Event Logs</span>
+                        <span id="console-focus-badge" class="console-focus-badge">[Click logs to scroll]</span>
+                    </div>
                     <button onclick="clearConsole()" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: var(--text-sub); font-family: var(--font-family); font-size: 0.75rem; padding: 2px 8px; border-radius: 4px; cursor: pointer; transition: all 0.2s;">Clear</button>
                 </div>
                 <div class="console-container" style="position: relative;">
@@ -871,8 +901,57 @@
     <script>
         const consoleEl = document.getElementById('console');
         const scrollBtn = document.getElementById('console-scroll-btn');
+        const focusBadge = document.getElementById('console-focus-badge');
+        let isConsoleFocused = false;
         let autoScrollEnabled = true;
         const maxLogLines = 200;
+
+        function setConsoleFocus(focused) {
+            isConsoleFocused = focused;
+            if (focused) {
+                consoleEl.classList.add('focused');
+                if (focusBadge) {
+                    focusBadge.innerText = 'Log Scroll Focused';
+                    focusBadge.classList.add('focused');
+                }
+            } else {
+                consoleEl.classList.remove('focused');
+                if (focusBadge) {
+                    focusBadge.innerText = '[Click logs to scroll]';
+                    focusBadge.classList.remove('focused');
+                }
+            }
+        }
+
+        // Click inside console to focus scrolling
+        consoleEl.addEventListener('click', (e) => {
+            e.stopPropagation();
+            setConsoleFocus(true);
+        });
+
+        // Click outside console to unfocus
+        document.addEventListener('click', (e) => {
+            if (isConsoleFocused && !consoleEl.contains(e.target) && e.target.id !== 'console-scroll-btn') {
+                setConsoleFocus(false);
+            }
+        });
+
+        // Press Escape to unfocus console
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && isConsoleFocused) {
+                setConsoleFocus(false);
+            }
+        });
+
+        // Wheel event delegation: when unfocused, scroll main page
+        consoleEl.addEventListener('wheel', (e) => {
+            if (!isConsoleFocused) {
+                window.scrollBy({
+                    top: e.deltaY,
+                    behavior: 'auto'
+                });
+            }
+        }, { passive: true });
 
         // In-memory store for active files: key -> { url, total_size, total_blocks, block_states (Uint8Array), active_clients, ... }
         const fileStore = {};
