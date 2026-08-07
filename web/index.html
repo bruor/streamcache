@@ -51,9 +51,6 @@
             margin-bottom: 2rem;
             padding-bottom: 1.5rem;
             border-bottom: 1px solid var(--card-border);
-            isolation: isolate;
-            transform: translateZ(0);
-            will-change: transform;
         }
 
         h1 {
@@ -75,10 +72,6 @@
             display: inline-block;
             box-shadow: 0 0 10px var(--accent-secondary);
             animation: pulse 2s infinite;
-            will-change: transform, opacity;
-            transform: translateZ(0);
-            isolation: isolate;
-            contain: layout paint;
         }
 
         @keyframes pulse {
@@ -99,21 +92,15 @@
             }
         }
 
-        /* Glassmorphism Card Style */
+        /* Dark Glass Card Style */
         .card {
-            background: var(--card-bg);
-            backdrop-filter: blur(16px);
-            -webkit-backdrop-filter: blur(16px);
+            background: rgba(14, 12, 26, 0.75);
+            background-image: linear-gradient(135deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%);
             border: 1px solid var(--card-border);
             border-radius: 16px;
             padding: 1.5rem;
             margin-bottom: 2rem;
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-            isolation: isolate;
-            transform: translateZ(0);
-            will-change: transform;
-            backface-visibility: hidden;
-            -webkit-backface-visibility: hidden;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4), inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
         }
 
         .card-title {
