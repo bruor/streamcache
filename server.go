@@ -538,6 +538,15 @@ func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
 
 	GlobalRegistry.Lock.RLock()
 	fileState, exists := GlobalRegistry.Files[key]
+	if !exists {
+		for k, f := range GlobalRegistry.Files {
+			if k == key || strings.HasPrefix(k, key+".") || strings.TrimSuffix(k, filepath.Ext(k)) == key {
+				fileState = f
+				exists = true
+				break
+			}
+		}
+	}
 	GlobalRegistry.Lock.RUnlock()
 
 	if !exists || fileState == nil {

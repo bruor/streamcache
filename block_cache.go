@@ -182,6 +182,14 @@ func (r *CacheRegistry) RecordFailedProbe(key string, duration time.Duration) {
 	r.FailedProbes[key] = time.Now().Add(duration)
 }
 
+func (r *CacheRegistry) ClearFailedProbe(key string) {
+	r.Lock.Lock()
+	defer r.Lock.Unlock()
+	if r.FailedProbes != nil {
+		delete(r.FailedProbes, key)
+	}
+}
+
 func (r *CacheRegistry) IsProbeFailed(key string) bool {
 	r.Lock.RLock()
 	defer r.Lock.RUnlock()

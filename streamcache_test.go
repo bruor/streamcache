@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -2708,6 +2709,105 @@ func TestSingleWorkerTailPrefetch(t *testing.T) {
 		t.Fatalf("Expected at least 2 requests (1 initial/sequential, 1 inline tail prefetch), got %d", len(ranges))
 	}
 }
+
+func TestCancelAndRehydrateSameMedia(t *testing.T) {
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	testBytes := make([]byte, GlobalConfig.BlockSize*100)
+	for i := range testBytes {
+		testBytes[i] = byte(i % 256)
+	}
+
+	blockCh := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("ETag", "\"test-etag-123\"")
+		// Hold worker download range requests until released
+		if r.Header.Get("Range") != "" && r.Header.Get("Range") != "bytes=0-0" {
+			select {
+			case <-blockCh:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		http.ServeContent(w, r, "video.mp4", time.Now(), bytes.NewReader(testBytes))
+	}))
+	defer func() {
+		close(blockCh)
+		server.Close()
+	}()
+
+	targetURL := server.URL + "/video.mp4"
+	key, ext := getCacheKeyAndExt(targetURL)
+	cacheFileName := key + ext
+
+	// 1. Initial request via handleMediaStream
+	req1 := httptest.NewRequest("GET", "/stream?url="+url.QueryEscape(targetURL), nil)
+	rr1 := httptest.NewRecorder()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	req1 = req1.WithContext(ctx1)
+
+	go handleMediaStream(rr1, req1)
+
+	// Allow coordinator to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Simulate player closing: cancel context
+	cancel1()
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Admin cancels hydration via API
+	cancelReq := httptest.NewRequest("POST", "/api/hydration/cancel?key="+cacheFileName, nil)
+	cancelRR := httptest.NewRecorder()
+	handleCancelHydration(cancelRR, cancelReq)
+
+	if cancelRR.Code != http.StatusOK {
+		t.Fatalf("Expected HTTP 200 from cancel API, got status %d", cancelRR.Code)
+	}
+
+	// 3. Retry same media request with conditional headers
+	req2 := httptest.NewRequest("GET", "/stream?url="+url.QueryEscape(targetURL), nil)
+	req2.Header.Set("If-None-Match", "\"test-etag-123\"")
+	rr2 := httptest.NewRecorder()
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	req2 = req2.WithContext(ctx2)
+
+	go handleMediaStream(rr2, req2)
+
+	time.Sleep(200 * time.Millisecond)
+
+	GlobalRegistry.Lock.RLock()
+	state2, exists := GlobalRegistry.Files[cacheFileName]
+	GlobalRegistry.Lock.RUnlock()
+
+	if !exists || state2 == nil {
+		t.Fatalf("Expected new FileCacheState in registry for re-hydrated media %s", cacheFileName)
+	}
+
+	state2.Lock.Lock()
+	writerActive := state2.WriterActive
+	state2.Lock.Unlock()
+
+	if !writerActive {
+		t.Errorf("Expected state2.WriterActive to be true for re-hydrated media")
+	}
+
+	// Clean up second hydration
+	CancelCoordinator(state2)
+}
+
 
 
 

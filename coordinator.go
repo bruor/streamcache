@@ -70,8 +70,8 @@ func CancelCoordinator(state *FileCacheState) {
 
 	if clientsCount == 0 {
 		GlobalRegistry.Lock.Lock()
-		_, exists := GlobalRegistry.Files[key]
-		if exists {
+		existingState, exists := GlobalRegistry.Files[key]
+		if exists && (existingState == state || existingState == nil) {
 			delete(GlobalRegistry.Files, key)
 			GlobalRegistry.Lock.Unlock()
 			if FileExists(partPath) {
@@ -87,6 +87,8 @@ func CancelCoordinator(state *FileCacheState) {
 	} else {
 		log.Printf("[Coord] Manually cancelled hydration for %s (%d active clients remain)", key, clientsCount)
 	}
+
+	GlobalRegistry.ClearFailedProbe(key)
 
 	if GlobalLogBroker != nil {
 		GlobalLogBroker.BroadcastStateUpdate()
@@ -269,8 +271,8 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 			if shouldCleanUpIncomplete {
 				GlobalRegistry.Lock.Lock()
-				_, exists := GlobalRegistry.Files[state.Key]
-				if exists {
+				existingState, exists := GlobalRegistry.Files[state.Key]
+				if exists && existingState == state {
 					delete(GlobalRegistry.Files, state.Key)
 					GlobalRegistry.Lock.Unlock()
 					_ = os.Remove(state.PartPath)
@@ -837,13 +839,7 @@ func runDownloadWorker(
 			rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
 			req.Header.Set("Range", rangeHeader)
 			if initialHeader != nil && len(initialHeader) > 0 {
-				for k, vv := range initialHeader {
-					if k != "Range" && k != "Connection" && k != "Host" {
-						for _, v := range vv {
-							req.Header.Add(k, v)
-						}
-					}
-				}
+				CopySafeHeaders(initialHeader, req.Header)
 			} else {
 				req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
 				req.Header.Set("Accept", "*/*")
@@ -1037,13 +1033,7 @@ func runDownloadWorker(
 			req.Header.Set("Range", rangeHeader)
 
 			if initialHeader != nil && len(initialHeader) > 0 {
-				for k, vv := range initialHeader {
-					if k != "Range" && k != "Connection" && k != "Host" {
-						for _, v := range vv {
-							req.Header.Add(k, v)
-						}
-					}
-				}
+				CopySafeHeaders(initialHeader, req.Header)
 			} else {
 				req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
 				req.Header.Set("Accept", "*/*")
@@ -1288,13 +1278,7 @@ func runInlineTailPrefetch(
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
 	req.Header.Set("Range", rangeHeader)
 	if initialHeader != nil && len(initialHeader) > 0 {
-		for k, vv := range initialHeader {
-			if k != "Range" && k != "Connection" && k != "Host" {
-				for _, v := range vv {
-					req.Header.Add(k, v)
-				}
-			}
-		}
+		CopySafeHeaders(initialHeader, req.Header)
 	} else {
 		req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
 		req.Header.Set("Accept", "*/*")

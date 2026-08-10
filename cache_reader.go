@@ -134,7 +134,9 @@ func (r *CacheReader) Close() error {
 			_ = os.Remove(r.state.PartPath)
 			_ = os.Remove(r.state.MetaPath)
 			GlobalRegistry.Lock.Lock()
-			delete(GlobalRegistry.Files, r.state.Key)
+			if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
+				delete(GlobalRegistry.Files, r.state.Key)
+			}
 			GlobalRegistry.Lock.Unlock()
 			log.Printf("[Reader] Removed incomplete cache file on last client exit: %s", r.state.Key)
 		}
