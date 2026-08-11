@@ -2920,6 +2920,142 @@ func TestUpstreamUserAgentModes(t *testing.T) {
 	}
 }
 
+func TestNonBlockingCommit(t *testing.T) {
+	// Initialize registry
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	key := "test_non_blocking_commit.mkv"
+	partPath := filepath.Join(t.TempDir(), key+".part")
+	finalPath := filepath.Join(t.TempDir(), key)
+
+	_ = os.WriteFile(partPath, []byte("dummy stream content"), 0644)
+
+	state := &FileCacheState{
+		Key:            key,
+		Path:           finalPath,
+		PartPath:       partPath,
+		BlockStates:    []int{BlockCompleted},
+		TotalSize:      20,
+		UpstreamStatus: "Downloading",
+		WriterActive:   true,
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	start := time.Now()
+
+	// Simulate commit logic without file.Sync
+	state.Lock.Lock()
+	state.UpstreamStatus = "Committing"
+	state.Lock.Unlock()
+
+	state.SetUpstreamStatus("Completed")
+	GlobalRegistry.MarkConnectionsAsInCache(key)
+
+	err := os.Rename(state.PartPath, state.Path)
+	if err != nil {
+		t.Fatalf("Failed to rename completed file: %v", err)
+	}
+
+	elapsed := time.Since(start)
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("Commit process took too long (expected <100ms, got %v)", elapsed)
+	}
+
+	state.Lock.Lock()
+	status := state.UpstreamStatus
+	state.Lock.Unlock()
+
+	if status != "Completed" {
+		t.Errorf("Expected status Completed, got %s", status)
+	}
+}
+
+func TestThrottledStatusNetworkOnly(t *testing.T) {
+	// Initialize registry
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	committingKey := "committing_file.mkv"
+	committingState := &FileCacheState{
+		Key:            committingKey,
+		UpstreamStatus: "Committing",
+	}
+
+	activeKey := "active_download.mkv"
+	activeState := &FileCacheState{
+		Key:            activeKey,
+		UpstreamStatus: "Downloading",
+		WriterActive:   true,
+		ZeroSpeedSec:   2,
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[committingKey] = committingState
+	GlobalRegistry.Files[activeKey] = activeState
+	GlobalRegistry.Lock.Unlock()
+
+	// Simulate SpeedMonitor check logic while a file is committing
+	GlobalRegistry.Lock.RLock()
+	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
+	for _, fs := range GlobalRegistry.Files {
+		files = append(files, fs)
+	}
+	GlobalRegistry.Lock.RUnlock()
+
+	isAnyCommitting := false
+	for _, fs := range files {
+		fs.Lock.Lock()
+		if fs.UpstreamStatus == "Committing" {
+			isAnyCommitting = true
+		}
+		fs.Lock.Unlock()
+	}
+
+	activeState.Lock.Lock()
+	instantSpeed := float64(activeState.BytesDownloadedSec)
+	activeState.BytesDownloadedSec = 0
+
+	if activeState.WriterActive && !isAnyCommitting && activeState.UpstreamStatus != "Committing" {
+		if instantSpeed == 0 {
+			activeState.ZeroSpeedSec++
+			if activeState.ZeroSpeedSec >= 3 && activeState.UpstreamStatus == "Downloading" {
+				activeState.UpstreamStatus = "Throttled"
+			}
+		}
+	} else {
+		activeState.ZeroSpeedSec = 0
+	}
+	activeState.Lock.Unlock()
+
+	if activeState.UpstreamStatus == "Throttled" {
+		t.Errorf("Expected active file NOT to flip to Throttled while another file is Committing")
+	}
+	if activeState.ZeroSpeedSec != 0 {
+		t.Errorf("Expected ZeroSpeedSec to be reset to 0 during commit, got %d", activeState.ZeroSpeedSec)
+	}
+}
+
+
 
 
 

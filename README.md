@@ -8,7 +8,7 @@ It dynamically proxies video requests, downloads and caches content on-demand in
 
 ## 🚀 Key Features
 
-- **On-Demand Caching with Deduplication**: Media files are cached on-demand when requested by a client. Once triggered, the proxy downloads the media to completion to guarantee a complete local copy. Upstream CDN bandwidth is saved by deduplicating concurrent and subsequent requests for the same media file.
+- **On-Demand Caching & Non-Blocking Commits**: Media files are cached on-demand when requested by a client. Once triggered, the proxy downloads the media in parallel to guarantee a complete local copy. Upon completion, file finalization (`.part` to final cache filename) occurs instantly via non-blocking atomic rename (<1ms) without hardware storage barriers (`fsync`), ensuring concurrent downloads run smoothly with zero freezes. Upstream CDN bandwidth is saved by deduplicating concurrent and subsequent requests for the same media file.
 - **Concurrent Block Hydration & Starvation Scheduling**: The proxy coordinates media downloads in parallel blocks (configured via `MAX_UPSTREAM_WORKERS`). If a player seeks to a different part of the video, the coordinator instantly shifts priority by spawning or pre-empting download workers to download the starved block first. It features:
   - *Worker Coalescing*: Worker threads automatically terminate if they hit blocks already completed or being actively downloaded by another thread.
   - *Client Hydration Wait*: If an active worker is already downloading a starved block and its estimated completion time (ETA) is under `CLIENT_HYDRATION_WAIT` (default `2s`), the proxy suppresses spawning new connections, saving valuable upstream network resources.

@@ -169,10 +169,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		if isCompleted {
 			state.UpstreamStatus = "Committing"
 			state.Lock.Unlock()
-			if file != nil {
-				log.Printf("[Coord] Committing and flushing cache file to disk: %s", state.Key)
-				_ = file.Sync()
-			}
+			log.Printf("[Coord] Committing completed cache file to disk: %s", state.Key)
 			state.SetUpstreamStatus("Completed")
 			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
 			state.Lock.Lock()

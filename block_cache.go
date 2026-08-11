@@ -243,6 +243,16 @@ func (r *CacheRegistry) startSpeedMonitor() {
 		}
 		r.Lock.RUnlock()
 
+		// Check if any file is currently committing to prevent false-positive throttling during disk operations
+		isAnyCommitting := false
+		for _, fs := range files {
+			fs.Lock.Lock()
+			if fs.UpstreamStatus == "Committing" {
+				isAnyCommitting = true
+			}
+			fs.Lock.Unlock()
+		}
+
 		for _, fileState := range files {
 			fileState.Lock.Lock()
 			instantSpeed := float64(fileState.BytesDownloadedSec)
@@ -268,7 +278,7 @@ func (r *CacheRegistry) startSpeedMonitor() {
 			}
 
 			// Zero-speed provider throttling detection
-			if fileState.WriterActive {
+			if fileState.WriterActive && !isAnyCommitting && fileState.UpstreamStatus != "Committing" {
 				if instantSpeed == 0 {
 					fileState.ZeroSpeedSec++
 					if fileState.ZeroSpeedSec >= 3 && fileState.UpstreamStatus == "Downloading" {
