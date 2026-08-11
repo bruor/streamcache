@@ -1028,6 +1028,11 @@ func runDownloadWorker(
 			req.Header.Set("Range", rangeHeader)
 
 			CopySafeHeaders(initialHeader, req.Header)
+			if ua := req.Header.Get("User-Agent"); ua != "" {
+				state.Lock.Lock()
+				state.UpstreamUserAgent = ua
+				state.Lock.Unlock()
+			}
 
 			state.SetUpstreamStatus("Connecting")
 

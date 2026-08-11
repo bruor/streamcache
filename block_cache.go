@@ -97,6 +97,7 @@ type FileCacheState struct {
 	SmoothDownloadSpeed  float64
 	ZeroSpeedSec         int
 	UpstreamStatus       string
+	UpstreamUserAgent    string
 	RecentConnections  map[string]*ConnectionInfo
 	ObservedCooldown   float64
 	ActiveWorkers      []*Worker

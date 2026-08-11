@@ -211,6 +211,7 @@ func buildStatePayload() ([]byte, error) {
 		UpstreamStatus string   `json:"upstream_status"`
 		ConnectionsLast30s int  `json:"connections_last_30s"`
 		ObservedCooldown   float64 `json:"observed_cooldown"`
+		UpstreamUserAgent  string  `json:"upstream_user_agent"`
 	}
 
 	var activeFiles []sseFile
@@ -261,20 +262,26 @@ func buildStatePayload() ([]byte, error) {
 		}
 		fileState.RecentConnections = filteredConns
 
+		effectiveUA := fileState.UpstreamUserAgent
+		if effectiveUA == "" {
+			effectiveUA = GlobalConfig.GetUpstreamUserAgent()
+		}
+
 		activeFiles = append(activeFiles, sseFile{
-			Key:            k,
-			URL:            fileState.URL,
-			TotalSize:      fileState.TotalSize,
-			TotalBlocks:    fileState.TotalBlocks,
-			BlockStates:    blocks,
-			ActiveWriter:   fileState.WriterActive,
-			ActiveClients:  len(fileState.Clients),
-			StarvingQueue:  starveQueue,
-			DownloadSpeed:  fileState.DownloadSpeed,
-			AvgDownloadSpeed: fileState.AvgDownloadSpeed,
-			UpstreamStatus: fileState.UpstreamStatus,
+			Key:                k,
+			URL:                fileState.URL,
+			TotalSize:          fileState.TotalSize,
+			TotalBlocks:        fileState.TotalBlocks,
+			BlockStates:        blocks,
+			ActiveWriter:       fileState.WriterActive,
+			ActiveClients:      len(fileState.Clients),
+			StarvingQueue:      starveQueue,
+			DownloadSpeed:      fileState.DownloadSpeed,
+			AvgDownloadSpeed:   fileState.AvgDownloadSpeed,
+			UpstreamStatus:     fileState.UpstreamStatus,
 			ConnectionsLast30s: activeCount + closedInLast30sCount,
 			ObservedCooldown:   fileState.ObservedCooldown,
+			UpstreamUserAgent:  effectiveUA,
 		})
 		fileState.Lock.Unlock()
 	}

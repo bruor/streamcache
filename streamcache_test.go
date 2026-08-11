@@ -2804,8 +2804,10 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 		t.Errorf("Expected state2.WriterActive to be true for re-hydrated media")
 	}
 
-	// Clean up second hydration
+	// Clean up second hydration and wait brief moment for background cancel
+	cancel2()
 	CancelCoordinator(state2)
+	time.Sleep(50 * time.Millisecond)
 }
 
 func TestUpstreamUserAgentModes(t *testing.T) {

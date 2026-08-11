@@ -1194,6 +1194,12 @@
             
             const metaEl = document.getElementById(`meta-${key}`);
             if (metaEl) {
+                let upstreamUA = fileData.upstream_user_agent || "VLC/3.0.20 LibVLC/3.0.20";
+                let uaTrunc = upstreamUA;
+                if (uaTrunc.length > 25) {
+                    uaTrunc = uaTrunc.substring(0, 22) + "...";
+                }
+
                 metaEl.innerHTML = `
                     <div class="download-meta-grid">
                         <div class="download-meta-card">
@@ -1203,6 +1209,10 @@
                         <div class="download-meta-card">
                             <span class="download-meta-label">Blocks</span>
                             <span class="download-meta-value">${completed}/${fileData.total_blocks}</span>
+                        </div>
+                        <div class="download-meta-card">
+                            <span class="download-meta-label">Upstream UA</span>
+                            <span class="download-meta-value" title="${upstreamUA}">${uaTrunc}</span>
                         </div>
                         <div class="download-meta-card">
                             <span class="download-meta-label">Active Clients</span>
@@ -1264,7 +1274,8 @@
                         avg_download_speed: file.avg_download_speed,
                         upstream_status: file.upstream_status,
                         connections_last_30s: file.connections_last_30s,
-                        observed_cooldown: file.observed_cooldown
+                        observed_cooldown: file.observed_cooldown,
+                        upstream_user_agent: file.upstream_user_agent
                     };
                     fileStore[file.key] = fileData;
                 } else {
@@ -1278,6 +1289,7 @@
                     fileData.upstream_status = file.upstream_status;
                     fileData.connections_last_30s = file.connections_last_30s;
                     fileData.observed_cooldown = file.observed_cooldown;
+                    fileData.upstream_user_agent = file.upstream_user_agent;
                     if (file.block_states && file.block_states.length === fileData.total_blocks) {
                         fileData.block_states.set(file.block_states);
                     }
