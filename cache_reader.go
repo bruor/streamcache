@@ -292,9 +292,6 @@ func (r *CacheReader) waitForBlock(blockIndex int) error {
 		}
 
 		// Mark client as starving and trigger on-demand download request
-		if status == BlockNotStarted {
-			r.state.BlockStates[blockIndex] = BlockDownloading
-		}
 		r.state.Starving[r.clientID] = blockIndex
 		r.state.Lock.Unlock()
 
