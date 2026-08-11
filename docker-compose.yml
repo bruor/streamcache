@@ -45,5 +45,11 @@ services:
       - PROBE_FAILURE_COOLDOWN=10m
       - PROBE_TRANSIENT_COOLDOWN=30s
       
+      # Upstream User-Agent Spoofing & Anti-Throttling Configs
+      # Mode options: smart (recommended; rewrites Lavf/FFmpeg/Unknown), force (always override), passthrough (fallback if empty)
+      - UPSTREAM_USER_AGENT_MODE=smart
+      - UPSTREAM_USER_AGENT=VLC/3.0.20 LibVLC/3.0.20
+      
       # Option to restrict domains allowed through the proxy (comma-separated list)
       # - ALLOWED_HOSTS=infinity.gives
+

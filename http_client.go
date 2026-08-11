@@ -147,14 +147,66 @@ func GetCleanHost(rawURL string) string {
 	return host
 }
 
-func CopySafeHeaders(src, dst http.Header) {
-	for k, vv := range src {
-		kLower := strings.ToLower(k)
-		if kLower == "range" || kLower == "connection" || kLower == "host" || kLower == "accept-encoding" || strings.HasPrefix(kLower, "if-") {
-			continue
-		}
-		for _, v := range vv {
-			dst.Add(k, v)
+func isThrottledUA(ua string) bool {
+	if strings.TrimSpace(ua) == "" {
+		return true
+	}
+	uaLower := strings.ToLower(ua)
+	throttledKeywords := []string{
+		"lavf", "ffmpeg", "libavformat", "avformat",
+		"gstreamer", "libsoup", "stagefright", "androidmediaplayer", "dalvik",
+		"curl", "wget", "python", "requests", "libcurl", "go-http-client", "aria2", "httpie",
+		"unknown", "internal", "null",
+	}
+	for _, kw := range throttledKeywords {
+		if strings.Contains(uaLower, kw) {
+			return true
 		}
 	}
+	return false
 }
+
+func CopySafeHeaders(src, dst http.Header) {
+	if dst == nil {
+		return
+	}
+	if src != nil {
+		for k, vv := range src {
+			kLower := strings.ToLower(k)
+			if kLower == "range" || kLower == "connection" || kLower == "host" || kLower == "accept-encoding" || strings.HasPrefix(kLower, "if-") || strings.HasPrefix(kLower, "sec-fetch-") {
+				continue
+			}
+			for _, v := range vv {
+				dst.Add(k, v)
+			}
+		}
+	}
+
+	mode := GlobalConfig.GetUpstreamUserAgentMode()
+	fallbackUA := GlobalConfig.GetUpstreamUserAgent()
+
+	switch mode {
+	case "force":
+		dst.Set("User-Agent", fallbackUA)
+	case "smart":
+		currentUA := dst.Get("User-Agent")
+		if isThrottledUA(currentUA) {
+			dst.Set("User-Agent", fallbackUA)
+		}
+	case "passthrough":
+		currentUA := dst.Get("User-Agent")
+		if strings.TrimSpace(currentUA) == "" || strings.EqualFold(currentUA, "unknown") {
+			dst.Set("User-Agent", fallbackUA)
+		}
+	default:
+		currentUA := dst.Get("User-Agent")
+		if isThrottledUA(currentUA) {
+			dst.Set("User-Agent", fallbackUA)
+		}
+	}
+
+	if dst.Get("Accept") == "" {
+		dst.Set("Accept", "*/*")
+	}
+}
+

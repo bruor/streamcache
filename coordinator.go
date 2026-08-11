@@ -838,12 +838,7 @@ func runDownloadWorker(
 		if err == nil {
 			rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
 			req.Header.Set("Range", rangeHeader)
-			if initialHeader != nil && len(initialHeader) > 0 {
-				CopySafeHeaders(initialHeader, req.Header)
-			} else {
-				req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
-				req.Header.Set("Accept", "*/*")
-			}
+			CopySafeHeaders(initialHeader, req.Header)
 
 			state.SetUpstreamStatus("Connecting")
 
@@ -1032,12 +1027,7 @@ func runDownloadWorker(
 			rangeHeader := fmt.Sprintf("bytes=%d-%d", blockStartOffset, state.TotalSize-1)
 			req.Header.Set("Range", rangeHeader)
 
-			if initialHeader != nil && len(initialHeader) > 0 {
-				CopySafeHeaders(initialHeader, req.Header)
-			} else {
-				req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
-				req.Header.Set("Accept", "*/*")
-			}
+			CopySafeHeaders(initialHeader, req.Header)
 
 			state.SetUpstreamStatus("Connecting")
 
@@ -1277,12 +1267,7 @@ func runInlineTailPrefetch(
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
 	req.Header.Set("Range", rangeHeader)
-	if initialHeader != nil && len(initialHeader) > 0 {
-		CopySafeHeaders(initialHeader, req.Header)
-	} else {
-		req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
-		req.Header.Set("Accept", "*/*")
-	}
+	CopySafeHeaders(initialHeader, req.Header)
 
 	state.SetUpstreamStatus("Connecting")
 

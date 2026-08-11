@@ -28,6 +28,8 @@ type Config struct {
 	ClientHydrationWait      time.Duration
 	ProbeFailureCooldown     time.Duration
 	ProbeTransientCooldown   time.Duration
+	UpstreamUserAgent        string
+	UpstreamUserAgentMode    string
 }
 
 func (c *Config) Lock() {
@@ -212,6 +214,37 @@ func (c *Config) GetProbeTransientCooldown() time.Duration {
 	return c.ProbeTransientCooldown
 }
 
+func (c *Config) GetUpstreamUserAgent() string {
+	if c == nil {
+		return "VLC/3.0.20 LibVLC/3.0.20"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.UpstreamUserAgent == "" {
+		return "VLC/3.0.20 LibVLC/3.0.20"
+	}
+	return c.UpstreamUserAgent
+}
+
+func (c *Config) GetUpstreamUserAgentMode() string {
+	if c == nil {
+		return "smart"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	mode := strings.ToLower(strings.TrimSpace(c.UpstreamUserAgentMode))
+	if mode == "" {
+		return "smart"
+	}
+	if mode == "override" {
+		return "force"
+	}
+	if mode == "disabled" {
+		return "passthrough"
+	}
+	return mode
+}
+
 var GlobalConfig *Config
 
 func LoadConfig() {
@@ -232,6 +265,8 @@ func LoadConfig() {
 		ClientHydrationWait:     getEnvDuration("CLIENT_HYDRATION_WAIT", 2*time.Second),
 		ProbeFailureCooldown:    getEnvDuration("PROBE_FAILURE_COOLDOWN", 10*time.Minute),
 		ProbeTransientCooldown:  getEnvDuration("PROBE_TRANSIENT_COOLDOWN", 30*time.Second),
+		UpstreamUserAgent:       getEnv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
+		UpstreamUserAgentMode:   getEnv("UPSTREAM_USER_AGENT_MODE", "smart"),
 	}
 
 	// Format port if missing colon
@@ -252,7 +287,7 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinBlocks=%d, MaxPrefetchTailBlocks=%d",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinBlocks=%d, MaxPrefetchTailBlocks=%d, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.BlockSize/(1024*1024),
@@ -266,6 +301,8 @@ func LoadConfig() {
 		cfg.ProbeTransientCooldown,
 		cfg.SchedulerMinBlocks,
 		cfg.MaxPrefetchTailBlocks,
+		cfg.GetUpstreamUserAgent(),
+		cfg.GetUpstreamUserAgentMode(),
 	)
 }
 

@@ -2808,6 +2808,106 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 	CancelCoordinator(state2)
 }
 
+func TestUpstreamUserAgentModes(t *testing.T) {
+	GlobalConfig.Lock()
+	oldUA := GlobalConfig.UpstreamUserAgent
+	oldMode := GlobalConfig.UpstreamUserAgentMode
+	GlobalConfig.UpstreamUserAgent = "TestUA/1.0"
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.UpstreamUserAgent = oldUA
+		GlobalConfig.UpstreamUserAgentMode = oldMode
+		GlobalConfig.Unlock()
+	}()
+
+	// 1. Smart mode testing
+	GlobalConfig.Lock()
+	GlobalConfig.UpstreamUserAgentMode = "smart"
+	GlobalConfig.Unlock()
+
+	// Throttled UAs must be replaced in smart mode
+	throttledUAs := []string{
+		"Lavf/59.27.100",
+		"FFmpeg/4.4",
+		"libavformat/58.76.100",
+		"curl/7.88.1",
+		"stagefright/1.2",
+		"Unknown",
+		"",
+	}
+	for _, ua := range throttledUAs {
+		src := make(http.Header)
+		if ua != "" {
+			src.Set("User-Agent", ua)
+		}
+		dst := make(http.Header)
+		CopySafeHeaders(src, dst)
+		if dst.Get("User-Agent") != "TestUA/1.0" {
+			t.Errorf("Smart mode failed: expected %q for input %q, got %q", "TestUA/1.0", ua, dst.Get("User-Agent"))
+		}
+	}
+
+	// Valid UAs must pass through in smart mode
+	validUAs := []string{
+		"Infuse/7.5",
+		"TiviMate/4.7.0",
+		"AppleCoreMedia/1.0",
+		"VLC/3.0.18 LibVLC/3.0.18",
+	}
+	for _, ua := range validUAs {
+		src := make(http.Header)
+		src.Set("User-Agent", ua)
+		dst := make(http.Header)
+		CopySafeHeaders(src, dst)
+		if dst.Get("User-Agent") != ua {
+			t.Errorf("Smart mode failed: expected valid UA %q to pass through, got %q", ua, dst.Get("User-Agent"))
+		}
+	}
+
+	// 2. Force mode testing
+	GlobalConfig.Lock()
+	GlobalConfig.UpstreamUserAgentMode = "force"
+	GlobalConfig.Unlock()
+
+	allUAs := append(throttledUAs, validUAs...)
+	for _, ua := range allUAs {
+		src := make(http.Header)
+		if ua != "" {
+			src.Set("User-Agent", ua)
+		}
+		dst := make(http.Header)
+		CopySafeHeaders(src, dst)
+		if dst.Get("User-Agent") != "TestUA/1.0" {
+			t.Errorf("Force mode failed: expected %q for input %q, got %q", "TestUA/1.0", ua, dst.Get("User-Agent"))
+		}
+	}
+
+	// 3. Passthrough mode testing
+	GlobalConfig.Lock()
+	GlobalConfig.UpstreamUserAgentMode = "passthrough"
+	GlobalConfig.Unlock()
+
+	// Passthrough passes Lavf as-is
+	src := make(http.Header)
+	src.Set("User-Agent", "Lavf/59.27.100")
+	dst := make(http.Header)
+	CopySafeHeaders(src, dst)
+	if dst.Get("User-Agent") != "Lavf/59.27.100" {
+		t.Errorf("Passthrough mode failed: expected %q, got %q", "Lavf/59.27.100", dst.Get("User-Agent"))
+	}
+
+	// Empty UA falls back to TestUA/1.0
+	srcEmpty := make(http.Header)
+	dstEmpty := make(http.Header)
+	CopySafeHeaders(srcEmpty, dstEmpty)
+	if dstEmpty.Get("User-Agent") != "TestUA/1.0" {
+		t.Errorf("Passthrough mode empty fallback failed: expected %q, got %q", "TestUA/1.0", dstEmpty.Get("User-Agent"))
+	}
+}
+
+
 
 
 

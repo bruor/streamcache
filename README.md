@@ -53,6 +53,9 @@ Streamcache is configured using environment variables. Default fallback values a
 | `CLIENT_HYDRATION_WAIT` | `2s` | Duration the proxy waits for active hydration to catch up before spawning a new connection (Jump Suppression). |
 | `PROBE_FAILURE_COOLDOWN` | `10m` | Cooldown duration for caching catastrophic/permanent probe failures (e.g. HTML blocks, HTTP 403/404) to block retries. |
 | `PROBE_TRANSIENT_COOLDOWN` | `30s` | Cooldown duration for caching transient probe failures (e.g. timeouts, network drops, HTTP 500/503) to absorb retry storms. |
+| `UPSTREAM_USER_AGENT_MODE` | `smart` | User-Agent spoofing mode for upstream CDN requests (`smart`, `force`, `passthrough`). `smart` passes valid player UAs while automatically rewriting throttled/bot signatures (e.g. `Lavf`, `FFmpeg`, `Unknown`). `force` always overrides all client UAs. `passthrough` passes client UAs, using default only if empty. |
+| `UPSTREAM_USER_AGENT` | `VLC/3.0.20 LibVLC/3.0.20` | Upstream User-Agent string sent to CDNs when spoofing or fallback is applied. |
+
 
 ---
 

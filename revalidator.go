@@ -239,12 +239,7 @@ func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Head
 	}
 
 	req.Header.Set("Range", "bytes=0-0")
-	if playerHeader != nil {
-		CopySafeHeaders(playerHeader, req.Header)
-	} else {
-		req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
-		req.Header.Set("Accept", "*/*")
-	}
+	CopySafeHeaders(playerHeader, req.Header)
 
 	// Set conditional headers if metadata is present
 	if meta != nil {
@@ -295,12 +290,7 @@ func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.H
 		return 0, "", "", "", false, err
 	}
 
-	if playerHeader != nil {
-		CopySafeHeaders(playerHeader, req.Header)
-	} else {
-		req.Header.Set("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
-		req.Header.Set("Accept", "*/*")
-	}
+	CopySafeHeaders(playerHeader, req.Header)
 
 	// Set conditional headers if metadata is present
 	if meta != nil {
