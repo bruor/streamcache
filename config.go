@@ -30,6 +30,7 @@ type Config struct {
 	ProbeTransientCooldown   time.Duration
 	UpstreamUserAgent        string
 	UpstreamUserAgentMode    string
+	MaxUpstreamRetries       int
 }
 
 func (c *Config) Lock() {
@@ -169,6 +170,15 @@ func (c *Config) GetUpstreamReadTimeout() time.Duration {
 	return c.UpstreamReadTimeout
 }
 
+func (c *Config) GetMaxUpstreamRetries() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.MaxUpstreamRetries
+}
+
 func (c *Config) GetCacheMaxBytes() int64 {
 	if c == nil {
 		return 50 * 1024 * 1024 * 1024
@@ -267,6 +277,7 @@ func LoadConfig() {
 		ProbeTransientCooldown:  getEnvDuration("PROBE_TRANSIENT_COOLDOWN", 30*time.Second),
 		UpstreamUserAgent:       getEnv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 		UpstreamUserAgentMode:   getEnv("UPSTREAM_USER_AGENT_MODE", "smart"),
+		MaxUpstreamRetries:      getEnvInt("MAX_UPSTREAM_RETRIES", 0),
 	}
 
 	// Format port if missing colon
@@ -287,13 +298,14 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinBlocks=%d, MaxPrefetchTailBlocks=%d, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinBlocks=%d, MaxPrefetchTailBlocks=%d, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.BlockSize/(1024*1024),
 		cfg.CacheMaxBytes/(1024*1024*1024),
 		cfg.MinDiskFreeBytes/(1024*1024*1024),
 		cfg.UpstreamReadTimeout,
+		cfg.MaxUpstreamRetries,
 		cfg.DisableFadvise,
 		cfg.MaxUpstreamWorkers,
 		cfg.ClientHydrationWait,

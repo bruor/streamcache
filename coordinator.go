@@ -776,13 +776,25 @@ func runDownloadWorker(
 		}
 
 		consecutiveFailures++
-		if consecutiveFailures >= 8 {
-			log.Printf("[Worker-%d] Maximum consecutive failures reached (8). Exiting worker.", w.id)
-			parentCancel()
+		maxRetries := GlobalConfig.GetMaxUpstreamRetries()
+		if maxRetries > 0 && consecutiveFailures >= maxRetries {
+			log.Printf("[Worker-%d] Maximum consecutive failures reached (%d/%d). Exiting worker.", w.id, consecutiveFailures, maxRetries)
+			
+			state.WorkersLock.Lock()
+			activeCount := len(state.ActiveWorkers)
+			state.WorkersLock.Unlock()
+			
+			if activeCount <= 1 {
+				parentCancel()
+			}
 			return true
 		}
 		
-		log.Printf("[Worker-%d] Retry %d/8. Sleeping %s before retrying...", w.id, consecutiveFailures, backoff)
+		if maxRetries > 0 {
+			log.Printf("[Worker-%d] Retry %d/%d. Sleeping %s before retrying...", w.id, consecutiveFailures, maxRetries, backoff)
+		} else {
+			log.Printf("[Worker-%d] Retry %d (unlimited retries). Sleeping %s before retrying...", w.id, consecutiveFailures, backoff)
+		}
 		
 		state.SetUpstreamStatus("Retrying")
 

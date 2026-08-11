@@ -35,6 +35,9 @@ services:
       # Timeout for stalled upstream reads (default is 0s / unlimited; uncomment and set e.g. 30s or 90s to tune down if needed)
       # - UPSTREAM_READ_TIMEOUT=30s
       
+      # Maximum consecutive worker retries (default is 0 / unlimited retries; uncomment to cap at e.g. 8)
+      # - MAX_UPSTREAM_RETRIES=0
+      
       # Maximum concurrent upstream downloader threads per VOD file
       - MAX_UPSTREAM_WORKERS=2
       

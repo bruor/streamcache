@@ -28,6 +28,7 @@ func TestMain(m *testing.M) {
 		SchedulerMinBlocks:      1,
 		MaxPrefetchTailBlocks:   10,
 		SchedulerMinTime:        20 * time.Millisecond,
+		MaxUpstreamRetries:      8, // Cap retries in unit test harness to prevent infinite background retry loops on closed mock servers
 	}
 
 	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
@@ -1137,6 +1138,16 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 	})
 
 	t.Run("consecutive_failures_exhaustion_exit", func(t *testing.T) {
+		GlobalConfig.Lock()
+		origRetries := GlobalConfig.MaxUpstreamRetries
+		GlobalConfig.MaxUpstreamRetries = 8
+		GlobalConfig.Unlock()
+		defer func() {
+			GlobalConfig.Lock()
+			GlobalConfig.MaxUpstreamRetries = origRetries
+			GlobalConfig.Unlock()
+		}()
+
 		GlobalRegistry.Lock.Lock()
 		GlobalRegistry.Files = make(map[string]*FileCacheState)
 		GlobalRegistry.Lock.Unlock()
