@@ -1384,20 +1384,20 @@
                 }
 
                 let originBadge = '';
+                let hydrationBadge = '';
                 if (conn.in_cache) {
                     originBadge = `<span class="session-origin-badge disk">DISK</span>`;
                 } else {
-                    let hydrationBadge = '';
+                    originBadge = `<span class="session-origin-badge cdn">CDN</span>`;
                     const fileData = fileStore[conn.key];
                     if (fileData && fileData.total_blocks > 0) {
                         const completed = calculateCompletedBlocks(fileData);
                         const percent = ((completed / fileData.total_blocks) * 100).toFixed(1);
                         const rawStatus = fileData.upstream_status || 'Downloading';
                         const statusLower = rawStatus.toLowerCase();
-                        let statusText = `${rawStatus} ${percent}%`;
-                        hydrationBadge = `<span class="download-badge ${statusLower}" style="font-size: 0.72rem; padding: 2px 7px; margin-left: 4px;">${statusText}</span>`;
+                        let badgeText = `${rawStatus} ${percent}%`;
+                        hydrationBadge = `<span class="download-badge ${statusLower}" style="font-size: 0.72rem; padding: 2px 7px;">${badgeText}</span>`;
                     }
-                    originBadge = `<span class="session-origin-badge cdn">CDN</span>${hydrationBadge}`;
                 }
 
                 let uaDisplay = conn.user_agent || "Unknown";
@@ -1428,7 +1428,10 @@
                             <span class="connection-client-id">${conn.id}${activeLabel}</span>
                             ${originBadge}
                         </div>
-                        <span class="connection-status-badge ${statusClass}">${statusText}</span>
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            ${hydrationBadge}
+                            <span class="connection-status-badge ${statusClass}">${statusText}</span>
+                        </div>
                     </div>
                     <div class="connection-grid">
                         <div class="connection-metric-card">
@@ -1444,7 +1447,7 @@
                             <span class="connection-metric-value">${durationStr}</span>
                         </div>
                         <div class="connection-metric-card">
-                            <span class="connection-metric-label">Current Offset</span>
+                            <span class="connection-metric-label">Playback Pos</span>
                             <span class="connection-metric-value">${formatBytes(conn.offset)}${percentageStr}</span>
                         </div>
                     </div>
