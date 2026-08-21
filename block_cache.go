@@ -103,6 +103,7 @@ type FileCacheState struct {
 	ActiveWorkers      []*Worker
 	WorkersLock        sync.Mutex
 	PendingTailPrefetchBlock int
+	Sniffed            bool
 }
 
 type ConnectionInfo struct {

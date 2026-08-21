@@ -33,6 +33,7 @@ func InitHTTPClient() {
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
+		ReadBufferSize:      512 * 1024, // 512KB read buffer for high-bandwidth 1Gbps+ streams
 		// Disable TLS certificate verification if required (IPTV providers sometimes use self-signed certs)
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -85,6 +86,9 @@ func (d *netDialer) DialContext(ctx context.Context, network, address string) (n
 	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024) // 2MB TCP receive window for 1Gbps+ BDP
 	}
 	return &timeoutConn{Conn: conn, readTimeout: GlobalConfig.GetUpstreamReadTimeout()}, nil
 }

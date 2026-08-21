@@ -16,6 +16,8 @@ services:
       
       # Block & Buffer Configs
       - BLOCK_SIZE=4MB
+      # Worker in-memory buffer in blocks (defaults to SCHEDULER_MIN_BLOCKS / 4 blocks = 16MB)
+      # - WORKER_BUFFER_BLOCKS=4
       # Set to true to disable Fadvise page cache purging (allows OS to buffer writes in RAM, speeding up slow NAS writes)
       # - DISABLE_FADVISE=true
       

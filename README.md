@@ -46,6 +46,7 @@ Streamcache is configured using environment variables. Default fallback values a
 | `CACHE_REVALIDATE_INTERVAL` | `1h` | Cache expiration age before forcing an HTTP revalidation probe to the source host. |
 | `ALLOWED_HOSTS` | *(empty)* | Optional comma-separated list of domain names (e.g. `cdn.example.com`) to restrict which upstreams can be proxied. |
 | `SCHEDULER_MIN_BLOCKS` | `4` | Minimum blocks to download before a worker can be pre-empted (protecting CDNs from connection thrashing). Set to `0` to disable. |
+| `WORKER_BUFFER_BLOCKS` | `4` (matches `SCHEDULER_MIN_BLOCKS`) | In-memory RAM buffer size per worker expressed in blocks (e.g. `4` blocks = 16MB buffer at 4MB block size). Defaults to `SCHEDULER_MIN_BLOCKS` with a floor of `1` block. |
 | `MAX_PREFETCH_TAILBLOCKS` | `10` | Maximum number of tail blocks to pre-fetch for non-optimized or unsupported media files (protecting upstream network). |
 | `SCHEDULER_MIN_TIME` | `2s` | Minimum duration to stream a block before switching targets. Set to `0` or `none` to disable. |
 | `UPSTREAM_READ_TIMEOUT` | `0s` (unlimited) | Read timeout for stalled upstream reads. Default is `0s` (unlimited/no timeout), allowing IPTV providers with pause/burst throttling to remain connected. Can be set to a duration (e.g. `30s`, `90s`) to tune down if needed. |

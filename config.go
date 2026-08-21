@@ -31,6 +31,7 @@ type Config struct {
 	UpstreamUserAgent        string
 	UpstreamUserAgentMode    string
 	MaxUpstreamRetries       int
+	WorkerBufferBlocks       int
 }
 
 func (c *Config) Lock() {
@@ -141,6 +142,31 @@ func (c *Config) GetSchedulerMinTime() time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.SchedulerMinTime
+}
+
+func (c *Config) GetWorkerBufferBlocks() int {
+	if c == nil {
+		return 4
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.WorkerBufferBlocks >= 1 {
+		return c.WorkerBufferBlocks
+	}
+	minBlocks := c.SchedulerMinBlocks
+	if minBlocks < 1 {
+		minBlocks = 1
+	}
+	return minBlocks
+}
+
+func (c *Config) GetWorkerBufferSize() int64 {
+	if c == nil {
+		return 16 * 1024 * 1024
+	}
+	blocks := int64(c.GetWorkerBufferBlocks())
+	blockSize := c.GetBlockSize()
+	return blocks * blockSize
 }
 
 func (c *Config) GetClientHydrationWait() time.Duration {
@@ -278,6 +304,7 @@ func LoadConfig() {
 		UpstreamUserAgent:       getEnv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 		UpstreamUserAgentMode:   getEnv("UPSTREAM_USER_AGENT_MODE", "smart"),
 		MaxUpstreamRetries:      getEnvInt("MAX_UPSTREAM_RETRIES", 0),
+		WorkerBufferBlocks:      getEnvInt("WORKER_BUFFER_BLOCKS", 0),
 	}
 
 	// Format port if missing colon
@@ -298,7 +325,7 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinBlocks=%d, MaxPrefetchTailBlocks=%d, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinBlocks=%d, WorkerBufferBlocks=%d, MaxPrefetchTailBlocks=%d, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.BlockSize/(1024*1024),
@@ -312,6 +339,7 @@ func LoadConfig() {
 		cfg.ProbeFailureCooldown,
 		cfg.ProbeTransientCooldown,
 		cfg.SchedulerMinBlocks,
+		cfg.GetWorkerBufferBlocks(),
 		cfg.MaxPrefetchTailBlocks,
 		cfg.GetUpstreamUserAgent(),
 		cfg.GetUpstreamUserAgentMode(),
