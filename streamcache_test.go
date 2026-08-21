@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -3045,6 +3046,101 @@ func TestThrottledStatusNetworkOnly(t *testing.T) {
 	}
 	if activeState.ZeroSpeedSec != 0 {
 		t.Errorf("Expected ZeroSpeedSec to be reset to 0 during commit, got %d", activeState.ZeroSpeedSec)
+	}
+}
+
+func TestActiveReaderDuringCommitAndRename(t *testing.T) {
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.BlockSize = 100
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.Unlock()
+	}()
+
+	// 300 bytes of recognizable test payload
+	testPayload := make([]byte, 300)
+	for i := range testPayload {
+		testPayload[i] = byte(i % 256)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "active_reader_test.mkv", time.Time{}, bytes.NewReader(testPayload))
+	}))
+	defer server.Close()
+
+	key := "active_reader_test.mkv"
+	state := &FileCacheState{
+		Key:         key,
+		URL:         server.URL,
+		Path:        filepath.Join(GlobalConfig.CacheDir, key),
+		PartPath:    filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		MetaPath:    filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		TotalSize:   300,
+		TotalBlocks: 3,
+		BlockStates: make([]int, 3),
+		Clients:     make(map[string]chan struct{}),
+		Starving:    make(map[string]int),
+		NotifyChan:  make(chan struct{}, 10),
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	defer cleanupAfterTest(t, state)
+
+	// Create reader and connect before hydration completes
+	req := httptest.NewRequest("GET", "/stream", nil)
+	reader := NewCacheReader(context.Background(), state, req)
+	defer reader.Close()
+
+	// Start coordinator to hydrate in background
+	StartCoordinator(state, nil)
+
+	// Read block 0 (first 100 bytes) while coordinator is running
+	buf0 := make([]byte, 100)
+	n0, err := reader.Read(buf0)
+	if err != nil || n0 != 100 {
+		t.Fatalf("Failed reading block 0 during hydration: n=%d, err=%v", n0, err)
+	}
+	if !bytes.Equal(buf0, testPayload[:100]) {
+		t.Fatalf("Block 0 content mismatch")
+	}
+
+	// Wait for coordinator to fully complete and commit/rename the file to final Path
+	for i := 0; i < 100; i++ {
+		state.Lock.Lock()
+		writerActive := state.WriterActive
+		state.Lock.Unlock()
+		if !writerActive && FileExists(state.Path) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !FileExists(state.Path) {
+		t.Fatalf("Expected file to be committed and renamed to %s, but not found", state.Path)
+	}
+
+	// Read remaining 200 bytes (blocks 1 and 2) AFTER the file was moved/renamed on disk
+	bufRest := make([]byte, 200)
+	nRest, err := reader.Read(bufRest)
+	if err != nil && err != io.EOF {
+		t.Fatalf("Failed reading blocks 1 & 2 after file move/rename: n=%d, err=%v", nRest, err)
+	}
+	if nRest != 200 {
+		t.Fatalf("Expected 200 bytes read after rename, got %d", nRest)
+	}
+	if !bytes.Equal(bufRest, testPayload[100:]) {
+		t.Fatalf("Blocks 1 & 2 content mismatch after rename")
 	}
 }
 
