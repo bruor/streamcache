@@ -766,7 +766,7 @@ func runDownloadWorker(
 					} else if !GlobalConfig.GetDisableFadvise() {
 						fd := file.Fd()
 						SyncFileRangeWrite(fd, prefetchStart, prefetchLength)
-						SyncFileRangeWaitAndEvict(fd, prefetchStart, prefetchLength)
+						FadviseDontNeed(fd, prefetchStart, prefetchLength)
 					}
 				}
 
@@ -830,7 +830,7 @@ func runDownloadWorker(
 
 	defer func() {
 		if !GlobalConfig.GetDisableFadvise() && prevBlockOffset >= 0 && ctx.Err() == nil {
-			SyncFileRangeWaitAndEvict(fd, prevBlockOffset, prevBlockLength)
+			FadviseDontNeed(fd, prevBlockOffset, prevBlockLength)
 		}
 	}()
 
@@ -1035,9 +1035,9 @@ func runDownloadWorker(
 			if !GlobalConfig.GetDisableFadvise() {
 				// 1. Asynchronously initiate writeout of the completed block
 				SyncFileRangeWrite(fd, blockStartOffset, blockLength)
-				// 2. Wait and evict the previous block from page cache
+				// 2. Mark previous block for page cache eviction
 				if prevBlockOffset >= 0 {
-					SyncFileRangeWaitAndEvict(fd, prevBlockOffset, prevBlockLength)
+					FadviseDontNeed(fd, prevBlockOffset, prevBlockLength)
 				}
 				prevBlockOffset = blockStartOffset
 				prevBlockLength = blockLength
@@ -1226,7 +1226,7 @@ func runInlineTailPrefetch(
 		} else if !GlobalConfig.GetDisableFadvise() {
 			fd := file.Fd()
 			SyncFileRangeWrite(fd, prefetchStart, prefetchLength)
-			SyncFileRangeWaitAndEvict(fd, prefetchStart, prefetchLength)
+			FadviseDontNeed(fd, prefetchStart, prefetchLength)
 		}
 	}
 

@@ -87,9 +87,6 @@ func (d *netDialer) DialContext(ctx context.Context, network, address string) (n
 	if err != nil {
 		return nil, err
 	}
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		_ = tcpConn.SetReadBuffer(2 * 1024 * 1024) // 2MB TCP receive window for 1Gbps+ BDP
-	}
 	return &timeoutConn{Conn: conn, readTimeout: GlobalConfig.GetUpstreamReadTimeout()}, nil
 }
 
