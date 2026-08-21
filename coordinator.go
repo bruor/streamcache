@@ -338,7 +338,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	// Main Coordinator Orchestration Loop
 	for {
 		// Sniff check for container optimization
-		sniffAndSchedulePrefetch(state, file, spawnPrefetchWorker)
+		sniffAndSchedulePrefetch(state, file)
 
 		// Check if fully completed
 		state.Lock.Lock()
@@ -380,7 +380,15 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		select {
 		case <-state.NotifyChan:
 			state.Lock.Lock()
-			
+			pendingTail := state.PendingTailPrefetchBlock
+			if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() > 1 {
+				state.PendingTailPrefetchBlock = -1
+				state.Lock.Unlock()
+				log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at block %d", pendingTail)
+				spawnPrefetchWorker(pendingTail)
+				state.Lock.Lock()
+			}
+
 			// If any active worker is currently pre-fetching index/metadata,
 			// suppress spawning of new workers and pre-emption to avoid race conditions.
 			isPreFetchingActive := false
@@ -1062,7 +1070,7 @@ func runDownloadWorker(
 			state.Lock.Unlock()
 
 			if currentBlock == 0 {
-				sniffAndSchedulePrefetch(state, file, nil)
+				sniffAndSchedulePrefetch(state, file)
 			}
 
 			state.Lock.Lock()
@@ -1263,7 +1271,7 @@ func runInlineTailPrefetch(
 	log.Printf("[Worker-%d] Inline tail pre-fetch finished. Resuming sequential stream.", w.id)
 }
 
-func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File, spawnPrefetchWorker func(int)) {
+func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 	state.Lock.Lock()
 	if state.Sniffed {
 		state.Lock.Unlock()
@@ -1366,21 +1374,12 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File, spawnPrefetc
 			state.Lock.Unlock()
 
 			if needPrefetch {
-				maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
-				if maxWorkers > 1 {
-					log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at block %d", tailStartBlock)
-					if spawnPrefetchWorker != nil {
-						spawnPrefetchWorker(tailStartBlock)
-					}
-				} else {
-					log.Printf("[Coord] Sniffed non-optimized container. MaxUpstreamWorkers=1: Queuing inline tail pre-fetch starting at block %d", tailStartBlock)
-					state.Lock.Lock()
-					state.PendingTailPrefetchBlock = tailStartBlock
-					state.Lock.Unlock()
-					select {
-					case state.NotifyChan <- struct{}{}:
-					default:
-					}
+				state.Lock.Lock()
+				state.PendingTailPrefetchBlock = tailStartBlock
+				state.Lock.Unlock()
+				select {
+				case state.NotifyChan <- struct{}{}:
+				default:
 				}
 			} else {
 				log.Printf("[Coord] Metadata tail blocks already cached. Skipping pre-fetch.")
