@@ -389,23 +389,6 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				state.Lock.Lock()
 			}
 
-			// If any active worker is currently pre-fetching index/metadata,
-			// suppress spawning of new workers and pre-emption to avoid race conditions.
-			isPreFetchingActive := false
-			state.WorkersLock.Lock()
-			for _, w := range state.ActiveWorkers {
-				if atomic.LoadInt32(&w.isPrefetching) == 1 {
-					isPreFetchingActive = true
-					break
-				}
-			}
-			state.WorkersLock.Unlock()
-
-			if isPreFetchingActive {
-				state.Lock.Unlock()
-				continue
-			}
-
 			// Find all starving blocks that are not completed or currently actively downloading
 			var starvingBlocks []int
 			for _, sb := range state.Starving {
@@ -552,7 +535,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								eligible = timeOk || bytesOk
 							}
 
-							if eligible {
+							if eligible && atomic.LoadInt32(&w.isPrefetching) == 0 {
 								var minDistanceToClient int64 = 1e18
 								for _, clientStarveBlock := range state.Starving {
 									dist := int64(clientStarveBlock - wCurrent)
