@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -763,8 +764,9 @@ func runDownloadWorker(
 						log.Printf("[Worker-%d] Prefetch file write error: %v", w.id, werr)
 						prefetchFailed = true
 					} else if !GlobalConfig.GetDisableFadvise() {
-						SyncFileRangeWrite(file.Fd(), prefetchStart, prefetchLength)
-						SyncFileRangeWaitAndEvict(file.Fd(), prefetchStart, prefetchLength)
+						fd := file.Fd()
+						SyncFileRangeWrite(fd, prefetchStart, prefetchLength)
+						SyncFileRangeWaitAndEvict(fd, prefetchStart, prefetchLength)
 					}
 				}
 
@@ -824,10 +826,11 @@ func runDownloadWorker(
 
 	var prevBlockOffset int64 = -1
 	var prevBlockLength int64 = 0
+	fd := file.Fd()
 
 	defer func() {
-		if !GlobalConfig.GetDisableFadvise() && prevBlockOffset >= 0 {
-			SyncFileRangeWaitAndEvict(file.Fd(), prevBlockOffset, prevBlockLength)
+		if !GlobalConfig.GetDisableFadvise() && prevBlockOffset >= 0 && ctx.Err() == nil {
+			SyncFileRangeWaitAndEvict(fd, prevBlockOffset, prevBlockLength)
 		}
 	}()
 
@@ -1022,7 +1025,8 @@ func runDownloadWorker(
 				}
 				state.Lock.Unlock()
 				closeConnection()
-				if handleFailure(false, "[Worker-%d] File write error at %d: %v", w.id, blockStartOffset, werr) {
+				isPermanent := ctx.Err() != nil || errors.Is(werr, os.ErrClosed)
+				if handleFailure(isPermanent, "[Worker-%d] File write error at %d: %v", w.id, blockStartOffset, werr) {
 					return
 				}
 				continue
@@ -1030,10 +1034,10 @@ func runDownloadWorker(
 
 			if !GlobalConfig.GetDisableFadvise() {
 				// 1. Asynchronously initiate writeout of the completed block
-				SyncFileRangeWrite(file.Fd(), blockStartOffset, blockLength)
+				SyncFileRangeWrite(fd, blockStartOffset, blockLength)
 				// 2. Wait and evict the previous block from page cache
 				if prevBlockOffset >= 0 {
-					SyncFileRangeWaitAndEvict(file.Fd(), prevBlockOffset, prevBlockLength)
+					SyncFileRangeWaitAndEvict(fd, prevBlockOffset, prevBlockLength)
 				}
 				prevBlockOffset = blockStartOffset
 				prevBlockLength = blockLength
@@ -1220,8 +1224,9 @@ func runInlineTailPrefetch(
 			log.Printf("[Worker-%d] Inline tail pre-fetch file write error: %v", w.id, werr)
 			prefetchFailed = true
 		} else if !GlobalConfig.GetDisableFadvise() {
-			SyncFileRangeWrite(file.Fd(), prefetchStart, prefetchLength)
-			SyncFileRangeWaitAndEvict(file.Fd(), prefetchStart, prefetchLength)
+			fd := file.Fd()
+			SyncFileRangeWrite(fd, prefetchStart, prefetchLength)
+			SyncFileRangeWaitAndEvict(fd, prefetchStart, prefetchLength)
 		}
 	}
 

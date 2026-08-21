@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,9 +94,7 @@ func TestOnDemandEviction(t *testing.T) {
 	defer cleanupAfterTest(t, nil)
 
 	// Clear registry size
-	GlobalRegistry.Lock.Lock()
-	GlobalRegistry.TotalCacheSize = 0
-	GlobalRegistry.Lock.Unlock()
+	atomic.StoreInt64(&GlobalRegistry.TotalCacheSize, 0)
 
 	// Create 4 mock files in cache folder
 	fileNames := []string{"a", "b", "c", "d"}
@@ -115,9 +114,7 @@ func TestOnDemandEviction(t *testing.T) {
 	}
 
 	// Set starting total size (4 files * 10 bytes = 40 bytes)
-	GlobalRegistry.Lock.Lock()
-	GlobalRegistry.TotalCacheSize = 40
-	GlobalRegistry.Lock.Unlock()
+	atomic.StoreInt64(&GlobalRegistry.TotalCacheSize, 40)
 
 	// Update Max Cache size limit to 25 bytes (triggers immediate eviction on next write/update)
 	GlobalConfig.Lock()
@@ -185,9 +182,7 @@ func TestRevalidateEvictsOldMediaFirst(t *testing.T) {
 	metaBytes, _ := json.Marshal(meta)
 	_ = os.WriteFile(metaPath, metaBytes, 0644)
 
-	GlobalRegistry.Lock.Lock()
-	GlobalRegistry.TotalCacheSize = 100
-	GlobalRegistry.Lock.Unlock()
+	atomic.StoreInt64(&GlobalRegistry.TotalCacheSize, 100)
 
 	// Change etag on server to simulate media content modification
 	etag = "etag-v2"
@@ -224,9 +219,7 @@ func TestRevalidateEvictsOldMediaFirst(t *testing.T) {
 	}
 
 	// TotalCacheSize should be reduced by 100
-	GlobalRegistry.Lock.RLock()
-	size := GlobalRegistry.TotalCacheSize
-	GlobalRegistry.Lock.RUnlock()
+	size := GlobalRegistry.GetTotalCacheSize()
 	if size != 0 {
 		t.Errorf("Expected TotalCacheSize to be 0 after old media eviction, got %d", size)
 	}
@@ -308,9 +301,9 @@ func TestDebouncedSchedulerTimeSlicing(t *testing.T) {
 		lock.Lock()
 		connCount++
 		lock.Unlock()
-		w.Header().Set("Content-Range", "bytes 0-4/500")
+		w.Header().Set("Content-Range", "bytes 0-99/500")
 		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write([]byte("12345"))
+		_, _ = w.Write(make([]byte, 100))
 	}))
 	defer server.Close()
 

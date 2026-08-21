@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -20,6 +21,8 @@ type CacheReader struct {
 	offset   int64
 	clientID string
 	ctx      context.Context
+	file     *os.File
+	fileMu   sync.Mutex
 }
 
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
@@ -87,7 +90,31 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 	return r
 }
 
+func (r *CacheReader) getFile() (*os.File, error) {
+	r.fileMu.Lock()
+	defer r.fileMu.Unlock()
+	if r.file != nil {
+		return r.file, nil
+	}
+	f, err := os.Open(r.state.PartPath)
+	if err != nil {
+		f, err = os.Open(r.state.Path)
+		if err != nil {
+			return nil, err
+		}
+	}
+	r.file = f
+	return r.file, nil
+}
+
 func (r *CacheReader) Close() error {
+	r.fileMu.Lock()
+	if r.file != nil {
+		_ = r.file.Close()
+		r.file = nil
+	}
+	r.fileMu.Unlock()
+
 	r.state.Lock.Lock()
 
 	// Clean up client channels
@@ -208,18 +235,10 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 
-	// Read directly from the file
-	r.state.Lock.Lock()
-	file := r.state.File
-	r.state.Lock.Unlock()
-
-	if file == nil {
-		// If coordinator closed it, read from final completed path
-		file, err = os.Open(r.state.Path)
-		if err != nil {
-			return 0, err
-		}
-		defer file.Close()
+	// Read directly from reader's independent file handle
+	file, err := r.getFile()
+	if err != nil {
+		return 0, err
 	}
 
 	n, err = file.ReadAt(p, off)

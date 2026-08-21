@@ -725,6 +725,10 @@ func (r *CacheRegistry) UpdateSize(delta int64) {
 	atomic.AddInt64(&r.TotalCacheSize, delta)
 }
 
+func (r *CacheRegistry) GetTotalCacheSize() int64 {
+	return atomic.LoadInt64(&r.TotalCacheSize)
+}
+
 func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 	r.Lock.Lock()
 	if r.Evicting {
