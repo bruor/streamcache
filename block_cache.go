@@ -716,14 +716,12 @@ func (r *CacheRegistry) LoadExistingCache() {
 		}
 	}
 
-	r.TotalCacheSize = totalSize
+	atomic.StoreInt64(&r.TotalCacheSize, totalSize)
 	log.Printf("[Registry] Scan complete. Initial Cache Size: %.2f GB", float64(totalSize)/(1024*1024*1024))
 }
 
 func (r *CacheRegistry) UpdateSize(delta int64) {
-	r.Lock.Lock()
-	r.TotalCacheSize += delta
-	r.Lock.Unlock()
+	atomic.AddInt64(&r.TotalCacheSize, delta)
 }
 
 func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
@@ -733,7 +731,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 		return
 	}
 
-	currentSize := r.TotalCacheSize
+	currentSize := atomic.LoadInt64(&r.TotalCacheSize)
 	cacheDir := GlobalConfig.GetCacheDir()
 
 	// Calculate how much space we need to free based on cache limit if incoming file is added
@@ -887,9 +885,7 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 		_ = os.Remove(file.Path)
 		_ = os.Remove(file.Path + ".json")
 
-		r.Lock.Lock()
-		r.TotalCacheSize -= file.Size
-		r.Lock.Unlock()
+		atomic.AddInt64(&r.TotalCacheSize, -file.Size)
 
 		freedBytes += file.Size
 		evictedCount++
@@ -903,9 +899,7 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 }
 
 func (r *CacheRegistry) GetTotalSize() int64 {
-	r.Lock.RLock()
-	defer r.Lock.RUnlock()
-	return r.TotalCacheSize
+	return atomic.LoadInt64(&r.TotalCacheSize)
 }
 
 func (r *CacheRegistry) getTotalSize() int64 {

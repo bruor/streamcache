@@ -167,62 +167,20 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		}
 
 		if isCompleted {
-			state.UpstreamStatus = "Committing"
 			state.Lock.Unlock()
+			state.SetUpstreamStatus("Committing")
 			log.Printf("[Coord] Committing completed cache file to disk: %s", state.Key)
-			state.SetUpstreamStatus("Completed")
-			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+
 			state.Lock.Lock()
-		} else {
-			state.UpstreamStatus = "Idle"
-		}
-
-		if isCompleted {
-			// Try to finalize immediately on completion
-			var immediateFinalize bool
-			if !FileExists(state.Path) {
-				// Unlock before performing OS operations and lock acquisitions
-				state.Lock.Unlock()
-				err := os.Rename(state.PartPath, state.Path)
-				if err == nil {
-					immediateFinalize = true
-					// Save final metadata JSON confirming completion
-					metaPath := state.Path + ".json"
-					meta := FileMeta{
-						URL:           state.URL,
-						TotalSize:     state.TotalSize,
-						ETag:          state.ETag,
-						LastModified:  state.LastModified,
-						LastValidated: time.Now().Unix(),
-						Completed:     true,
-					}
-					newBytes, err := json.Marshal(meta)
-					if err == nil {
-						_ = os.WriteFile(metaPath, newBytes, 0644)
-					}
-					GlobalRegistry.Lock.Lock()
-					delete(GlobalRegistry.Files, state.Key)
-					GlobalRegistry.Lock.Unlock()
-					log.Printf("[Coord] Cached file finalized immediately on coordinator completion: %s", state.Key)
-				} else {
-					log.Printf("[Coord] Immediate finalize rename failed (likely Windows lock, deferring): %v", err)
-				}
-				state.Lock.Lock() // Relock to finish the evaluation of deferred paths
-			}
-
-			var fileToClose *os.File
-			shouldFinalize := !immediateFinalize && len(state.Clients) == 0 && state.File != nil && !FileExists(state.Path)
-			if shouldFinalize {
-				fileToClose = state.File
-				state.File = nil
-			}
+			fileToClose := state.File
+			state.File = nil
 			state.Lock.Unlock()
 
 			if fileToClose != nil {
 				_ = fileToClose.Close()
 			}
 
-			if shouldFinalize {
+			if !FileExists(state.Path) {
 				err := os.Rename(state.PartPath, state.Path)
 				if err == nil {
 					// Save final metadata JSON confirming completion
@@ -239,12 +197,30 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 					if err == nil {
 						_ = os.WriteFile(metaPath, newBytes, 0644)
 					}
+					GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+					state.SetUpstreamStatus("Completed")
+
 					GlobalRegistry.Lock.Lock()
 					delete(GlobalRegistry.Files, state.Key)
 					GlobalRegistry.Lock.Unlock()
-					log.Printf("[Coord] Cached file finalized on coordinator exit (deferred): %s", state.Key)
+
+					if GlobalLogBroker != nil {
+						GlobalLogBroker.BroadcastStateUpdate()
+					}
+					log.Printf("[Coord] Cached file finalized and committed to disk: %s", state.Key)
 				} else {
-					log.Printf("[Coord] Error renaming cache file on coordinator exit (deferred): %v", err)
+					log.Printf("[Coord] Commit rename failed (likely Windows lock, deferring to reader exit): %v", err)
+					GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+					state.SetUpstreamStatus("Completed")
+				}
+			} else {
+				GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+				state.SetUpstreamStatus("Completed")
+				GlobalRegistry.Lock.Lock()
+				delete(GlobalRegistry.Files, state.Key)
+				GlobalRegistry.Lock.Unlock()
+				if GlobalLogBroker != nil {
+					GlobalLogBroker.BroadcastStateUpdate()
 				}
 			}
 		} else {
