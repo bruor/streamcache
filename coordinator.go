@@ -840,7 +840,7 @@ func runDownloadWorker(
 		// Check for pending inline tail pre-fetch when MaxUpstreamWorkers == 1
 		state.Lock.Lock()
 		pendingTail := state.PendingTailPrefetchBlock
-		if pendingTail > 0 {
+		if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() == 1 {
 			state.PendingTailPrefetchBlock = -1
 			if state.BlockStates[currentBlock] != BlockCompleted {
 				state.BlockStates[currentBlock] = BlockNotStarted
@@ -848,6 +848,8 @@ func runDownloadWorker(
 					GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{currentBlock}, BlockNotStarted)
 				}
 			}
+		} else {
+			pendingTail = -1
 		}
 		state.Lock.Unlock()
 

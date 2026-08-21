@@ -31,6 +31,7 @@ func TestMain(m *testing.M) {
 		MaxPrefetchTailBlocks:   10,
 		SchedulerMinTime:        20 * time.Millisecond,
 		MaxUpstreamRetries:      8, // Cap retries in unit test harness to prevent infinite background retry loops on closed mock servers
+		MaxUpstreamWorkers:      2,
 	}
 
 	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)

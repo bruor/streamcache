@@ -114,6 +114,9 @@ func (c *Config) GetMaxUpstreamWorkers() int {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if c.MaxUpstreamWorkers <= 0 {
+		return 2
+	}
 	return c.MaxUpstreamWorkers
 }
 
