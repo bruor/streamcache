@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -144,17 +143,17 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 				}
 
 				conn := &ClientConnection{
-					ID:            connID,
-					Key:           cacheFileName,
-					URL:           targetURL,
-					RemoteAddr:    remoteAddr,
-					UserAgent:     userAgent,
-					Offset:        startOffset,
-					StartOffset:   startOffset,
-					TotalSize:     totalSize,
-					StartTime:     time.Now().Unix(),
-					InCache:       true,
-					StarvingBlock: -1,
+					ID:             connID,
+					Key:            cacheFileName,
+					URL:            targetURL,
+					RemoteAddr:     remoteAddr,
+					UserAgent:      userAgent,
+					Offset:         startOffset,
+					StartOffset:    startOffset,
+					TotalSize:      totalSize,
+					StartTime:      time.Now().Unix(),
+					InCache:        true,
+					StarvingOffset: -1,
 				}
 				GlobalRegistry.RegisterConnection(connID, conn)
 				defer GlobalRegistry.UnregisterConnection(connID)
@@ -224,7 +223,6 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 		metaPath := cacheFilePath + ".json"
 		partPath := filepath.Join(GlobalConfig.GetTmpDir(), cacheFileName+".part")
-		totalBlocks := int(math.Ceil(float64(totalSize) / float64(GlobalConfig.GetBlockSize())))
 
 		// Double-check if another concurrent request created FileCacheState during probe/pre-evict
 		GlobalRegistry.Lock.Lock()
@@ -233,28 +231,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			state = existingState
 			GlobalRegistry.Lock.Unlock()
 		} else {
-			blockStates := make([]int, totalBlocks)
-
-			// Create FileCacheState
-			state = &FileCacheState{
-				Key:                      cacheFileName,
-				URL:                      targetURL,
-				Path:                     cacheFilePath,
-				PartPath:                 partPath,
-				MetaPath:                 metaPath,
-				TotalSize:                totalSize,
-				TotalBlocks:              totalBlocks,
-				BlockStates:              blockStates,
-				ContentType:              probeContentType,
-				ETag:                     etag,
-				LastModified:             lastMod,
-				LastValidated:            time.Now().Unix(),
-				Clients:                  make(map[string]chan struct{}),
-				Starving:                 make(map[string]int),
-				NotifyChan:               make(chan struct{}, 10),
-				UpstreamStatus:           "Idle",
-				PendingTailPrefetchBlock: -1,
-			}
+			state = NewFileCacheState(cacheFileName, targetURL, cacheFilePath, partPath, metaPath, probeContentType, etag, lastMod, totalSize)
 
 			// Save initial sparse metadata
 			meta := FileMeta{
@@ -265,7 +242,6 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 				LastModified:  lastMod,
 				LastValidated: time.Now().Unix(),
 				Completed:     false,
-				BlockStates:   blockStates,
 			}
 			metaBytes, _ := json.Marshal(meta)
 			_ = os.WriteFile(metaPath, metaBytes, 0644)
@@ -281,16 +257,8 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	reader := NewCacheReader(r.Context(), state, r)
 	defer reader.Close()
 
-	// Check if all blocks are already completed before starting coordinator
-	isCompleted := len(state.BlockStates) > 0
-	state.Lock.Lock()
-	for _, status := range state.BlockStates {
-		if status != BlockCompleted {
-			isCompleted = false
-			break
-		}
-	}
-	state.Lock.Unlock()
+	// Check if all bytes are already completed before starting coordinator
+	isCompleted := state.RangeSet.IsComplete(state.TotalSize)
 
 	// Spin up Upstream Download Coordinator if not active and file not fully completed
 	if !isCompleted {
@@ -319,61 +287,55 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	GlobalRegistry.Lock.RUnlock()
 
 	type debugFile struct {
-		Key          string         `json:"key"`
-		URL          string         `json:"url"`
-		TotalSize    int64          `json:"total_size"`
-		TotalBlocks  int            `json:"total_blocks"`
-		ActiveBlocks int            `json:"completed_blocks"`
-		ActiveWriter bool           `json:"active_writer"`
-		ActiveClients int           `json:"active_clients"`
-		StarvingList map[string]int `json:"starving_clients"`
+		Key             string           `json:"key"`
+		URL             string           `json:"url"`
+		TotalSize       int64            `json:"total_size"`
+		Ranges          [][]int64        `json:"ranges"`
+		DownloadedBytes int64            `json:"downloaded_bytes"`
+		ActiveWriter    bool             `json:"active_writer"`
+		ActiveClients   int              `json:"active_clients"`
+		StarvingList    map[string]int64 `json:"starving_clients"`
 	}
 
 	var activeFiles []debugFile
 	for _, fileState := range files {
 		fileState.Lock.Lock()
 		k := fileState.Key
-		completed := 0
-		for _, s := range fileState.BlockStates {
-			if s == BlockCompleted {
-				completed++
-			}
-		}
+		downloaded := fileState.RangeSet.TotalBytes()
+		isCompleted := fileState.RangeSet.IsComplete(fileState.TotalSize)
 
-		isCompleted := len(fileState.BlockStates) > 0 && completed == len(fileState.BlockStates)
 		if isCompleted && fileState.UpstreamStatus != "Committing" {
 			fileState.Lock.Unlock()
 			continue
 		}
 
-		starvingCopy := make(map[string]int, len(fileState.Starving))
-		for clientID, blockIdx := range fileState.Starving {
-			starvingCopy[clientID] = blockIdx
+		starvingCopy := make(map[string]int64, len(fileState.Starving))
+		for clientID, offset := range fileState.Starving {
+			starvingCopy[clientID] = offset
 		}
 
 		activeFiles = append(activeFiles, debugFile{
-			Key:           k,
-			URL:           fileState.URL,
-			TotalSize:     fileState.TotalSize,
-			TotalBlocks:   fileState.TotalBlocks,
-			ActiveBlocks:  completed,
-			ActiveWriter:  fileState.WriterActive,
-			ActiveClients: len(fileState.Clients),
-			StarvingList:  starvingCopy,
+			Key:             k,
+			URL:             fileState.URL,
+			TotalSize:       fileState.TotalSize,
+			Ranges:          fileState.RangeSet.ToSlices(),
+			DownloadedBytes: downloaded,
+			ActiveWriter:    fileState.WriterActive,
+			ActiveClients:   len(fileState.Clients),
+			StarvingList:    starvingCopy,
 		})
 		fileState.Lock.Unlock()
 	}
 
-
 	// Sort active files from most complete to least complete (descending)
 	sort.Slice(activeFiles, func(i, j int) bool {
 		compI := 0.0
-		if activeFiles[i].TotalBlocks > 0 {
-			compI = float64(activeFiles[i].ActiveBlocks) / float64(activeFiles[i].TotalBlocks)
+		if activeFiles[i].TotalSize > 0 {
+			compI = float64(activeFiles[i].DownloadedBytes) / float64(activeFiles[i].TotalSize)
 		}
 		compJ := 0.0
-		if activeFiles[j].TotalBlocks > 0 {
-			compJ = float64(activeFiles[j].ActiveBlocks) / float64(activeFiles[j].TotalBlocks)
+		if activeFiles[j].TotalSize > 0 {
+			compJ = float64(activeFiles[j].DownloadedBytes) / float64(activeFiles[j].TotalSize)
 		}
 		if compI == compJ {
 			return activeFiles[i].Key < activeFiles[j].Key
@@ -585,6 +547,3 @@ func getMimeTypeByExt(ext string) string {
 		return "video/x-matroska"
 	}
 }
-
-
-

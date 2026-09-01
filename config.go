@@ -10,28 +10,23 @@ import (
 )
 
 type Config struct {
-	mu                       sync.RWMutex
-	Port                     string
-	CacheDir                 string
-	TmpDir                   string
-	BlockSize                int64
-	CacheMaxBytes            int64
-	MinDiskFreeBytes         int64
-	CacheRevalidateInterval  time.Duration
-	AllowedHosts             []string
-	SchedulerMinBlocks       int
-	MaxPrefetchTailBlocks    int
-	SchedulerMinTime         time.Duration
-	DisableFadvise           bool
-	UpstreamReadTimeout      time.Duration
-	MaxUpstreamWorkers       int
-	ClientHydrationWait      time.Duration
-	ProbeFailureCooldown     time.Duration
-	ProbeTransientCooldown   time.Duration
-	UpstreamUserAgent        string
-	UpstreamUserAgentMode    string
-	MaxUpstreamRetries       int
-	WorkerBufferBlocks       int
+	mu                      sync.RWMutex
+	Port                    string
+	CacheDir                string
+	TmpDir                  string
+	CacheMaxBytes           int64
+	MinDiskFreeBytes        int64
+	CacheRevalidateInterval time.Duration
+	AllowedHosts            []string
+	SchedulerMinTime        time.Duration
+	UpstreamReadTimeout     time.Duration
+	MaxUpstreamWorkers      int
+	ClientHydrationWait     time.Duration
+	ProbeFailureCooldown    time.Duration
+	ProbeTransientCooldown  time.Duration
+	UpstreamUserAgent       string
+	UpstreamUserAgentMode   string
+	MaxUpstreamRetries      int
 }
 
 func (c *Config) Lock() {
@@ -56,15 +51,6 @@ func (c *Config) RUnlock() {
 	if c != nil {
 		c.mu.RUnlock()
 	}
-}
-
-func (c *Config) GetBlockSize() int64 {
-	if c == nil {
-		return 4 * 1024 * 1024
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.BlockSize
 }
 
 func (c *Config) GetPort() string {
@@ -120,24 +106,6 @@ func (c *Config) GetMaxUpstreamWorkers() int {
 	return c.MaxUpstreamWorkers
 }
 
-func (c *Config) GetMaxPrefetchTailBlocks() int {
-	if c == nil {
-		return 10
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.MaxPrefetchTailBlocks
-}
-
-func (c *Config) GetSchedulerMinBlocks() int {
-	if c == nil {
-		return 4
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.SchedulerMinBlocks
-}
-
 func (c *Config) GetSchedulerMinTime() time.Duration {
 	if c == nil {
 		return 2 * time.Second
@@ -147,31 +115,6 @@ func (c *Config) GetSchedulerMinTime() time.Duration {
 	return c.SchedulerMinTime
 }
 
-func (c *Config) GetWorkerBufferBlocks() int {
-	if c == nil {
-		return 4
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.WorkerBufferBlocks >= 1 {
-		return c.WorkerBufferBlocks
-	}
-	minBlocks := c.SchedulerMinBlocks
-	if minBlocks < 1 {
-		minBlocks = 1
-	}
-	return minBlocks
-}
-
-func (c *Config) GetWorkerBufferSize() int64 {
-	if c == nil {
-		return 16 * 1024 * 1024
-	}
-	blocks := int64(c.GetWorkerBufferBlocks())
-	blockSize := c.GetBlockSize()
-	return blocks * blockSize
-}
-
 func (c *Config) GetClientHydrationWait() time.Duration {
 	if c == nil {
 		return 2 * time.Second
@@ -179,15 +122,6 @@ func (c *Config) GetClientHydrationWait() time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.ClientHydrationWait
-}
-
-func (c *Config) GetDisableFadvise() bool {
-	if c == nil {
-		return false
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.DisableFadvise
 }
 
 func (c *Config) GetUpstreamReadTimeout() time.Duration {
@@ -291,14 +225,10 @@ func LoadConfig() {
 		Port:                    getEnv("PORT", ":8080"),
 		CacheDir:                getEnv("CACHE_DIR", "./cache/files"),
 		TmpDir:                  getEnv("TMP_DIR", "./cache/tmp"),
-		BlockSize:               getEnvSize("BLOCK_SIZE", 4*1024*1024), // 4MB
-		CacheMaxBytes:           getEnvSize("CACHE_MAX_BYTES", 50*1024*1024*1024), // 50GB
+		CacheMaxBytes:           getEnvSize("CACHE_MAX_BYTES", 50*1024*1024*1024),     // 50GB
 		MinDiskFreeBytes:        getEnvSize("MIN_DISK_FREE_BYTES", 10*1024*1024*1024), // 10GB
 		CacheRevalidateInterval: getEnvDuration("CACHE_REVALIDATE_INTERVAL", 1*time.Hour),
-		SchedulerMinBlocks:      getEnvInt("SCHEDULER_MIN_BLOCKS", 4), // 4 blocks (16MB default)
-		MaxPrefetchTailBlocks:   getEnvInt("MAX_PREFETCH_TAILBLOCKS", 10), // Max 10 blocks (40MB default)
 		SchedulerMinTime:        getEnvDuration("SCHEDULER_MIN_TIME", 2*time.Second),
-		DisableFadvise:          getEnvBool("DISABLE_FADVISE", false),
 		UpstreamReadTimeout:     getEnvDuration("UPSTREAM_READ_TIMEOUT", 0),
 		MaxUpstreamWorkers:      getEnvInt("MAX_UPSTREAM_WORKERS", 2),
 		ClientHydrationWait:     getEnvDuration("CLIENT_HYDRATION_WAIT", 2*time.Second),
@@ -307,7 +237,6 @@ func LoadConfig() {
 		UpstreamUserAgent:       getEnv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 		UpstreamUserAgentMode:   getEnv("UPSTREAM_USER_AGENT_MODE", "smart"),
 		MaxUpstreamRetries:      getEnvInt("MAX_UPSTREAM_RETRIES", 0),
-		WorkerBufferBlocks:      getEnvInt("WORKER_BUFFER_BLOCKS", 0),
 	}
 
 	// Format port if missing colon
@@ -328,22 +257,18 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, BlockSize=%dMB, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, DisableFadvise=%t, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinBlocks=%d, WorkerBufferBlocks=%d, MaxPrefetchTailBlocks=%d, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
 		cfg.Port,
 		cfg.CacheDir,
-		cfg.BlockSize/(1024*1024),
 		cfg.CacheMaxBytes/(1024*1024*1024),
 		cfg.MinDiskFreeBytes/(1024*1024*1024),
 		cfg.UpstreamReadTimeout,
 		cfg.MaxUpstreamRetries,
-		cfg.DisableFadvise,
 		cfg.MaxUpstreamWorkers,
 		cfg.ClientHydrationWait,
 		cfg.ProbeFailureCooldown,
 		cfg.ProbeTransientCooldown,
-		cfg.SchedulerMinBlocks,
-		cfg.GetWorkerBufferBlocks(),
-		cfg.MaxPrefetchTailBlocks,
+		cfg.SchedulerMinTime,
 		cfg.GetUpstreamUserAgent(),
 		cfg.GetUpstreamUserAgentMode(),
 	)

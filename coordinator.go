@@ -43,11 +43,6 @@ func CancelCoordinator(state *FileCacheState) {
 	cancel := state.Cancel
 	state.Cancel = nil
 	state.UpstreamStatus = "Cancelled"
-	for i, st := range state.BlockStates {
-		if st == BlockDownloading {
-			state.BlockStates[i] = BlockNotStarted
-		}
-	}
 	clientsCount := len(state.Clients)
 	fileToClose := state.File
 	state.File = nil
@@ -58,7 +53,7 @@ func CancelCoordinator(state *FileCacheState) {
 	state.Lock.Unlock()
 
 	if GlobalLogBroker != nil {
-		go GlobalLogBroker.BroadcastStateUpdate()
+		GlobalLogBroker.BroadcastStateUpdate()
 	}
 
 	if cancel != nil {
@@ -98,14 +93,13 @@ func CancelCoordinator(state *FileCacheState) {
 
 type Worker struct {
 	id                int
-	startBlock        int
+	startOffset       int64
 	cancel            context.CancelFunc
-	currentBlock      int
-	offset            int64 // guarded atomically
+	currentOffset     int64 // guarded atomically
 	speed             int64 // estimated speed (bytes/sec)
 	connStartTimeNano int64 // Unix nano timestamp of connection start, guarded atomically
-	connBytesWritten   int64 // bytes read on this connection, guarded atomically
-	isPrefetching     int32 // 1 if prefetching last blocks (metadata), 0 otherwise, guarded atomically
+	connBytesWritten  int64 // bytes read on this connection, guarded atomically
+	isPrefetching     int32 // 1 if prefetching tail metadata, 0 otherwise, guarded atomically
 	isPrefetchHelper  bool
 }
 
@@ -152,19 +146,12 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		state.Lock.Lock()
 		state.Cancel = nil
 
-		// Wake up any client readers waiting on block updates
+		// Wake up any client readers waiting on data
 		for _, ch := range state.Clients {
 			safeSignal(ch)
 		}
 
-		// We check if all blocks are completed to ensure we only finalize fully completed files.
-		isCompleted := len(state.BlockStates) > 0
-		for _, status := range state.BlockStates {
-			if status != BlockCompleted {
-				isCompleted = false
-				break
-			}
-		}
+		isCompleted := state.RangeSet.IsComplete(state.TotalSize)
 
 		if isCompleted {
 			state.Lock.Unlock()
@@ -188,6 +175,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 					meta := FileMeta{
 						URL:           state.URL,
 						TotalSize:     state.TotalSize,
+						ContentType:   state.ContentType,
 						ETag:          state.ETag,
 						LastModified:  state.LastModified,
 						LastValidated: time.Now().Unix(),
@@ -224,12 +212,6 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				}
 			}
 		} else {
-			// Incomplete download (state.Lock is already held from line 138)
-			for i, st := range state.BlockStates {
-				if st == BlockDownloading {
-					state.BlockStates[i] = BlockNotStarted
-				}
-			}
 			var fileToClose *os.File
 			shouldCleanUpIncomplete := len(state.Clients) == 0
 			if shouldCleanUpIncomplete {
@@ -279,31 +261,31 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		}
 	}
 
-	spawnWorker := func(startBlock int) {
+	spawnWorker := func(startOffset int64) {
 		state.WorkersLock.Lock()
 		defer state.WorkersLock.Unlock()
 		workerIdGen++
 		wCtx, wCancel := context.WithCancel(parentCtx)
 		w := &Worker{
-			id:           workerIdGen,
-			startBlock:   startBlock,
-			cancel:       wCancel,
-			currentBlock: startBlock,
+			id:            workerIdGen,
+			startOffset:   startOffset,
+			cancel:        wCancel,
+			currentOffset: startOffset,
 		}
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, removeWorker, parentCancel)
 	}
 
-	spawnPrefetchWorker := func(startBlock int) {
+	spawnPrefetchWorker := func(startOffset int64) {
 		state.WorkersLock.Lock()
 		defer state.WorkersLock.Unlock()
 		workerIdGen++
 		wCtx, wCancel := context.WithCancel(parentCtx)
 		w := &Worker{
 			id:               workerIdGen,
-			startBlock:       startBlock,
+			startOffset:      startOffset,
 			cancel:           wCancel,
-			currentBlock:     startBlock,
+			currentOffset:    startOffset,
 			isPrefetchHelper: true,
 		}
 		atomic.StoreInt32(&w.isPrefetching, 1)
@@ -313,26 +295,23 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 	// Initial scan to start worker(s)
 	state.Lock.Lock()
-	initialTargetBlock := -1
-	for _, starvingBlock := range state.Starving {
-		if state.BlockStates[starvingBlock] != BlockCompleted {
-			initialTargetBlock = starvingBlock
+	var initialTargetOffset int64 = -1
+	for _, starvingOffset := range state.Starving {
+		if !state.RangeSet.Contains(starvingOffset) {
+			initialTargetOffset = starvingOffset
 			break
 		}
 	}
-	if initialTargetBlock == -1 {
-		// Start at first uncompleted block
-		for i, status := range state.BlockStates {
-			if status != BlockCompleted {
-				initialTargetBlock = i
-				break
-			}
+	if initialTargetOffset == -1 {
+		gapStart, _, found := state.RangeSet.FindNextGap(0, state.TotalSize)
+		if found {
+			initialTargetOffset = gapStart
 		}
 	}
 	state.Lock.Unlock()
 
-	if initialTargetBlock != -1 {
-		spawnWorker(initialTargetBlock)
+	if initialTargetOffset != -1 {
+		spawnWorker(initialTargetOffset)
 	}
 
 	// Main Coordinator Orchestration Loop
@@ -341,63 +320,44 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		sniffAndSchedulePrefetch(state, file)
 
 		// Check if fully completed
-		state.Lock.Lock()
-		isCompleted := len(state.BlockStates) > 0
-		for _, status := range state.BlockStates {
-			if status != BlockCompleted {
-				isCompleted = false
-				break
-			}
-		}
-		state.Lock.Unlock()
-		
-		if isCompleted {
+		if state.RangeSet.IsComplete(state.TotalSize) {
 			break
 		}
 
-		// Keep-alive check: if no workers are running, start one
+		// Keep-alive check: if no workers are running, start one at first gap
 		state.WorkersLock.Lock()
 		activeCount := len(state.ActiveWorkers)
 		state.WorkersLock.Unlock()
-		
+
 		if activeCount == 0 {
-			state.Lock.Lock()
-			nextUncompletedBlock := -1
-			for i, status := range state.BlockStates {
-				if status != BlockCompleted {
-					nextUncompletedBlock = i
-					break
-				}
-			}
-			state.Lock.Unlock()
-			
-			if nextUncompletedBlock != -1 {
-				log.Printf("[Coord] No active workers but hydration incomplete. Spawning worker at block %d", nextUncompletedBlock)
-				spawnWorker(nextUncompletedBlock)
+			gapStart, _, found := state.RangeSet.FindNextGap(0, state.TotalSize)
+			if found {
+				log.Printf("[Coord] No active workers but hydration incomplete. Spawning worker at offset %d", gapStart)
+				spawnWorker(gapStart)
 			}
 		}
 
 		select {
 		case <-state.NotifyChan:
 			state.Lock.Lock()
-			pendingTail := state.PendingTailPrefetchBlock
+			pendingTail := state.PendingTailPrefetchOffset
 			if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() > 1 {
-				state.PendingTailPrefetchBlock = -1
+				state.PendingTailPrefetchOffset = -1
 				state.Lock.Unlock()
-				log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at block %d", pendingTail)
+				log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at offset %d", pendingTail)
 				spawnPrefetchWorker(pendingTail)
 				state.Lock.Lock()
 			}
 
-			// Find all starving blocks that are not completed or currently actively downloading
-			var starvingBlocks []int
+			// Find all starving offsets that are not covered
+			var starvingOffsets []int64
 			for _, sb := range state.Starving {
-				if state.BlockStates[sb] != BlockCompleted {
-					// Check if any active worker is currently downloading this block
+				if !state.RangeSet.Contains(sb) {
 					isBeingDownloaded := false
 					state.WorkersLock.Lock()
 					for _, w := range state.ActiveWorkers {
-						if w.currentBlock == sb {
+						wOff := atomic.LoadInt64(&w.currentOffset)
+						if wOff <= sb && sb-wOff <= 512*1024 {
 							isBeingDownloaded = true
 							break
 						}
@@ -406,62 +366,45 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 					if !isBeingDownloaded {
 						alreadyInList := false
-						for _, b := range starvingBlocks {
-							if b == sb {
+						for _, off := range starvingOffsets {
+							if off == sb {
 								alreadyInList = true
 								break
 							}
 						}
 						if !alreadyInList {
-							starvingBlocks = append(starvingBlocks, sb)
+							starvingOffsets = append(starvingOffsets, sb)
 						}
 					}
 				}
 			}
-			
-			if len(starvingBlocks) > 0 {
-				// For each starvation target, decide whether to wait (Hydration Wait Time) or spawn/preempt
-				for _, sb := range starvingBlocks {
+
+			if len(starvingOffsets) > 0 {
+				for _, sb := range starvingOffsets {
 					suppressed := false
 					state.WorkersLock.Lock()
 					for _, w := range state.ActiveWorkers {
-						wCurrent := w.currentBlock
-						if wCurrent < 0 {
-							continue
-						}
+						wCurrent := atomic.LoadInt64(&w.currentOffset)
 
-						// 1. If the worker is already downloading sb, or is about to download sb next
-						if wCurrent == sb || wCurrent+1 == sb {
-							log.Printf("[Coord] Client Hydration Wait active for block %d (worker %d is at block %d). Suppressing connection jump.", 
-								sb, w.id, wCurrent)
+						// 1. If worker is streaming within 512KB ahead/behind
+						if wCurrent <= sb && sb-wCurrent <= 512*1024 {
+							log.Printf("[Coord] Client Hydration Wait active for offset %d (worker %d is at %d). Suppressing jump.", sb, w.id, wCurrent)
 							suppressed = true
 							break
 						}
 
-						// If the worker is currently pre-fetching tail blocks inline and sb is within the tail range:
+						// If worker is prefetching tail metadata and target is within tail range
 						if atomic.LoadInt32(&w.isPrefetching) == 1 && sb >= wCurrent {
-							log.Printf("[Coord] Worker %d is pre-fetching tail blocks (at %d, client starving at %d). Suppressing pre-emption.", 
-								w.id, wCurrent, sb)
+							log.Printf("[Coord] Worker %d is pre-fetching tail metadata (at %d, client starving at %d). Suppressing pre-emption.", w.id, wCurrent, sb)
 							suppressed = true
 							break
 						}
 
-						// 2. If the worker is further behind, check if it will reach sb sequentially
+						// 2. Sequential catch-up ETA calculation
 						if wCurrent < sb {
-							// Check if there are any completed blocks in between
-							hasCompletedBlockInPath := false
-							for b := wCurrent + 1; b < sb; b++ {
-								if state.BlockStates[b] == BlockCompleted {
-									hasCompletedBlockInPath = true
-									break
-								}
-							}
-
-							if !hasCompletedBlockInPath {
-								wOffset := atomic.LoadInt64(&w.offset)
+							gapStart, _, found := state.RangeSet.FindNextGap(wCurrent, sb)
+							if !found || gapStart == wCurrent {
 								wSpeed := atomic.LoadInt64(&w.speed)
-
-								// Estimate speed dynamically if not set yet
 								if wSpeed == 0 {
 									connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
 									connBytes := atomic.LoadInt64(&w.connBytesWritten)
@@ -474,19 +417,14 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								}
 
 								if wSpeed > 0 {
-									blockSize := GlobalConfig.GetBlockSize()
 									hydrationWait := GlobalConfig.GetClientHydrationWait()
-									targetOffset := int64(sb) * blockSize
-									if wOffset <= targetOffset {
-										bytesRemaining := (int64(sb)+1)*blockSize - wOffset
-										eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
-										if eta < hydrationWait {
-											log.Printf("[Coord] Client Hydration Wait active for block %d (ETA %.2fs < threshold %s). Suppressing connection jump.", 
-												sb, eta.Seconds(), hydrationWait)
-											suppressed = true
-											break
-										}
-										}
+									bytesRemaining := sb - wCurrent
+									eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
+									if eta < hydrationWait {
+										log.Printf("[Coord] Client Hydration Wait active for offset %d (ETA %.2fs < threshold %s). Suppressing connection jump.", sb, eta.Seconds(), hydrationWait)
+										suppressed = true
+										break
+									}
 								}
 							}
 						}
@@ -503,42 +441,30 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 					maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
 					if activeCount < maxWorkers {
-						log.Printf("[Coord] Spawning new worker starting at starving block %d (Active: %d/%d)", 
-							sb, activeCount+1, maxWorkers)
+						log.Printf("[Coord] Spawning new worker starting at starving offset %d (Active: %d/%d)", sb, activeCount+1, maxWorkers)
 						spawnWorker(sb)
 					} else {
 						// Worker limit reached. Find furthest worker to pre-empt
 						state.WorkersLock.Lock()
 						var workerToPreempt *Worker
 						maxDistance := int64(-1)
-						
+
 						for _, w := range state.ActiveWorkers {
-							wCurrent := w.currentBlock
-							
-							// Check debouncer always to protect CDN from connection thrashing
+							wCurrent := atomic.LoadInt64(&w.currentOffset)
+
 							connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
-							connBytes := atomic.LoadInt64(&w.connBytesWritten)
 							var elapsed time.Duration
 							if connStartNano > 0 {
 								elapsed = time.Since(time.Unix(0, connStartNano))
 							}
-							
+
 							minTime := GlobalConfig.GetSchedulerMinTime()
-							minBlocks := GlobalConfig.GetSchedulerMinBlocks()
-							blockSize := GlobalConfig.GetBlockSize()
-							eligible := false
-							if minTime <= 0 && minBlocks <= 0 {
-								eligible = true
-							} else {
-								timeOk := minTime > 0 && elapsed >= minTime
-								bytesOk := minBlocks > 0 && connBytes >= int64(minBlocks)*blockSize
-								eligible = timeOk || bytesOk
-							}
+							eligible := minTime <= 0 || elapsed >= minTime
 
 							if eligible && atomic.LoadInt32(&w.isPrefetching) == 0 {
 								var minDistanceToClient int64 = 1e18
-								for _, clientStarveBlock := range state.Starving {
-									dist := int64(clientStarveBlock - wCurrent)
+								for _, clientStarveOffset := range state.Starving {
+									dist := clientStarveOffset - wCurrent
 									if dist < 0 {
 										dist = -dist
 									}
@@ -552,13 +478,12 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								}
 							}
 						}
-						
+
 						if workerToPreempt != nil {
-							log.Printf("[Coord] Pre-empting worker %d (at block %d) to switch to starving block %d", 
-								workerToPreempt.id, workerToPreempt.currentBlock, sb)
+							log.Printf("[Coord] Pre-empting worker %d (at offset %d) to switch to starving offset %d",
+								workerToPreempt.id, atomic.LoadInt64(&workerToPreempt.currentOffset), sb)
 							workerToPreempt.cancel()
-							
-							// Remove from ActiveWorkers slice immediately to prevent reuse
+
 							for i, aw := range state.ActiveWorkers {
 								if aw.id == workerToPreempt.id {
 									state.ActiveWorkers = append(state.ActiveWorkers[:i], state.ActiveWorkers[i+1:]...)
@@ -566,7 +491,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								}
 							}
 							state.WorkersLock.Unlock()
-							
+
 							spawnWorker(sb)
 						} else {
 							state.WorkersLock.Unlock()
@@ -592,12 +517,12 @@ func runDownloadWorker(
 	parentCancel context.CancelFunc,
 ) {
 	defer onExit(w)
-	log.Printf("[Worker-%d] Starting background downloader at block %d", w.id, w.startBlock)
+	log.Printf("[Worker-%d] Starting background downloader at offset %d", w.id, w.startOffset)
 
 	consecutiveFailures := 0
 	backoff := 2 * time.Second
-	currentBlock := w.startBlock
-	
+	currentOffset := w.startOffset
+
 	handleFailure := func(isPermanent bool, errFormat string, args ...interface{}) bool {
 		if ctx.Err() != nil {
 			log.Printf("[Worker-%d] Context canceled. Exiting worker.", w.id)
@@ -609,7 +534,7 @@ func runDownloadWorker(
 			parentCancel()
 			return true
 		}
-		
+
 		select {
 		case <-ctx.Done():
 			return true
@@ -620,23 +545,23 @@ func runDownloadWorker(
 		maxRetries := GlobalConfig.GetMaxUpstreamRetries()
 		if maxRetries > 0 && consecutiveFailures >= maxRetries {
 			log.Printf("[Worker-%d] Maximum consecutive failures reached (%d/%d). Exiting worker.", w.id, consecutiveFailures, maxRetries)
-			
+
 			state.WorkersLock.Lock()
 			activeCount := len(state.ActiveWorkers)
 			state.WorkersLock.Unlock()
-			
+
 			if activeCount <= 1 {
 				parentCancel()
 			}
 			return true
 		}
-		
+
 		if maxRetries > 0 {
 			log.Printf("[Worker-%d] Retry %d/%d. Sleeping %s before retrying...", w.id, consecutiveFailures, maxRetries, backoff)
 		} else {
 			log.Printf("[Worker-%d] Retry %d (unlimited retries). Sleeping %s before retrying...", w.id, consecutiveFailures, backoff)
 		}
-		
+
 		state.SetUpstreamStatus("Retrying")
 
 		coordinatorSleepMu.RLock()
@@ -684,170 +609,31 @@ func runDownloadWorker(
 	}
 	defer closeConnection()
 
-	if w.isPrefetchHelper {
-		blockSize := GlobalConfig.GetBlockSize()
-		prefetchStart := int64(w.startBlock) * blockSize
-		prefetchLength := state.TotalSize - prefetchStart
-
-		log.Printf("[Worker-%d] Parallel Pre-fetch Helper: Grabbing last %d bytes starting at block %d", w.id, prefetchLength, w.startBlock)
-
-		req, err := http.NewRequestWithContext(ctx, "GET", state.URL, nil)
-		if err == nil {
-			rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
-			req.Header.Set("Range", rangeHeader)
-			CopySafeHeaders(initialHeader, req.Header)
-
-			state.SetUpstreamStatus("Connecting")
-
-			resp, rerr := UpstreamHTTPClient.Do(req)
-			if rerr == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
-				state.SetUpstreamStatus("Downloading")
-				state.Lock.Lock()
-				var downloadingBlocks []int
-				for b := w.startBlock; b < state.TotalBlocks; b++ {
-					if state.BlockStates[b] != BlockCompleted {
-						state.BlockStates[b] = BlockDownloading
-						downloadingBlocks = append(downloadingBlocks, b)
-					}
-				}
-				if len(downloadingBlocks) > 0 && GlobalLogBroker != nil {
-					GlobalLogBroker.BroadcastBlockUpdate(state.Key, downloadingBlocks, BlockDownloading)
-				}
-				state.Lock.Unlock()
-
-				prefetchBuffer := make([]byte, prefetchLength)
-				bytesRead := int64(0)
-				prefetchFailed := false
-
-				for bytesRead < prefetchLength {
-					select {
-					case <-ctx.Done():
-						prefetchFailed = true
-						break
-					default:
-					}
-					if prefetchFailed {
-						break
-					}
-
-					n, readErr := resp.Body.Read(prefetchBuffer[bytesRead:])
-					if n > 0 {
-						bytesRead += int64(n)
-
-						atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
-						atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
-						GlobalRegistry.UpdateSize(int64(n))
-					}
-
-					if readErr != nil {
-						if bytesRead < prefetchLength {
-							log.Printf("[Worker-%d] Prefetch read error: %v", w.id, readErr)
-							prefetchFailed = true
-						}
-						break
-					}
-				}
-				_ = resp.Body.Close()
-
-				if bytesRead == prefetchLength {
-					_, werr := file.WriteAt(prefetchBuffer, prefetchStart)
-					if werr != nil {
-						log.Printf("[Worker-%d] Prefetch file write error: %v", w.id, werr)
-						prefetchFailed = true
-					} else if !GlobalConfig.GetDisableFadvise() {
-						fd := file.Fd()
-						SyncFileRangeWrite(fd, prefetchStart, prefetchLength)
-						FadviseDontNeed(fd, prefetchStart, prefetchLength)
-					}
-				}
-
-				state.Lock.Lock()
-				for b := w.startBlock; b < state.TotalBlocks; b++ {
-					bStart := int64(b) * blockSize
-					bEnd := bStart + blockSize
-					if bEnd > state.TotalSize {
-						bEnd = state.TotalSize
-					}
-					if prefetchStart+bytesRead >= bEnd && !prefetchFailed {
-						state.BlockStates[b] = BlockCompleted
-					} else {
-						if state.BlockStates[b] != BlockCompleted {
-							state.BlockStates[b] = BlockNotStarted
-						}
-					}
-				}
-				if !prefetchFailed && GlobalLogBroker != nil {
-					var completedBlocks []int
-					for b := w.startBlock; b < state.TotalBlocks; b++ {
-						completedBlocks = append(completedBlocks, b)
-					}
-					GlobalLogBroker.BroadcastBlockUpdate(state.Key, completedBlocks, BlockCompleted)
-				}
-				for _, ch := range state.Clients {
-					safeSignal(ch)
-				}
-				state.Lock.Unlock()
-			} else {
-				if rerr == nil {
-					_ = resp.Body.Close()
-				}
-				log.Printf("[Worker-%d] Prefetch request failed. Status: %v, err: %v", w.id, resp, rerr)
-
-				state.Lock.Lock()
-				for b := w.startBlock; b < state.TotalBlocks; b++ {
-					if state.BlockStates[b] != BlockCompleted {
-						state.BlockStates[b] = BlockNotStarted
-					}
-				}
-				state.Lock.Unlock()
-			}
-		} else {
-			log.Printf("[Worker-%d] Prefetch request creation failed: %v", w.id, err)
+	// Pre-flight check: was this start offset already satisfied by another worker during connect?
+	if state.RangeSet.Contains(currentOffset) && !w.isPrefetchHelper {
+		gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
+		if !found {
+			log.Printf("[Worker-%d] Start offset %d already satisfied and file complete. Exiting.", w.id, currentOffset)
+			return
 		}
-
-		atomic.StoreInt32(&w.isPrefetching, 0)
-		log.Printf("[Worker-%d] Parallel Pre-fetching finished.", w.id)
-
-		select {
-		case state.NotifyChan <- struct{}{}:
-		default:
-		}
-		return
+		currentOffset = gapStart
+		atomic.StoreInt64(&w.currentOffset, currentOffset)
 	}
 
-	var prevBlockOffset int64 = -1
-	var prevBlockLength int64 = 0
-	fd := file.Fd()
-
-	defer func() {
-		if !GlobalConfig.GetDisableFadvise() && prevBlockOffset >= 0 && ctx.Err() == nil {
-			FadviseDontNeed(fd, prevBlockOffset, prevBlockLength)
-		}
-	}()
+	buf := make([]byte, 128*1024)
 
 	for {
 		select {
 		case <-ctx.Done():
-			state.Lock.Lock()
-			if state.BlockStates[currentBlock] != BlockCompleted {
-				state.BlockStates[currentBlock] = BlockNotStarted
-			}
-			state.Lock.Unlock()
 			return
 		default:
 		}
 
-		// Check for pending inline tail pre-fetch when MaxUpstreamWorkers == 1
+		// Single-worker inline tail prefetch check
 		state.Lock.Lock()
-		pendingTail := state.PendingTailPrefetchBlock
+		pendingTail := state.PendingTailPrefetchOffset
 		if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() == 1 {
-			state.PendingTailPrefetchBlock = -1
-			if state.BlockStates[currentBlock] != BlockCompleted {
-				state.BlockStates[currentBlock] = BlockNotStarted
-				if GlobalLogBroker != nil {
-					GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{currentBlock}, BlockNotStarted)
-				}
-			}
+			state.PendingTailPrefetchOffset = -1
 		} else {
 			pendingTail = -1
 		}
@@ -859,13 +645,24 @@ func runDownloadWorker(
 			continue
 		}
 
-		blockSize := GlobalConfig.GetBlockSize()
-		blockStartOffset := int64(currentBlock) * blockSize
-		blockEndOffset := blockStartOffset + blockSize
-		if blockEndOffset > state.TotalSize {
-			blockEndOffset = state.TotalSize
+		// Check if current offset is already covered in RangeSet
+		if state.RangeSet.Contains(currentOffset) {
+			gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
+			if !found {
+				log.Printf("[Worker-%d] Range from %d to EOF completed. Worker coalescing and exiting.", w.id, currentOffset)
+				closeConnection()
+				return
+			}
+			log.Printf("[Worker-%d] Reached completed range at %d. Leapfrogging to next gap at %d", w.id, currentOffset, gapStart)
+			closeConnection()
+			currentOffset = gapStart
+			atomic.StoreInt64(&w.currentOffset, currentOffset)
 		}
-		blockLength := blockEndOffset - blockStartOffset
+
+		if currentOffset >= state.TotalSize {
+			closeConnection()
+			return
+		}
 
 		if activeRespBody == nil {
 			req, err := http.NewRequestWithContext(ctx, "GET", state.URL, nil)
@@ -876,7 +673,7 @@ func runDownloadWorker(
 				continue
 			}
 
-			rangeHeader := fmt.Sprintf("bytes=%d-%d", blockStartOffset, state.TotalSize-1)
+			rangeHeader := fmt.Sprintf("bytes=%d-%d", currentOffset, state.TotalSize-1)
 			req.Header.Set("Range", rangeHeader)
 
 			CopySafeHeaders(initialHeader, req.Header)
@@ -888,7 +685,7 @@ func runDownloadWorker(
 
 			state.SetUpstreamStatus("Connecting")
 
-			log.Printf("[Worker-%d] Connecting upstream for block %d (Range: %s)", w.id, currentBlock, rangeHeader)
+			log.Printf("[Worker-%d] Connecting upstream for offset %d (Range: %s)", w.id, currentOffset, rangeHeader)
 			resp, err := UpstreamHTTPClient.Do(req)
 			if err != nil {
 				hadFailure = true
@@ -908,10 +705,22 @@ func runDownloadWorker(
 				continue
 			}
 
+			// Pre-flight check after connection: did another worker finish this range while we handshook?
+			if state.RangeSet.Contains(currentOffset) && !w.isPrefetchHelper {
+				log.Printf("[Worker-%d] Offset %d satisfied during connect handshake. Cleanly aborting connection.", w.id, currentOffset)
+				_ = resp.Body.Close()
+				gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
+				if !found {
+					return
+				}
+				currentOffset = gapStart
+				atomic.StoreInt64(&w.currentOffset, currentOffset)
+				continue
+			}
+
 			activeRespBody = resp.Body
-			
 			state.SetUpstreamStatus("Downloading")
-			
+
 			consecutiveFailures = 0
 			backoff = 2 * time.Second
 
@@ -941,172 +750,69 @@ func runDownloadWorker(
 			}
 		}
 
-		state.Lock.Lock()
-		state.BlockStates[currentBlock] = BlockDownloading
-		state.Lock.Unlock()
-		if GlobalLogBroker != nil {
-			GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{currentBlock}, BlockDownloading)
-		}
-
-		blockBytesWritten := int64(0)
-		blockBuffer := make([]byte, blockLength)
-		blockFailed := false
-		
-		atomic.StoreInt64(&w.offset, blockStartOffset)
-		startTime := time.Now()
-
-		for blockBytesWritten < blockLength {
-			select {
-			case <-ctx.Done():
-				state.Lock.Lock()
-				if state.BlockStates[currentBlock] != BlockCompleted {
-					state.BlockStates[currentBlock] = BlockNotStarted
-				}
-				state.Lock.Unlock()
-				return
-			default:
-			}
-
-			n, err := activeRespBody.Read(blockBuffer[blockBytesWritten:])
-			if n > 0 {
-				blockBytesWritten += int64(n)
-				atomic.StoreInt64(&w.offset, blockStartOffset+blockBytesWritten)
-				atomic.AddInt64(&w.connBytesWritten, int64(n))
-
-				atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
-				atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
-				GlobalRegistry.UpdateSize(int64(n))
-			}
-
-			if err != nil {
-				if blockBytesWritten < blockLength {
-					log.Printf("[Worker-%d] Upstream read error: %v", w.id, err)
-					blockFailed = true
-				}
-				closeConnection()
-				break
-			}
-		}
-
-		elapsed := time.Since(startTime).Seconds()
-		if elapsed > 0 {
-			atomic.StoreInt64(&w.speed, int64(float64(blockBytesWritten)/elapsed))
-		}
-
-		if blockFailed {
-			state.Lock.Lock()
-			if state.BlockStates[currentBlock] != BlockCompleted {
-				state.BlockStates[currentBlock] = BlockNotStarted
-			}
-			state.Lock.Unlock()
-			closeConnection()
-			
-			if handleFailure(false, "[Worker-%d] Download block %d failed", w.id, currentBlock) {
-				return
-			}
-			continue
-		}
-
-		if blockBytesWritten == blockLength {
-			_, werr := file.WriteAt(blockBuffer[:blockLength], blockStartOffset)
+		// Read streaming chunk from upstream HTTP body
+		readStartTime := time.Now()
+		n, err := activeRespBody.Read(buf)
+		if n > 0 {
+			_, werr := file.WriteAt(buf[:n], currentOffset)
 			if werr != nil {
-				log.Printf("[Worker-%d] File write error at %d: %v", w.id, blockStartOffset, werr)
-				blockFailed = true
-				state.Lock.Lock()
-				if state.BlockStates[currentBlock] != BlockCompleted {
-					state.BlockStates[currentBlock] = BlockNotStarted
-				}
-				state.Lock.Unlock()
+				log.Printf("[Worker-%d] File write error at %d: %v", w.id, currentOffset, werr)
 				closeConnection()
 				isPermanent := ctx.Err() != nil || errors.Is(werr, os.ErrClosed)
-				if handleFailure(isPermanent, "[Worker-%d] File write error at %d: %v", w.id, blockStartOffset, werr) {
+				if handleFailure(isPermanent, "[Worker-%d] File write error at %d: %v", w.id, currentOffset, werr) {
 					return
 				}
 				continue
 			}
 
-			if !GlobalConfig.GetDisableFadvise() {
-				// 1. Asynchronously initiate writeout of the completed block
-				SyncFileRangeWrite(fd, blockStartOffset, blockLength)
-				// 2. Mark previous block for page cache eviction
-				if prevBlockOffset >= 0 {
-					FadviseDontNeed(fd, prevBlockOffset, prevBlockLength)
-				}
-				prevBlockOffset = blockStartOffset
-				prevBlockLength = blockLength
-			}
+			// Add to RangeSet and wake waiting readers immediately!
+			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
 
 			state.Lock.Lock()
-			state.BlockStates[currentBlock] = BlockCompleted
-			log.Printf("[Worker-%d] Block %d completed", w.id, currentBlock)
-			if GlobalLogBroker != nil {
-				GlobalLogBroker.BroadcastBlockUpdate(state.Key, []int{currentBlock}, BlockCompleted)
-			}
-
 			for _, ch := range state.Clients {
 				safeSignal(ch)
 			}
-
-			// Notify coordinator loop to wake up and check if it should preempt / finalize / check keep-alive
-			select {
-			case state.NotifyChan <- struct{}{}:
-			default:
-			}
 			state.Lock.Unlock()
 
-			if currentBlock == 0 {
-				sniffAndSchedulePrefetch(state, file)
+			currentOffset += int64(n)
+			atomic.StoreInt64(&w.currentOffset, currentOffset)
+			atomic.AddInt64(&w.connBytesWritten, int64(n))
+
+			atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
+			atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
+			GlobalRegistry.UpdateSize(int64(n))
+
+			readElapsed := time.Since(readStartTime).Seconds()
+			if readElapsed > 0 {
+				instantSpeed := int64(float64(n) / readElapsed)
+				atomic.StoreInt64(&w.speed, instantSpeed)
 			}
 
-			state.Lock.Lock()
-			pendingTail := state.PendingTailPrefetchBlock
-			if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() == 1 {
-				state.PendingTailPrefetchBlock = -1
-				state.Lock.Unlock()
-				closeConnection()
-				runInlineTailPrefetch(ctx, w, state, initialHeader, file, pendingTail)
-				continue
+			if GlobalLogBroker != nil {
+				GlobalLogBroker.BroadcastRangeUpdate(state.Key, currentOffset-int64(n), currentOffset)
 			}
+		}
 
-			// We REMOVED the intermediate metadata JSON file write from here to prevent redundant disk I/O!
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[Worker-%d] Upstream read error at %d: %v", w.id, currentOffset, err)
+			}
+			closeConnection()
 
-			nextBlock := currentBlock + 1
-			if nextBlock >= len(state.BlockStates) {
-				state.Lock.Unlock()
-				closeConnection()
+			if currentOffset >= state.TotalSize || state.RangeSet.IsComplete(state.TotalSize) {
+				log.Printf("[Worker-%d] Completed full download to EOF (%d bytes). Exiting.", w.id, currentOffset)
 				return
 			}
 
-			nextStatus := state.BlockStates[nextBlock]
-			if nextStatus == BlockCompleted {
-				log.Printf("[Worker-%d] Next block %d already completed. Worker coalescing and exiting.", w.id, nextBlock)
-				state.Lock.Unlock()
-				closeConnection()
+			if w.isPrefetchHelper {
+				log.Printf("[Worker-%d] Prefetch helper completed read up to %d.", w.id, currentOffset)
 				return
 			}
-			
-			if nextStatus == BlockDownloading {
-				isAnotherWorkerDownloading := false
-				state.WorkersLock.Lock()
-				for _, aw := range state.ActiveWorkers {
-					if aw.id != w.id && aw.currentBlock == nextBlock {
-						isAnotherWorkerDownloading = true
-						break
-					}
-				}
-				state.WorkersLock.Unlock()
 
-				if isAnotherWorkerDownloading {
-					log.Printf("[Worker-%d] Next block %d already downloading by another worker. Exiting.", w.id, nextBlock)
-					state.Lock.Unlock()
-					closeConnection()
-					return
-				}
+			if handleFailure(false, "[Worker-%d] Upstream read error at %d: %v", w.id, currentOffset, err) {
+				return
 			}
-
-			currentBlock = nextBlock
-			w.currentBlock = currentBlock
-			state.Lock.Unlock()
+			continue
 		}
 	}
 }
@@ -1127,20 +833,18 @@ func runInlineTailPrefetch(
 	state *FileCacheState,
 	initialHeader http.Header,
 	file *os.File,
-	tailStartBlock int,
+	tailStartOffset int64,
 ) {
-	blockSize := GlobalConfig.GetBlockSize()
-	prefetchStart := int64(tailStartBlock) * blockSize
-	prefetchLength := state.TotalSize - prefetchStart
+	prefetchLength := state.TotalSize - tailStartOffset
 	if prefetchLength <= 0 {
 		return
 	}
 
 	atomic.StoreInt32(&w.isPrefetching, 1)
-	w.currentBlock = tailStartBlock
+	atomic.StoreInt64(&w.currentOffset, tailStartOffset)
 	defer atomic.StoreInt32(&w.isPrefetching, 0)
 
-	log.Printf("[Worker-%d] MaxUpstreamWorkers=1: Executing inline tail pre-fetch (%d bytes) starting at block %d", w.id, prefetchLength, tailStartBlock)
+	log.Printf("[Worker-%d] MaxUpstreamWorkers=1: Executing inline tail pre-fetch (%d bytes) starting at offset %d", w.id, prefetchLength, tailStartOffset)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", state.URL, nil)
 	if err != nil {
@@ -1148,7 +852,7 @@ func runInlineTailPrefetch(
 		return
 	}
 
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", prefetchStart, state.TotalSize-1)
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", tailStartOffset, state.TotalSize-1)
 	req.Header.Set("Range", rangeHeader)
 	CopySafeHeaders(initialHeader, req.Header)
 
@@ -1165,93 +869,43 @@ func runInlineTailPrefetch(
 	defer resp.Body.Close()
 
 	state.SetUpstreamStatus("Downloading")
-	state.Lock.Lock()
-	var downloadingBlocks []int
-	for b := tailStartBlock; b < state.TotalBlocks; b++ {
-		if state.BlockStates[b] != BlockCompleted {
-			state.BlockStates[b] = BlockDownloading
-			downloadingBlocks = append(downloadingBlocks, b)
-		}
-	}
-	if len(downloadingBlocks) > 0 && GlobalLogBroker != nil {
-		GlobalLogBroker.BroadcastBlockUpdate(state.Key, downloadingBlocks, BlockDownloading)
-	}
-	state.Lock.Unlock()
+	buf := make([]byte, 128*1024)
+	currentOffset := tailStartOffset
 
-	prefetchBuffer := make([]byte, prefetchLength)
-	bytesRead := int64(0)
-	prefetchFailed := false
-
-	for bytesRead < prefetchLength {
+	for {
 		select {
 		case <-ctx.Done():
-			prefetchFailed = true
-			break
+			return
 		default:
 		}
-		if prefetchFailed {
-			break
-		}
 
-		n, readErr := resp.Body.Read(prefetchBuffer[bytesRead:])
+		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			bytesRead += int64(n)
+			_, werr := file.WriteAt(buf[:n], currentOffset)
+			if werr != nil {
+				log.Printf("[Worker-%d] Inline tail pre-fetch write error at %d: %v", w.id, currentOffset, werr)
+				break
+			}
+
+			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
+			state.Lock.Lock()
+			for _, ch := range state.Clients {
+				safeSignal(ch)
+			}
+			state.Lock.Unlock()
+
+			currentOffset += int64(n)
+			atomic.StoreInt64(&w.currentOffset, currentOffset)
 
 			atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
 			atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
 			GlobalRegistry.UpdateSize(int64(n))
 		}
 
-		if readErr != nil {
-			if bytesRead < prefetchLength {
-				log.Printf("[Worker-%d] Inline tail pre-fetch read error: %v", w.id, readErr)
-				prefetchFailed = true
-			}
+		if err != nil {
 			break
 		}
 	}
-
-	if bytesRead == prefetchLength {
-		_, werr := file.WriteAt(prefetchBuffer, prefetchStart)
-		if werr != nil {
-			log.Printf("[Worker-%d] Inline tail pre-fetch file write error: %v", w.id, werr)
-			prefetchFailed = true
-		} else if !GlobalConfig.GetDisableFadvise() {
-			fd := file.Fd()
-			SyncFileRangeWrite(fd, prefetchStart, prefetchLength)
-			FadviseDontNeed(fd, prefetchStart, prefetchLength)
-		}
-	}
-
-	state.Lock.Lock()
-	var resetBlocks []int
-	var completedBlocks []int
-	for b := tailStartBlock; b < state.TotalBlocks; b++ {
-		bStart := int64(b) * blockSize
-		bEnd := bStart + blockSize
-		if bEnd > state.TotalSize {
-			bEnd = state.TotalSize
-		}
-		if prefetchStart+bytesRead >= bEnd && !prefetchFailed {
-			state.BlockStates[b] = BlockCompleted
-			completedBlocks = append(completedBlocks, b)
-		} else {
-			if state.BlockStates[b] != BlockCompleted {
-				state.BlockStates[b] = BlockNotStarted
-				resetBlocks = append(resetBlocks, b)
-			}
-		}
-	}
-	if len(completedBlocks) > 0 && GlobalLogBroker != nil {
-		GlobalLogBroker.BroadcastBlockUpdate(state.Key, completedBlocks, BlockCompleted)
-	}
-	if len(resetBlocks) > 0 && GlobalLogBroker != nil {
-		GlobalLogBroker.BroadcastBlockUpdate(state.Key, resetBlocks, BlockNotStarted)
-	}
-	for _, ch := range state.Clients {
-		safeSignal(ch)
-	}
-	state.Lock.Unlock()
 
 	log.Printf("[Worker-%d] Inline tail pre-fetch finished. Resuming sequential stream.", w.id)
 }
@@ -1262,15 +916,17 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 		state.Lock.Unlock()
 		return
 	}
-	block0Completed := len(state.BlockStates) > 0 && state.BlockStates[0] == BlockCompleted
-	if !block0Completed {
+
+	avail := state.RangeSet.AvailableFrom(0)
+	isHeaderReady := avail >= 128*1024 || (state.TotalSize > 0 && avail >= state.TotalSize)
+	if !isHeaderReady {
 		state.Lock.Unlock()
 		return
 	}
 	state.Sniffed = true
 	state.Lock.Unlock()
 
-	log.Printf("[Coord] Block 0 completed. Sniffing media headers to determine optimization status...")
+	log.Printf("[Coord] Initial header bytes available. Sniffing media container...")
 	buf := make([]byte, 128*1024)
 	n, err := file.ReadAt(buf, 0)
 	if (err == nil || err == io.EOF) && n > 0 {
@@ -1280,7 +936,6 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 		hasMdatSize := false
 		hasCues := false
 		cuesOffset := int64(0)
-		prefetchBlocks := 0
 
 		isMkv := n >= 4 && binary.BigEndian.Uint32(data[0:4]) == 0x1A45DFA3
 		isMp4 := false
@@ -1301,80 +956,32 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 			}
 		}
 
-		padding := GlobalConfig.GetSchedulerMinBlocks()
-		if padding < 1 {
-			padding = 1
-		}
-
-		var tailStartBlock int = -1
-		if isMp4 && !isFastStart {
-			blockSize := GlobalConfig.GetBlockSize()
-			maxTailBlocks := GlobalConfig.GetMaxPrefetchTailBlocks()
-			if hasMdatSize && moovOffset > 0 {
-				moovBytes := state.TotalSize - moovOffset
-				prefetchBlocks = int((moovBytes + blockSize - 1) / blockSize) + padding
-			} else {
-				// Estimate based on 0.15% of file size, floor of 16MB
-				estimatedBytes := state.TotalSize * 15 / 10000
-				if estimatedBytes < 16*1024*1024 {
-					estimatedBytes = 16*1024*1024
-				}
-				prefetchBlocks = int((estimatedBytes + blockSize - 1) / blockSize) + padding
-			}
-
-			if prefetchBlocks > maxTailBlocks {
-				prefetchBlocks = maxTailBlocks
-			}
-			tailStartBlock = state.TotalBlocks - prefetchBlocks
+		var tailStartOffset int64 = -1
+		if isMp4 && !isFastStart && hasMdatSize && moovOffset > 0 {
+			tailStartOffset = moovOffset
 		} else if isMkv && hasCues && cuesOffset > 0 {
-			blockSize := GlobalConfig.GetBlockSize()
-			maxTailBlocks := GlobalConfig.GetMaxPrefetchTailBlocks()
-			cuesBytes := state.TotalSize - cuesOffset
-			prefetchBlocks = int((cuesBytes + blockSize - 1) / blockSize) + padding
-
-			if prefetchBlocks > maxTailBlocks {
-				prefetchBlocks = maxTailBlocks
-			}
-			tailStartBlock = state.TotalBlocks - prefetchBlocks
+			tailStartOffset = cuesOffset
 		}
 
-		if tailStartBlock < 0 {
-			tailStartBlock = 0
-		}
-
-		lockoutBlocks := GlobalConfig.GetSchedulerMinBlocks() * 2
-		if lockoutBlocks < 2 {
-			lockoutBlocks = 2
-		}
-
-		if tailStartBlock >= lockoutBlocks && prefetchBlocks < state.TotalBlocks/2 && tailStartBlock < state.TotalBlocks {
-			needPrefetch := false
-			state.Lock.Lock()
-			for b := tailStartBlock; b < state.TotalBlocks; b++ {
-				if state.BlockStates[b] != BlockCompleted {
-					needPrefetch = true
-					break
+		if tailStartOffset > 0 && tailStartOffset < state.TotalSize {
+			tailBytes := state.TotalSize - tailStartOffset
+			// Sanity check: only prefetch if tail metadata is less than 20% of the entire file
+			if tailBytes > 0 && tailBytes < state.TotalSize/5 {
+				if !state.RangeSet.Contains(tailStartOffset) {
+					state.Lock.Lock()
+					state.PendingTailPrefetchOffset = tailStartOffset
+					state.Lock.Unlock()
+					select {
+					case state.NotifyChan <- struct{}{}:
+					default:
+					}
+					log.Printf("[Coord] Non-faststart container detected. Scheduled exact tail prefetch from byte offset %d (%d bytes)", tailStartOffset, tailBytes)
+				} else {
+					log.Printf("[Coord] Metadata tail bytes already cached. Skipping pre-fetch.")
 				}
 			}
-			state.Lock.Unlock()
-
-			if needPrefetch {
-				state.Lock.Lock()
-				state.PendingTailPrefetchBlock = tailStartBlock
-				state.Lock.Unlock()
-				select {
-				case state.NotifyChan <- struct{}{}:
-				default:
-				}
-			} else {
-				log.Printf("[Coord] Metadata tail blocks already cached. Skipping pre-fetch.")
-			}
-		} else {
-			log.Printf("[Coord] Metadata is already localized in head blocks. Fast-start container detected.")
-		}
-	} else {
-		if err != nil && err != io.EOF {
-			log.Printf("[Coord] Error reading block 0 for sniffing: %v (read %d bytes)", err, n)
+		} else if isFastStart || (isMp4 && moovOffset == 0) {
+			log.Printf("[Coord] Fast-start container detected. Metadata localized in header.")
 		}
 	}
 }

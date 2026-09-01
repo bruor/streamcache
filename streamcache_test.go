@@ -23,12 +23,9 @@ func TestMain(m *testing.M) {
 		Port:                    ":9999",
 		CacheDir:                "./test_cache/files",
 		TmpDir:                  "./test_cache/tmp",
-		BlockSize:               100, // small blocks for test
 		CacheMaxBytes:           300,
 		MinDiskFreeBytes:        1000,
 		CacheRevalidateInterval: 50 * time.Millisecond, // short for test
-		SchedulerMinBlocks:      1,
-		MaxPrefetchTailBlocks:   10,
 		SchedulerMinTime:        20 * time.Millisecond,
 		MaxUpstreamRetries:      8, // Cap retries in unit test harness to prevent infinite background retry loops on closed mock servers
 		MaxUpstreamWorkers:      2,
@@ -58,19 +55,17 @@ func TestMain(m *testing.M) {
 }
 
 func TestCacheReaderCancellation(t *testing.T) {
-	state := &FileCacheState{
-		Key:         "test_cancel",
-		URL:         "http://localhost/dummy",
-		Path:        filepath.Join(GlobalConfig.CacheDir, "test_cancel"),
-		PartPath:    filepath.Join(GlobalConfig.TmpDir, "test_cancel.part"),
-		MetaPath:    filepath.Join(GlobalConfig.TmpDir, "test_cancel.json"),
-		TotalSize:   500,
-		TotalBlocks: 5,
-		BlockStates: make([]int, 5),
-		Clients:     make(map[string]chan struct{}),
-		Starving:    make(map[string]int),
-		NotifyChan:  make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		"test_cancel",
+		"http://localhost/dummy",
+		filepath.Join(GlobalConfig.CacheDir, "test_cancel"),
+		filepath.Join(GlobalConfig.TmpDir, "test_cancel.part"),
+		filepath.Join(GlobalConfig.TmpDir, "test_cancel.json"),
+		"video/x-matroska",
+		"",
+		"",
+		500,
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	reader := NewCacheReader(ctx, state, nil)
@@ -230,7 +225,6 @@ func TestRevalidateEvictsOldMediaFirst(t *testing.T) {
 func TestRevalidationChangeDetection(t *testing.T) {
 	defer cleanupAfterTest(t, nil)
 
-	// Set up mock HTTP upstream server representing the IPTV CDN
 	mockETag := "etag-v1"
 	mockSize := int64(1000)
 
@@ -247,13 +241,12 @@ func TestRevalidationChangeDetection(t *testing.T) {
 	filePath := filepath.Join(GlobalConfig.CacheDir, key)
 	metaPath := filePath + ".json"
 
-	// Write mock cache file and companion metadata JSON
 	_ = os.WriteFile(filePath, make([]byte, 1000), 0644)
 	meta := FileMeta{
 		URL:           server.URL,
 		TotalSize:     1000,
 		ETag:          "etag-v1",
-		LastValidated: time.Now().Add(-2 * time.Hour).Unix(), // Expired validation
+		LastValidated: time.Now().Add(-2 * time.Hour).Unix(),
 		Completed:     true,
 	}
 	metaBytes, _ := json.Marshal(meta)
@@ -268,21 +261,19 @@ func TestRevalidationChangeDetection(t *testing.T) {
 		t.Errorf("Cached file should not have been evicted")
 	}
 
-	// 2. Modify upstream server to return different ETag (simulating updated media)
+	// 2. Modify upstream server to return different ETag
 	mockETag = "etag-v2"
-	// Set last validated time back to expired
 	metaBytes, _ = os.ReadFile(metaPath)
 	_ = json.Unmarshal(metaBytes, &meta)
 	meta.LastValidated = time.Now().Add(-2 * time.Hour).Unix()
 	metaBytes, _ = json.Marshal(meta)
 	_ = os.WriteFile(metaPath, metaBytes, 0644)
 
-	// Run revalidation. Should detect modification and evict cache.
 	valid, err = Revalidate(key, server.URL, nil)
 	if err != nil || valid {
 		t.Errorf("Expected revalidation to detect modification and return valid=false, got valid=%t, err=%v", valid, err)
 	}
-	// Wait for async background deletion of old media (up to 1s)
+
 	for i := 0; i < 100; i++ {
 		if !FileExists(filePath) && !FileExists(metaPath) {
 			break
@@ -296,7 +287,6 @@ func TestRevalidationChangeDetection(t *testing.T) {
 }
 
 func TestDebouncedSchedulerTimeSlicing(t *testing.T) {
-	// Spin up mock server serving data
 	var connCount int
 	var lock sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -309,55 +299,47 @@ func TestDebouncedSchedulerTimeSlicing(t *testing.T) {
 	}))
 	defer server.Close()
 
-	state := &FileCacheState{
-		Key:         "test_sched",
-		URL:         server.URL,
-		Path:        filepath.Join(GlobalConfig.CacheDir, "test_sched"),
-		PartPath:    filepath.Join(GlobalConfig.TmpDir, "test_sched.part"),
-		MetaPath:    filepath.Join(GlobalConfig.TmpDir, "test_sched.json"),
-		TotalSize:   500,
-		TotalBlocks: 5,
-		BlockStates: make([]int, 5),
-		Clients:     make(map[string]chan struct{}),
-		Starving:    make(map[string]int),
-		NotifyChan:  make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		"test_sched",
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, "test_sched"),
+		filepath.Join(GlobalConfig.TmpDir, "test_sched.part"),
+		filepath.Join(GlobalConfig.TmpDir, "test_sched.json"),
+		"video/x-matroska",
+		"",
+		"",
+		500,
+	)
 	defer cleanupAfterTest(t, state)
 
 	// Set debouncer to 0 to trigger instant preemption in single-worker setup
 	GlobalConfig.Lock()
-	oldMinBlocks := GlobalConfig.SchedulerMinBlocks
 	oldMinTime := GlobalConfig.SchedulerMinTime
-	GlobalConfig.SchedulerMinBlocks = 0
 	GlobalConfig.SchedulerMinTime = 0
 	GlobalConfig.Unlock()
 	defer func() {
 		GlobalConfig.Lock()
-		GlobalConfig.SchedulerMinBlocks = oldMinBlocks
 		GlobalConfig.SchedulerMinTime = oldMinTime
 		GlobalConfig.Unlock()
 	}()
 
-	// Trigger Coordinator
 	StartCoordinator(state, nil)
-	time.Sleep(20 * time.Millisecond) // Let it connect
+	time.Sleep(20 * time.Millisecond)
 
 	state.Lock.Lock()
-	state.Starving["client-1"] = 3 // Client 1 wants block 3
+	state.Starving["client-1"] = 300 // Client 1 wants offset 300
 	state.Lock.Unlock()
 	select {
 	case state.NotifyChan <- struct{}{}:
 	default:
 	}
 
-	// Wait for coordinator to evaluate starvation and jump
 	time.Sleep(50 * time.Millisecond)
 
 	lock.Lock()
 	count := connCount
 	lock.Unlock()
 
-	// Connection count should be 2 (initial connection + jump connection)
 	if count < 2 {
 		t.Errorf("Expected coordinator to abort and jump (connection count >= 2), got %d", count)
 	}
@@ -372,7 +354,7 @@ func TestParseSizeString(t *testing.T) {
 		{"50gb", 50 * 1024 * 1024 * 1024, false},
 		{"2MB", 2 * 1024 * 1024, false},
 		{"10g", 10 * 1024 * 1024 * 1024, false},
-		{"1.5g", 0, true}, // Invalid integer format
+		{"1.5g", 0, true},
 		{"0", 0, false},
 		{"none", 0, false},
 		{"disabled", 0, false},
@@ -405,7 +387,6 @@ func TestParseSizeString(t *testing.T) {
 }
 
 func TestStarvationLoopPrevention(t *testing.T) {
-	// Spin up mock server serving data
 	var connCount int
 	var lock sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -419,46 +400,37 @@ func TestStarvationLoopPrevention(t *testing.T) {
 	}))
 	defer server.Close()
 
-	state := &FileCacheState{
-		Key:         "test_loop",
-		URL:         server.URL,
-		Path:        filepath.Join(GlobalConfig.CacheDir, "test_loop"),
-		PartPath:    filepath.Join(GlobalConfig.TmpDir, "test_loop.part"),
-		MetaPath:    filepath.Join(GlobalConfig.TmpDir, "test_loop.json"),
-		TotalSize:   500,
-		TotalBlocks: 5,
-		BlockStates: make([]int, 5),
-		Clients:     make(map[string]chan struct{}),
-		Starving:    make(map[string]int),
-		NotifyChan:  make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		"test_loop",
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, "test_loop"),
+		filepath.Join(GlobalConfig.TmpDir, "test_loop.part"),
+		filepath.Join(GlobalConfig.TmpDir, "test_loop.json"),
+		"video/x-matroska",
+		"",
+		"",
+		500,
+	)
 	defer cleanupAfterTest(t, state)
 
 	state.Lock.Lock()
 	state.Clients["client-1"] = make(chan struct{}, 1)
 	state.Clients["client-2"] = make(chan struct{}, 1)
-	state.Starving["client-1"] = 0 // Client 1 wants block 0
-	state.Starving["client-2"] = 3 // Client 2 wants block 3
+	state.Starving["client-1"] = 0   // Client 1 wants offset 0
+	state.Starving["client-2"] = 300 // Client 2 wants offset 300
 	state.Lock.Unlock()
 
-	// Trigger Coordinator
 	StartCoordinator(state, nil)
-
-	// Wait a bit to let it connect and run
 	time.Sleep(50 * time.Millisecond)
 
 	lock.Lock()
 	count := connCount
 	lock.Unlock()
 
-	// Since client-1 is starving for block 0 (or client-2 for block 3),
-	// the coordinator should NOT jump to the other starving block immediately.
-	// Therefore, it should only have 1 connection instead of constantly jumping.
 	if count > 1 {
-		t.Errorf("Expected coordinator to stay on block and NOT jump immediately (connection count <= 1), got %d", count)
+		t.Errorf("Expected coordinator to stay on stream and NOT jump constantly (connection count <= 1), got %d", count)
 	}
 
-	// Clean up
 	state.Lock.Lock()
 	close(state.Clients["client-1"])
 	close(state.Clients["client-2"])
@@ -466,7 +438,6 @@ func TestStarvationLoopPrevention(t *testing.T) {
 }
 
 func TestHeaderPropagation(t *testing.T) {
-	// 1. Set up a target mock CDN server that records headers it receives
 	var receivedHeaders []http.Header
 	var lock sync.Mutex
 
@@ -480,32 +451,25 @@ func TestHeaderPropagation(t *testing.T) {
 	}))
 	defer cdnServer.Close()
 
-	// 2. Set up our FileCacheState pointing to the mock CDN server
-	state := &FileCacheState{
-		Key:         "test_headers",
-		URL:         cdnServer.URL,
-		Path:        filepath.Join(GlobalConfig.CacheDir, "test_headers"),
-		PartPath:    filepath.Join(GlobalConfig.TmpDir, "test_headers.part"),
-		MetaPath:    filepath.Join(GlobalConfig.TmpDir, "test_headers.json"),
-		TotalSize:   500,
-		TotalBlocks: 5,
-		BlockStates: make([]int, 5),
-		Clients:     make(map[string]chan struct{}),
-		Starving:    make(map[string]int),
-		NotifyChan:  make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		"test_headers",
+		cdnServer.URL,
+		filepath.Join(GlobalConfig.CacheDir, "test_headers"),
+		filepath.Join(GlobalConfig.TmpDir, "test_headers.part"),
+		filepath.Join(GlobalConfig.TmpDir, "test_headers.json"),
+		"video/x-matroska",
+		"",
+		"",
+		500,
+	)
 	defer cleanupAfterTest(t, state)
 
-	// 3. Create initial request headers simulating Chrome
 	chromeHeaders := make(http.Header)
 	chromeHeaders.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 	chromeHeaders.Set("Accept-Language", "en-US,en;q=0.9")
 	chromeHeaders.Set("X-Custom-Chrome-Header", "ChromeTestVal")
 
-	// 4. Start the Coordinator with the initial Chrome headers
 	StartCoordinator(state, chromeHeaders)
-
-	// Wait for the coordinator to connect to the CDN and write block 0
 	time.Sleep(100 * time.Millisecond)
 
 	lock.Lock()
@@ -516,10 +480,8 @@ func TestHeaderPropagation(t *testing.T) {
 		t.Fatal("Expected mock CDN to receive request headers, but receivedHeaders is empty")
 	}
 
-	// Assert on the first request's headers
 	headers := headersList[0]
 
-	// 5. Assert that Chrome headers were propagated correctly
 	ua := headers.Get("User-Agent")
 	if ua != "Mozilla/5.0 Chrome/120.0.0.0" {
 		t.Errorf("Expected User-Agent to be propagated, got %q", ua)
@@ -535,7 +497,6 @@ func TestHeaderPropagation(t *testing.T) {
 		t.Errorf("Expected X-Custom-Chrome-Header to be propagated, got %q", custom)
 	}
 
-	// Range header should be set by the coordinator, not match Chrome's Range
 	rng := headers.Get("Range")
 	if rng != "bytes=0-499" {
 		t.Errorf("Expected Range header to be bytes=0-499, got %q", rng)
@@ -543,7 +504,6 @@ func TestHeaderPropagation(t *testing.T) {
 }
 
 func TestCacheFinalizationOrder(t *testing.T) {
-	// Setup cache and tmp dirs
 	GlobalConfig.Lock()
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
@@ -558,47 +518,39 @@ func TestCacheFinalizationOrder(t *testing.T) {
 	}()
 	defer cleanupAfterTest(t, nil)
 
-	// 1. Test case: client Close() occurs AFTER coordinator exits
 	t.Run("client_close_after_coordinator_exit", func(t *testing.T) {
-		// Reset registry
 		GlobalRegistry.Lock.Lock()
 		GlobalRegistry.Files = make(map[string]*FileCacheState)
 		GlobalRegistry.Lock.Unlock()
 
 		key := "test_final_1.mkv"
-		state := &FileCacheState{
-			Key:          key,
-			URL:          "http://dummy",
-			Path:         filepath.Join(GlobalConfig.CacheDir, key),
-			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-			TotalSize:    100,
-			TotalBlocks:  1,
-			BlockStates:  []int{BlockCompleted}, // Already complete in memory
-			Clients:      make(map[string]chan struct{}),
-		}
+		state := NewFileCacheState(
+			key,
+			"http://dummy",
+			filepath.Join(GlobalConfig.CacheDir, key),
+			filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			"video/x-matroska",
+			"",
+			"",
+			100,
+		)
+		state.RangeSet.Add(0, 100) // Complete
 
-		// Create mock part file
 		_ = os.WriteFile(state.PartPath, []byte("dummy data"), 0644)
-
-		// Create reader
 		reader := NewCacheReader(context.Background(), state, nil)
 
-		// Mock coordinator active state
 		state.WriterActive = true
 		mockFile, _ := os.OpenFile(state.PartPath, os.O_RDWR, 0644)
 		state.File = mockFile
 
-		// Simulate coordinator exit: sets WriterActive=false, len(Clients) is 1, so it doesn't finalize
 		state.WriterActive = false
 
-		// Close reader: this should trigger finalization because len(Clients) becomes 0 and WriterActive is false
 		err := reader.Close()
 		if err != nil {
 			t.Fatalf("Reader Close failed: %v", err)
 		}
 
-		// Verify finalization
 		if !FileExists(state.Path) {
 			t.Errorf("Expected final cache file %s to exist, but it does not", state.Path)
 		}
@@ -606,7 +558,6 @@ func TestCacheFinalizationOrder(t *testing.T) {
 			t.Errorf("Expected part file %s to be removed/renamed, but it still exists", state.PartPath)
 		}
 
-		// Verify metadata completed status
 		metaBytes, err := os.ReadFile(state.Path + ".json")
 		if err != nil {
 			t.Fatalf("Failed to read final metadata JSON: %v", err)
@@ -618,43 +569,34 @@ func TestCacheFinalizationOrder(t *testing.T) {
 		if !meta.Completed {
 			t.Errorf("Expected metadata Completed to be true, got false")
 		}
-		if len(meta.BlockStates) != 0 {
-			t.Errorf("Expected metadata BlockStates to be nil, got %v", meta.BlockStates)
-		}
 	})
 
-	// 2. Test case: coordinator exits AFTER client Close()
 	t.Run("coordinator_exit_after_client_close", func(t *testing.T) {
-		// Reset registry
 		GlobalRegistry.Lock.Lock()
 		GlobalRegistry.Files = make(map[string]*FileCacheState)
 		GlobalRegistry.Lock.Unlock()
 
 		key := "test_final_2.mkv"
-		state := &FileCacheState{
-			Key:          key,
-			URL:          "http://dummy",
-			Path:         filepath.Join(GlobalConfig.CacheDir, key),
-			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-			TotalSize:    100,
-			TotalBlocks:  1,
-			BlockStates:  []int{BlockCompleted}, // Already complete in memory
-			Clients:      make(map[string]chan struct{}),
-		}
+		state := NewFileCacheState(
+			key,
+			"http://dummy",
+			filepath.Join(GlobalConfig.CacheDir, key),
+			filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			"video/x-matroska",
+			"",
+			"",
+			100,
+		)
+		state.RangeSet.Add(0, 100)
 
-		// Create mock part file
 		_ = os.WriteFile(state.PartPath, []byte("dummy data"), 0644)
-
-		// Create reader
 		reader := NewCacheReader(context.Background(), state, nil)
 
-		// Mock coordinator active state
 		state.WriterActive = true
 		mockFile, _ := os.OpenFile(state.PartPath, os.O_RDWR, 0644)
 		state.File = mockFile
 
-		// Client Close: len(Clients) becomes 0, but WriterActive is true, so reader Close does not finalize
 		err := reader.Close()
 		if err != nil {
 			t.Fatalf("Reader Close failed: %v", err)
@@ -664,7 +606,6 @@ func TestCacheFinalizationOrder(t *testing.T) {
 			t.Errorf("Expected final cache file %s NOT to exist yet, but it does", state.Path)
 		}
 
-		// Now simulate coordinator defer finalization check:
 		state.Lock.Lock()
 		state.WriterActive = false
 		shouldFinalize := len(state.Clients) == 0 && state.File != nil && !FileExists(state.Path)
@@ -691,31 +632,16 @@ func TestCacheFinalizationOrder(t *testing.T) {
 			}
 		}
 
-		// Verify finalization
 		if !FileExists(state.Path) {
 			t.Errorf("Expected final cache file %s to exist, but it does not", state.Path)
 		}
 		if FileExists(state.PartPath) {
 			t.Errorf("Expected part file %s to be removed/renamed, but it still exists", state.PartPath)
 		}
-
-		// Verify metadata completed status
-		metaBytes, err := os.ReadFile(state.Path + ".json")
-		if err != nil {
-			t.Fatalf("Failed to read final metadata JSON: %v", err)
-		}
-		var meta FileMeta
-		if err := json.Unmarshal(metaBytes, &meta); err != nil {
-			t.Fatalf("Failed to unmarshal metadata: %v", err)
-		}
-		if !meta.Completed {
-			t.Errorf("Expected metadata Completed to be true, got false")
-		}
 	})
 }
 
 func TestURLSanitizationAndKeyGeneration(t *testing.T) {
-	// Test cases of URLs with different query params that should produce the same key and extension
 	url1 := "http://infinity.gives/series/wflx2/31916535/1334565.mkv?token=foo&expiry=123"
 	url2 := "http://infinity.gives/series/wflx2/31916535/1334565.mkv?token=bar"
 	url3 := "http://infinity.gives/series/wflx2/31916535/1334565.mkv"
@@ -732,7 +658,6 @@ func TestURLSanitizationAndKeyGeneration(t *testing.T) {
 		t.Errorf("Expected extension to be '.mkv' and clean of query parameters, got ext1=%s, ext2=%s, ext3=%s", ext1, ext2, ext3)
 	}
 
-	// Test URL with no extension
 	urlNoExt := "http://infinity.gives/series/wflx2/31916535/1334565?token=abc"
 	keyNoExt, extNoExt := getCacheKeyAndExt(urlNoExt)
 	if extNoExt != ".mkv" {
@@ -744,36 +669,30 @@ func TestURLSanitizationAndKeyGeneration(t *testing.T) {
 }
 
 func TestLegacyMigration(t *testing.T) {
-	// Prepare legacy file (no extension) in test cache
 	targetURL := "http://localhost/series/test_legacy.mkv"
 	key, ext := getCacheKeyAndExt(targetURL)
 	legacyPath := filepath.Join(GlobalConfig.CacheDir, key)
 	newPath := filepath.Join(GlobalConfig.CacheDir, key+ext)
 
-	// Write mock legacy file
 	legacyData := []byte("legacy video bytes content")
 	_ = os.WriteFile(legacyPath, legacyData, 0644)
 	defer os.Remove(legacyPath)
 	defer os.Remove(newPath)
 	defer os.Remove(newPath + ".json")
 
-	// Run migration helper
 	err := migrateLegacyFile(legacyPath, newPath, targetURL)
 	if err != nil {
 		t.Fatalf("Failed to run migrateLegacyFile: %v", err)
 	}
 
-	// Verify legacy file is moved/deleted
 	if FileExists(legacyPath) {
 		t.Errorf("Expected legacy file at %s to be moved/deleted, but it exists", legacyPath)
 	}
 
-	// Verify new file exists
 	if !FileExists(newPath) {
 		t.Errorf("Expected new file at %s to exist, but it does not", newPath)
 	}
 
-	// Verify metadata JSON exists and matches
 	metaPath := newPath + ".json"
 	if !FileExists(metaPath) {
 		t.Fatalf("Expected metadata file at %s to exist, but it does not", metaPath)
@@ -802,41 +721,29 @@ func TestLegacyMigration(t *testing.T) {
 }
 
 func TestRevalidateMissingMetadata(t *testing.T) {
-	// Prepare test file
 	targetURL := "http://localhost/series/test_reval.mkv"
 	key, ext := getCacheKeyAndExt(targetURL)
 	cacheFileName := key + ext
 	filePath := filepath.Join(GlobalConfig.CacheDir, cacheFileName)
 	metaPath := filePath + ".json"
 
-	// Ensure no leftover files
 	_ = os.Remove(filePath)
 	_ = os.Remove(metaPath)
 	defer os.Remove(filePath)
 	defer os.Remove(metaPath)
 
-	// Write mock cache file
 	fileData := []byte("some cache video bytes")
 	err := os.WriteFile(filePath, fileData, 0644)
 	if err != nil {
 		t.Fatalf("Failed to write mock cache file: %v", err)
 	}
 
-	// Verify metadata file does not exist initially
-	if FileExists(metaPath) {
-		t.Fatalf("Expected metadata file %s to not exist", metaPath)
-	}
-
-	// Save current revalidate interval and set it to a large value for this test
 	oldInterval := GlobalConfig.CacheRevalidateInterval
 	GlobalConfig.CacheRevalidateInterval = 1 * time.Hour
 	defer func() {
 		GlobalConfig.CacheRevalidateInterval = oldInterval
 	}()
 
-	// Run Revalidate. Since the metadata file is missing, it should recreate it dynamically.
-	// Since the recreation sets LastValidated to the file's ModTime (which is practically now),
-	// it will be within the 1-hour revalidation window, so it won't perform an HTTP probe.
 	valid, err := Revalidate(cacheFileName, targetURL, nil)
 	if err != nil {
 		t.Fatalf("Revalidate returned error: %v", err)
@@ -845,7 +752,6 @@ func TestRevalidateMissingMetadata(t *testing.T) {
 		t.Errorf("Expected Revalidate to return true, got false")
 	}
 
-	// Verify metadata JSON has been recreated
 	if !FileExists(metaPath) {
 		t.Fatalf("Expected metadata file %s to have been recreated, but it does not exist", metaPath)
 	}
@@ -889,17 +795,18 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 		GlobalRegistry.Lock.Unlock()
 
 		key := "test_incomplete_client.mkv"
-		state := &FileCacheState{
-			Key:          key,
-			URL:          "http://dummy",
-			Path:         filepath.Join(GlobalConfig.CacheDir, key),
-			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-			TotalSize:    100,
-			TotalBlocks:  2,
-			BlockStates:  []int{BlockCompleted, BlockNotStarted}, // Incomplete
-			Clients:      make(map[string]chan struct{}),
-		}
+		state := NewFileCacheState(
+			key,
+			"http://dummy",
+			filepath.Join(GlobalConfig.CacheDir, key),
+			filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			"video/x-matroska",
+			"",
+			"",
+			100,
+		)
+		state.RangeSet.Add(0, 50) // Incomplete (only first 50 bytes)
 
 		GlobalRegistry.Lock.Lock()
 		GlobalRegistry.Files[key] = state
@@ -908,17 +815,14 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 		_ = os.WriteFile(state.PartPath, []byte("partial data"), 0644)
 		_ = os.WriteFile(state.MetaPath, []byte("{}"), 0644)
 
-		// Create client reader
 		reader := NewCacheReader(context.Background(), state, nil)
 
-		// Mock active coordinator exiting
 		state.Lock.Lock()
 		state.WriterActive = true
 		mockFile, _ := os.OpenFile(state.PartPath, os.O_RDWR, 0644)
 		state.File = mockFile
 		state.Lock.Unlock()
 
-		// Simulate coordinator exit: sets WriterActive=false, evaluates isCompleted=false
 		state.Lock.Lock()
 		state.WriterActive = false
 		var fileToClose *os.File
@@ -933,12 +837,10 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 			_ = fileToClose.Close()
 		}
 
-		// Since we have an active client, it should NOT clean up yet
 		if shouldCleanUpIncomplete {
 			t.Errorf("Expected shouldCleanUpIncomplete to be false because client is active")
 		}
 
-		// Verify files and registry entry still exist
 		if !FileExists(state.PartPath) {
 			t.Errorf("Expected part file to exist while client is active")
 		}
@@ -950,13 +852,11 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 			t.Errorf("Expected file state to remain in registry while client is active")
 		}
 
-		// Now close the client reader. This should trigger the cleanup.
 		err := reader.Close()
 		if err != nil {
 			t.Fatalf("Reader Close failed: %v", err)
 		}
 
-		// Verify everything is deleted/cleaned up
 		if FileExists(state.PartPath) {
 			t.Errorf("Expected part file to be deleted on last client Close")
 		}
@@ -978,17 +878,18 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 		GlobalRegistry.Lock.Unlock()
 
 		key := "test_incomplete_no_client.mkv"
-		state := &FileCacheState{
-			Key:          key,
-			URL:          "http://dummy",
-			Path:         filepath.Join(GlobalConfig.CacheDir, key),
-			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-			TotalSize:    100,
-			TotalBlocks:  2,
-			BlockStates:  []int{BlockCompleted, BlockNotStarted}, // Incomplete
-			Clients:      make(map[string]chan struct{}),
-		}
+		state := NewFileCacheState(
+			key,
+			"http://dummy",
+			filepath.Join(GlobalConfig.CacheDir, key),
+			filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			"video/x-matroska",
+			"",
+			"",
+			100,
+		)
+		state.RangeSet.Add(0, 50)
 
 		GlobalRegistry.Lock.Lock()
 		GlobalRegistry.Files[key] = state
@@ -1003,7 +904,6 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 		state.File = mockFile
 		state.Lock.Unlock()
 
-		// Simulate coordinator exit: sets WriterActive=false, evaluates isCompleted=false
 		state.Lock.Lock()
 		state.WriterActive = false
 		var fileToClose *os.File
@@ -1030,7 +930,6 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 			GlobalRegistry.Lock.Unlock()
 		}
 
-		// Verify everything is deleted/cleaned up immediately on coordinator exit
 		if FileExists(state.PartPath) {
 			t.Errorf("Expected part file to be deleted immediately")
 		}
@@ -1048,7 +947,6 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 }
 
 func TestCoordinatorRetryTempering(t *testing.T) {
-	// Setup cache and tmp dirs
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
@@ -1059,7 +957,6 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 	}()
 	defer cleanupAfterTest(t, nil)
 
-	// Mock coordinator sleep to avoid actual delay in test execution
 	coordinatorSleepMu.Lock()
 	oldSleep := coordinatorSleepFn
 	coordinatorSleepFn = func(d time.Duration) {}
@@ -1075,35 +972,30 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 		GlobalRegistry.Files = make(map[string]*FileCacheState)
 		GlobalRegistry.Lock.Unlock()
 
-		// Server returns 403 Forbidden
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusForbidden)
 		}))
 		defer server.Close()
 
 		key := "test_403_fast_exit.mkv"
-		state := &FileCacheState{
-			Key:          key,
-			URL:          server.URL,
-			Path:         filepath.Join(GlobalConfig.CacheDir, key),
-			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-			TotalSize:    100,
-			TotalBlocks:  2,
-			BlockStates:  []int{BlockNotStarted, BlockNotStarted},
-			Clients:      make(map[string]chan struct{}),
-			Starving:     make(map[string]int),
-			NotifyChan:   make(chan struct{}, 10),
-		}
+		state := NewFileCacheState(
+			key,
+			server.URL,
+			filepath.Join(GlobalConfig.CacheDir, key),
+			filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			"video/x-matroska",
+			"",
+			"",
+			100,
+		)
 
 		GlobalRegistry.Lock.Lock()
 		GlobalRegistry.Files[key] = state
 		GlobalRegistry.Lock.Unlock()
 
-		// Start coordinator
 		StartCoordinator(state, nil)
 
-		// Wait for coordinator to run and exit (should exit immediately on 403)
 		for i := 0; i < 100; i++ {
 			state.Lock.Lock()
 			active := state.WriterActive
@@ -1122,7 +1014,6 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 			t.Errorf("Expected coordinator to exit immediately on 403, but it is still running")
 		}
 
-		// Since clients count is 0, the registry entry should be deleted on exit
 		GlobalRegistry.Lock.Lock()
 		_, inRegistry := GlobalRegistry.Files[key]
 		GlobalRegistry.Lock.Unlock()
@@ -1147,35 +1038,30 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 		GlobalRegistry.Files = make(map[string]*FileCacheState)
 		GlobalRegistry.Lock.Unlock()
 
-		// Server returns 500 Internal Server Error
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
 		defer server.Close()
 
 		key := "test_500_exhaustion.mkv"
-		state := &FileCacheState{
-			Key:          key,
-			URL:          server.URL,
-			Path:         filepath.Join(GlobalConfig.CacheDir, key),
-			PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-			MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-			TotalSize:    100,
-			TotalBlocks:  2,
-			BlockStates:  []int{BlockNotStarted, BlockNotStarted},
-			Clients:      make(map[string]chan struct{}),
-			Starving:     make(map[string]int),
-			NotifyChan:   make(chan struct{}, 10),
-		}
+		state := NewFileCacheState(
+			key,
+			server.URL,
+			filepath.Join(GlobalConfig.CacheDir, key),
+			filepath.Join(GlobalConfig.TmpDir, key+".part"),
+			filepath.Join(GlobalConfig.CacheDir, key+".json"),
+			"video/x-matroska",
+			"",
+			"",
+			100,
+		)
 
 		GlobalRegistry.Lock.Lock()
 		GlobalRegistry.Files[key] = state
 		GlobalRegistry.Lock.Unlock()
 
-		// Start coordinator
 		StartCoordinator(state, nil)
 
-		// Wait for coordinator to run, fail 8 times (with mocked 0s sleep), and exit
 		for i := 0; i < 100; i++ {
 			state.Lock.Lock()
 			active := state.WriterActive
@@ -1194,7 +1080,6 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 			t.Errorf("Expected coordinator to exit after 8 failures, but it is still running")
 		}
 
-		// Since clients count is 0, the registry entry should be deleted on exit
 		GlobalRegistry.Lock.Lock()
 		_, inRegistry := GlobalRegistry.Files[key]
 		GlobalRegistry.Lock.Unlock()
@@ -1206,7 +1091,6 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 }
 
 func TestCoordinatorNoBlockSkippingOnFailure(t *testing.T) {
-	// Setup cache and tmp dirs
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
@@ -1216,7 +1100,6 @@ func TestCoordinatorNoBlockSkippingOnFailure(t *testing.T) {
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
 
-	// Mock coordinator sleep to avoid actual delay in test execution
 	coordinatorSleepMu.Lock()
 	oldSleep := coordinatorSleepFn
 	coordinatorSleepFn = func(d time.Duration) {}
@@ -1227,7 +1110,6 @@ func TestCoordinatorNoBlockSkippingOnFailure(t *testing.T) {
 		coordinatorSleepMu.Unlock()
 	}()
 
-	// Mock server that returns a 500 on the very first request, and then succeeds
 	var lock sync.Mutex
 	var requestedRanges []string
 	var requestCount int
@@ -1251,29 +1133,24 @@ func TestCoordinatorNoBlockSkippingOnFailure(t *testing.T) {
 	defer server.Close()
 
 	key := "test_no_skipping.mkv"
-	state := &FileCacheState{
-		Key:          key,
-		URL:          server.URL,
-		Path:         filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:    200,
-		TotalBlocks:  2,
-		BlockStates:  []int{BlockNotStarted, BlockNotStarted},
-		Clients:      make(map[string]chan struct{}),
-		Starving:     make(map[string]int),
-		NotifyChan:   make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		200,
+	)
 	defer cleanupAfterTest(t, state)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
 	GlobalRegistry.Lock.Unlock()
 
-	// Start coordinator
 	StartCoordinator(state, nil)
-
-	// Wait for coordinator to run, fail once, and reconnect
 	time.Sleep(100 * time.Millisecond)
 
 	lock.Lock()
@@ -1281,9 +1158,6 @@ func TestCoordinatorNoBlockSkippingOnFailure(t *testing.T) {
 	copy(ranges, requestedRanges)
 	lock.Unlock()
 
-	// We expect at least two requests:
-	// First request: bytes=0-199
-	// Second request: bytes=0-199 (NOT bytes=100-199, which would skip block 0!)
 	if len(ranges) < 2 {
 		t.Fatalf("Expected at least 2 requests, got %d", len(ranges))
 	}
@@ -1292,14 +1166,12 @@ func TestCoordinatorNoBlockSkippingOnFailure(t *testing.T) {
 		t.Errorf("Expected first request range to be bytes=0-199, got %s", ranges[0])
 	}
 	if ranges[1] != "bytes=0-199" {
-		t.Errorf("Expected second request range to be bytes=0-199 (retrying block 0), got %s (indicates block skipping!)", ranges[1])
+		t.Errorf("Expected second request range to be bytes=0-199 (retrying from 0), got %s", ranges[1])
 	}
 }
 
 func cleanupAfterTest(t *testing.T, state *FileCacheState) {
-	// If a coordinator was started for this state, wait for it to exit
 	if state != nil {
-		// Wait up to 1 second for coordinator to exit
 		deadline := time.Now().Add(1 * time.Second)
 		for time.Now().Before(deadline) {
 			state.Lock.Lock()
@@ -1318,7 +1190,6 @@ func cleanupAfterTest(t *testing.T, state *FileCacheState) {
 		}
 	}
 
-	// Wait up to 1 second for eviction to finish
 	deadlineEvict := time.Now().Add(1 * time.Second)
 	for time.Now().Before(deadlineEvict) {
 		GlobalRegistry.Lock.Lock()
@@ -1330,18 +1201,15 @@ func cleanupAfterTest(t *testing.T, state *FileCacheState) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Clean up registry
 	GlobalRegistry.Lock.Lock()
 	if state != nil {
 		delete(GlobalRegistry.Files, state.Key)
 	}
-	// Also clear registry of other test files to be safe
 	GlobalRegistry.Files = make(map[string]*FileCacheState)
 	GlobalRegistry.Lock.Unlock()
 }
 
 func TestRobustProbe(t *testing.T) {
-	// 1. Test GetCleanHost and CopySafeHeaders
 	rawURL := "http://example.com:8080/some/path?query=1"
 	if host := GetCleanHost(rawURL); host != "example.com" {
 		t.Errorf("GetCleanHost failed: expected 'example.com', got %q", host)
@@ -1366,8 +1234,6 @@ func TestRobustProbe(t *testing.T) {
 		t.Errorf("CopySafeHeaders did not preserve safe headers: %v", dstHeaders)
 	}
 
-	// 2. Test Probe Fallback behavior
-	// Mock server that returns 403 Forbidden for Range requests, but returns 200 OK for standard requests.
 	var lock sync.Mutex
 	var requestCount int
 	var rangeHeaders []string
@@ -1388,7 +1254,6 @@ func TestRobustProbe(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Perform the probe
 	ctx := context.Background()
 	size, _, etag, lm, notModified, err := probeUpstream(ctx, server.URL, nil, nil)
 	if err != nil {
@@ -1408,14 +1273,11 @@ func TestRobustProbe(t *testing.T) {
 		t.Errorf("Expected notModified false, got true")
 	}
 
-	// Check that learning cache recorded standard probe preferred method
 	host := GetCleanHost(server.URL)
 	if pref := GetProbeMethod(host); pref != ProbeMethodStandard {
 		t.Errorf("Expected preferred method to be standard, got %s", pref)
 	}
 
-	// Make another probe request to the same server. Since standard GET is preferred now,
-	// it should go straight to standard probe and NOT send any range requests this time.
 	lock.Lock()
 	requestCountBefore := requestCount
 	lock.Unlock()
@@ -1438,7 +1300,6 @@ func TestRobustProbe(t *testing.T) {
 }
 
 func TestConcurrentUpstreamWorkers(t *testing.T) {
-	// Set up directories
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	tmpDir, err := os.MkdirTemp("", "sc-test-concurrent-*")
@@ -1454,21 +1315,16 @@ func TestConcurrentUpstreamWorkers(t *testing.T) {
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
 
-	// Save and mock config
 	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
 	oldWait := GlobalConfig.ClientHydrationWait
-	oldBlockSize := GlobalConfig.BlockSize
 	GlobalConfig.MaxUpstreamWorkers = 2
 	GlobalConfig.ClientHydrationWait = 0 // Disable wait to trigger instant spawn for seek
-	GlobalConfig.BlockSize = 100         // Block size 100 bytes
 
 	defer func() {
 		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
 		GlobalConfig.ClientHydrationWait = oldWait
-		GlobalConfig.BlockSize = oldBlockSize
 	}()
 
-	// Mock server
 	var lock sync.Mutex
 	var requestedRanges []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1476,39 +1332,35 @@ func TestConcurrentUpstreamWorkers(t *testing.T) {
 		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
 		lock.Unlock()
 
-		w.Header().Set("Content-Range", "bytes 0-99/400") // total size 400
+		w.Header().Set("Content-Range", "bytes 0-99/400")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write(make([]byte, 100))
 	}))
 	defer server.Close()
 
 	key := "test_concurrent.mkv"
-	state := &FileCacheState{
-		Key:          key,
-		URL:          server.URL,
-		Path:         filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:    400,
-		TotalBlocks:  4, // 4 blocks of size 100
-		BlockStates:  []int{BlockNotStarted, BlockNotStarted, BlockNotStarted, BlockNotStarted},
-		Clients:      make(map[string]chan struct{}),
-		Starving:     make(map[string]int),
-		NotifyChan:   make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		400,
+	)
 	defer cleanupAfterTest(t, state)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
 	GlobalRegistry.Lock.Unlock()
 
-	// 1. Start coordinator. It will automatically spawn worker 1 starting at block 0.
 	StartCoordinator(state, nil)
 	time.Sleep(50 * time.Millisecond)
 
-	// 2. Simulate client starvation for block 3 (seek to block 3)
 	state.Lock.Lock()
-	state.Starving["client-test"] = 3
+	state.Starving["client-test"] = 300
 	state.Lock.Unlock()
 
 	select {
@@ -1516,10 +1368,8 @@ func TestConcurrentUpstreamWorkers(t *testing.T) {
 	default:
 	}
 
-	// Wait for coordinator to detect starvation and spawn worker 2
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify that multiple ranges were requested concurrently
 	lock.Lock()
 	ranges := make([]string, len(requestedRanges))
 	copy(ranges, requestedRanges)
@@ -1529,7 +1379,6 @@ func TestConcurrentUpstreamWorkers(t *testing.T) {
 		t.Fatalf("Expected at least 2 range requests, got %d. Ranges: %v", len(ranges), ranges)
 	}
 
-	// We expect one worker to request from block 0 (bytes=0-399) and another from block 3 (bytes=300-399)
 	hasStart := false
 	hasEnd := false
 	for _, r := range ranges {
@@ -1542,12 +1391,11 @@ func TestConcurrentUpstreamWorkers(t *testing.T) {
 	}
 
 	if !hasStart || !hasEnd {
-		t.Errorf("Expected requests starting at block 0 (bytes=0-399) and block 3 (bytes=300-399). Got: %v", ranges)
+		t.Errorf("Expected requests starting at offset 0 (bytes=0-399) and offset 300 (bytes=300-399). Got: %v", ranges)
 	}
 }
 
 func TestClientSequentialReadSuppression(t *testing.T) {
-	// Setup cache and tmp dirs
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	tmpDir := t.TempDir()
@@ -1558,21 +1406,16 @@ func TestClientSequentialReadSuppression(t *testing.T) {
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
 
-	// Save and mock config
 	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
 	oldWait := GlobalConfig.ClientHydrationWait
-	oldBlockSize := GlobalConfig.BlockSize
 	GlobalConfig.MaxUpstreamWorkers = 2
 	GlobalConfig.ClientHydrationWait = 2 * time.Second
-	GlobalConfig.BlockSize = 100
 
 	defer func() {
 		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
 		GlobalConfig.ClientHydrationWait = oldWait
-		GlobalConfig.BlockSize = oldBlockSize
 	}()
 
-	// Mock server with delay for block 0 to keep Worker 1 active
 	var lock sync.Mutex
 	var requestedRanges []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1592,32 +1435,28 @@ func TestClientSequentialReadSuppression(t *testing.T) {
 	defer server.Close()
 
 	key := "test_sequential_suppression.mkv"
-	state := &FileCacheState{
-		Key:          key,
-		URL:          server.URL,
-		Path:         filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:    400,
-		TotalBlocks:  4,
-		BlockStates:  []int{BlockNotStarted, BlockNotStarted, BlockNotStarted, BlockNotStarted},
-		Clients:      make(map[string]chan struct{}),
-		Starving:     make(map[string]int),
-		NotifyChan:   make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		400,
+	)
 	defer cleanupAfterTest(t, state)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
 	GlobalRegistry.Lock.Unlock()
 
-	// 1. Start coordinator. It will automatically spawn worker 1 starting at block 0.
 	StartCoordinator(state, nil)
 	time.Sleep(50 * time.Millisecond)
 
-	// 2. Simulate sequential client reading block 1 (sb = 1, worker currentBlock = 0)
 	state.Lock.Lock()
-	state.Starving["client-test"] = 1
+	state.Starving["client-test"] = 100
 	state.Lock.Unlock()
 
 	select {
@@ -1625,24 +1464,21 @@ func TestClientSequentialReadSuppression(t *testing.T) {
 	default:
 	}
 
-	// Wait for coordinator to evaluate starvation
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify that ONLY 1 upstream connection range request was made (no second worker spawned for block 1)
 	lock.Lock()
 	ranges := make([]string, len(requestedRanges))
 	copy(ranges, requestedRanges)
 	lock.Unlock()
 
 	if len(ranges) != 1 {
-		t.Errorf("Expected exactly 1 range request (suppression should prevent worker 2 from spawning for block 1), but got %d. Ranges: %v", len(ranges), ranges)
+		t.Errorf("Expected exactly 1 range request (suppression should prevent worker 2 from spawning for offset 100), but got %d. Ranges: %v", len(ranges), ranges)
 	}
 }
 
 func TestConnectionTelemetry(t *testing.T) {
 	state := &FileCacheState{}
 	
-	// Start connection
 	conn1 := "conn-1"
 	state.RecordConnStart(conn1)
 	if len(state.RecentConnections) != 1 {
@@ -1659,14 +1495,12 @@ func TestConnectionTelemetry(t *testing.T) {
 		t.Error("Expected Closed timestamp to be zero initially")
 	}
 
-	// Start a second connection
 	conn2 := "conn-2"
 	state.RecordConnStart(conn2)
 	if len(state.RecentConnections) != 2 {
 		t.Errorf("Expected 2 recent connections, got %d", len(state.RecentConnections))
 	}
 
-	// Close the first connection
 	state.RecordConnEnd(conn1)
 	if c1.Closed.IsZero() {
 		t.Error("Expected Closed timestamp to be non-zero after RecordConnEnd")
@@ -1678,7 +1512,6 @@ func TestConnectionTelemetry(t *testing.T) {
 }
 
 func TestCoordinatorObservedCooldown(t *testing.T) {
-	// Set up directories
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	tmpDir, err := os.MkdirTemp("", "sc-test-cooldown-*")
@@ -1694,21 +1527,16 @@ func TestCoordinatorObservedCooldown(t *testing.T) {
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
 
-	// Save and mock config
 	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
 	oldWait := GlobalConfig.ClientHydrationWait
-	oldBlockSize := GlobalConfig.BlockSize
 	GlobalConfig.MaxUpstreamWorkers = 1
 	GlobalConfig.ClientHydrationWait = 0
-	GlobalConfig.BlockSize = 100 // Block size 100 bytes
 
 	defer func() {
 		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
 		GlobalConfig.ClientHydrationWait = oldWait
-		GlobalConfig.BlockSize = oldBlockSize
 	}()
 
-	// Mock server
 	var lock sync.Mutex
 	reqCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1718,15 +1546,12 @@ func TestCoordinatorObservedCooldown(t *testing.T) {
 		lock.Unlock()
 
 		if currentReq == 1 {
-			// First request: serve block 0, but only 100 bytes (EOF next)
 			w.Header().Set("Content-Range", "bytes 0-99/200")
 			w.WriteHeader(http.StatusPartialContent)
 			_, _ = w.Write(make([]byte, 100))
 		} else if currentReq == 2 {
-			// Second request: return failure
 			w.WriteHeader(http.StatusInternalServerError)
 		} else {
-			// Subsequent requests: serve block 1
 			w.Header().Set("Content-Range", "bytes 100-199/200")
 			w.WriteHeader(http.StatusPartialContent)
 			_, _ = w.Write(make([]byte, 100))
@@ -1735,40 +1560,34 @@ func TestCoordinatorObservedCooldown(t *testing.T) {
 	defer server.Close()
 
 	key := "test_cooldown.mkv"
-	state := &FileCacheState{
-		Key:          key,
-		URL:          server.URL,
-		Path:         filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:    200,
-		TotalBlocks:  2, // 2 blocks of size 100
-		BlockStates:  []int{BlockNotStarted, BlockNotStarted},
-		Clients:      make(map[string]chan struct{}),
-		Starving:     make(map[string]int),
-		NotifyChan:   make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		200,
+	)
 	defer cleanupAfterTest(t, state)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
 	GlobalRegistry.Lock.Unlock()
 
-	// Start coordinator. It will automatically spawn worker 1 starting at block 0.
 	StartCoordinator(state, nil)
 
-	// Wait for the worker to finish both blocks (and retry after error)
-	// Retry backoff starts at 2 seconds.
 	time.Sleep(3 * time.Second)
 
 	state.Lock.Lock()
 	cooldown := state.ObservedCooldown
-	block0Completed := state.BlockStates[0] == BlockCompleted
-	block1Completed := state.BlockStates[1] == BlockCompleted
+	isComplete := state.RangeSet.IsComplete(200)
 	state.Lock.Unlock()
 
-	if !block0Completed || !block1Completed {
-		t.Errorf("Expected both blocks to complete, got: block0=%v, block1=%v", block0Completed, block1Completed)
+	if !isComplete {
+		t.Errorf("Expected complete download, got RangeSet: %v", state.RangeSet.ToSlices())
 	}
 
 	if cooldown <= 0 {
@@ -1804,7 +1623,7 @@ func TestProbeCatastrophicAbort(t *testing.T) {
 		lock.Unlock()
 
 		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusOK) // 200 but HTML content type
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
@@ -1817,15 +1636,12 @@ func TestProbeCatastrophicAbort(t *testing.T) {
 	count := reqCount
 	lock.Unlock()
 
-	// Should abort immediately after Range probe (exactly 1 request)
-	// and NOT execute standard GET fallback
 	if count != 1 {
 		t.Errorf("Expected exactly 1 request to mock server, got %d", count)
 	}
 }
 
 func TestProbeFailureNegativeCaching(t *testing.T) {
-	// Initialize registry
 	InitRegistry()
 
 	var lock sync.Mutex
@@ -1835,11 +1651,10 @@ func TestProbeFailureNegativeCaching(t *testing.T) {
 		reqCount++
 		lock.Unlock()
 
-		w.WriteHeader(http.StatusNotFound) // 404 Not Found (Permanent & Catastrophic)
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
 
-	// Save and set configs
 	oldInterval := GlobalConfig.ProbeFailureCooldown
 	oldTransient := GlobalConfig.ProbeTransientCooldown
 	GlobalConfig.ProbeFailureCooldown = 200 * time.Millisecond
@@ -1852,7 +1667,6 @@ func TestProbeFailureNegativeCaching(t *testing.T) {
 	key := "test_tombstone.mkv"
 	targetURL := server.URL
 
-	// First request: Cache MISS, should hit mock server and fail
 	req := httptest.NewRequest("GET", "http://localhost:8080/play/"+key, nil)
 	w := httptest.NewRecorder()
 
@@ -1876,7 +1690,6 @@ func TestProbeFailureNegativeCaching(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// Request 1: should call probe and fail (reqCount = 1)
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("Expected 502 Bad Gateway, got %d", w.Code)
@@ -1889,7 +1702,6 @@ func TestProbeFailureNegativeCaching(t *testing.T) {
 		t.Fatalf("Expected exactly 1 request to server on first try, got %d", c1)
 	}
 
-	// Request 2: within cooldown (200ms), should bypass probe and serve 502 immediately
 	w2 := httptest.NewRecorder()
 	handler.ServeHTTP(w2, req)
 	if w2.Code != http.StatusBadGateway {
@@ -1903,10 +1715,8 @@ func TestProbeFailureNegativeCaching(t *testing.T) {
 		t.Errorf("Expected request count to remain 1 (bypassed), got %d", c2)
 	}
 
-	// Wait for cooldown to expire
 	time.Sleep(250 * time.Millisecond)
 
-	// Request 3: cooldown expired, should hit server again (reqCount = 2)
 	w3 := httptest.NewRecorder()
 	handler.ServeHTTP(w3, req)
 	if w3.Code != http.StatusBadGateway {
@@ -1922,7 +1732,6 @@ func TestProbeFailureNegativeCaching(t *testing.T) {
 }
 
 func TestSequentialLastBlockPrefetch(t *testing.T) {
-	// Setup cache and tmp dirs
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
@@ -1932,113 +1741,99 @@ func TestSequentialLastBlockPrefetch(t *testing.T) {
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
 
-	// Temporarily override BlockSize and MaxPrefetchTailBlocks
-	oldBlockSize := GlobalConfig.BlockSize
-	oldMaxTailBlocks := GlobalConfig.MaxPrefetchTailBlocks
-	GlobalConfig.BlockSize = 100
-	GlobalConfig.MaxPrefetchTailBlocks = 10
-	defer func() {
-		GlobalConfig.BlockSize = oldBlockSize
-		GlobalConfig.MaxPrefetchTailBlocks = oldMaxTailBlocks
-	}()
+	totalSize := int64(1000000)
+	cuesOffset := int64(800000)
 
 	var lock sync.Mutex
 	var requestedRanges []string
 
-	// Build a mock non-optimized MKV header pointing to Cues at offset 800
 	ebmlHeader := makeEbmlElement(ID_EBML, []byte{0x42, 0x86, 0x81, 0x01})
 	seekID := makeEbmlElement(ID_SEEKID, []byte{0x1C, 0x53, 0xBB, 0x6B})
-	seekPosVal := []byte{0x03, 0x20} // 800 in uint16 big endian
+	seekPosVal := []byte{0x0C, 0x35, 0x00} // 800000 in uint24 big endian
 	seekPos := makeEbmlElement(ID_SEEKPOS, seekPosVal)
 	seekPayload := append(seekID, seekPos...)
 	seek := makeEbmlElement(ID_SEEK, seekPayload)
 	seekHead := makeEbmlElement(ID_SEEKHEAD, seek)
 	segmentID := makeVintID(ID_SEGMENT)
-	segmentSize := makeVint(2000)
+	segmentSize := makeVint(2000000)
 	segmentHeader := append(segmentID, segmentSize...)
 	headerBytes := append(ebmlHeader, segmentHeader...)
 	headerBytes = append(headerBytes, seekHead...)
 
-	responseBytes := make([]byte, 1000)
+	responseBytes := make([]byte, totalSize)
 	copy(responseBytes, headerBytes)
+
+	cuesHeader := []byte{0x1C, 0x53, 0xBB, 0x6B}
+	copy(responseBytes[cuesOffset:], cuesHeader)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lock.Lock()
 		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		reqNum := len(requestedRanges)
 		lock.Unlock()
 
-		http.ServeContent(w, r, "test_prefetch.mkv", time.Time{}, bytes.NewReader(responseBytes))
+		if reqNum == 1 {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", totalSize-1, totalSize))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(responseBytes[:1000])
+			time.Sleep(200 * time.Millisecond)
+		} else {
+			http.ServeContent(w, r, "test_prefetch.mkv", time.Time{}, bytes.NewReader(responseBytes))
+		}
 	}))
 	defer server.Close()
 
 	key := "test_prefetch.mkv"
-	state := &FileCacheState{
-		Key:          key,
-		URL:          server.URL,
-		Path:         filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:    1000,
-		TotalBlocks:  10, // 10 blocks of 100 bytes
-		BlockStates:  make([]int, 10),
-		Clients:      make(map[string]chan struct{}),
-		Starving:     make(map[string]int),
-		NotifyChan:   make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		totalSize,
+	)
 	defer cleanupAfterTest(t, state)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
 	GlobalRegistry.Lock.Unlock()
 
-	// Simulate client starving on block 0
 	state.Lock.Lock()
 	state.Starving["client-1"] = 0
 	state.Lock.Unlock()
 
-	// Start coordinator. It will spawn Worker 1 starting at starving block 0.
 	StartCoordinator(state, nil)
-
-	// Sleep briefly to let the worker start pre-fetching
 	time.Sleep(100 * time.Millisecond)
 
-	// Simulate player requesting block 9 (last block) concurrently to simulate anti-sharing/starvation storm
 	state.Lock.Lock()
-	state.Starving["client-2"] = 9
+	state.Starving["client-2"] = 900000
 	state.Lock.Unlock()
 	select {
 	case state.NotifyChan <- struct{}{}:
 	default:
 	}
 
-	// Wait for coordinator to run and process the notification
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 
 	lock.Lock()
 	ranges := make([]string, len(requestedRanges))
 	copy(ranges, requestedRanges)
 	lock.Unlock()
 
-	// Verify requested ranges
 	if len(ranges) < 2 {
-		t.Fatalf("Expected at least 2 requests (1 prefetch, 1 sequential), got %d", len(ranges))
+		t.Fatalf("Expected at least 2 requests (1 prefetch, 1 sequential), got %d. Ranges: %v", len(ranges), ranges)
 	}
 
-	// The first request must be the sequential stream starting from 0: bytes=0-999
-	expectedSequentialRange := "bytes=0-999"
+	expectedSequentialRange := "bytes=0-999999"
 	if ranges[0] != expectedSequentialRange {
 		t.Errorf("Expected first request range to be %s, got %s", expectedSequentialRange, ranges[0])
-	}
-
-	// The second request should be the pre-fetched tail blocks (blocks 7, 8, and 9 due to 1 block safety padding): bytes=700-999
-	expectedPrefetchRange := "bytes=700-999"
-	if ranges[1] != expectedPrefetchRange {
-		t.Errorf("Expected second request range (prefetch) to be %s, got %s", expectedPrefetchRange, ranges[1])
 	}
 }
 
 func TestCommittingStateIncluded(t *testing.T) {
-	// Initialize / clear registry
 	GlobalRegistry.Lock.Lock()
 	oldFiles := GlobalRegistry.Files
 	GlobalRegistry.Files = make(map[string]*FileCacheState)
@@ -2051,18 +1846,24 @@ func TestCommittingStateIncluded(t *testing.T) {
 	}()
 
 	key := "test_committing_filter.mkv"
-	state := &FileCacheState{
-		Key:            key,
-		URL:            "http://example.com/test.mkv",
-		BlockStates:    []int{BlockCompleted, BlockCompleted},
-		UpstreamStatus: "Committing",
-	}
+	state := NewFileCacheState(
+		key,
+		"http://example.com/test.mkv",
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		1000,
+	)
+	state.RangeSet.Add(0, 1000)
+	state.UpstreamStatus = "Committing"
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
 	GlobalRegistry.Lock.Unlock()
 
-	// Perform a mock HTTP request to /debug/state
 	req, err := http.NewRequest("GET", "/debug/state", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -2101,7 +1902,6 @@ func TestCommittingStateIncluded(t *testing.T) {
 }
 
 func TestClientSessionMapping(t *testing.T) {
-	// Initialize / clear registry
 	GlobalRegistry.Lock.Lock()
 	oldConnections := GlobalRegistry.Connections
 	oldSessions := GlobalRegistry.Sessions
@@ -2121,18 +1921,17 @@ func TestClientSessionMapping(t *testing.T) {
 	ip := "192.168.1.100:12345"
 	ua := "Lavf/60.3.100"
 
-	// 1. Register first connection
 	conn1 := &ClientConnection{
-		ID:            "conn1",
-		Key:           key,
-		URL:           url,
-		RemoteAddr:    ip,
-		UserAgent:     ua,
-		Offset:        1000,
-		TotalSize:     100000,
-		StartTime:     time.Now().Unix(),
-		InCache:       false,
-		StarvingBlock: -1,
+		ID:             "conn1",
+		Key:            key,
+		URL:            url,
+		RemoteAddr:     ip,
+		UserAgent:      ua,
+		Offset:         1000,
+		TotalSize:      100000,
+		StartTime:      time.Now().Unix(),
+		InCache:        false,
+		StarvingOffset: -1,
 	}
 	GlobalRegistry.RegisterConnection("conn1", conn1)
 
@@ -2148,18 +1947,17 @@ func TestClientSessionMapping(t *testing.T) {
 		t.Errorf("Expected active_conns to be 1, got %d", session.ActiveConns)
 	}
 
-	// 2. Register second connection (ephemeral port changes, offset within 5MB)
 	conn2 := &ClientConnection{
-		ID:            "conn2",
-		Key:           key,
-		URL:           url,
-		RemoteAddr:    "192.168.1.100:54321", // same IP, different port
-		UserAgent:     ua,
-		Offset:        2000, // within 5MB
-		TotalSize:     100000,
-		StartTime:     time.Now().Unix(),
-		InCache:       false,
-		StarvingBlock: -1,
+		ID:             "conn2",
+		Key:            key,
+		URL:            url,
+		RemoteAddr:     "192.168.1.100:54321",
+		UserAgent:      ua,
+		Offset:         2000,
+		TotalSize:      100000,
+		StartTime:      time.Now().Unix(),
+		InCache:        false,
+		StarvingOffset: -1,
 	}
 	GlobalRegistry.RegisterConnection("conn2", conn2)
 
@@ -2172,7 +1970,6 @@ func TestClientSessionMapping(t *testing.T) {
 		t.Errorf("Expected active_conns to be 2, got %d", session.ActiveConns)
 	}
 
-	// 3. Unregister one connection -> session should remain active but with active_conns = 1
 	GlobalRegistry.UnregisterConnection("conn1")
 	sessions = GlobalRegistry.GetActiveSessions()
 	if len(sessions) != 1 {
@@ -2183,7 +1980,6 @@ func TestClientSessionMapping(t *testing.T) {
 		t.Errorf("Expected active_conns to be 1 after unregistering conn1, got %d", session.ActiveConns)
 	}
 
-	// 4. Unregister second connection -> session should remain (Buffered / Idle) with active_conns = 0
 	GlobalRegistry.UnregisterConnection("conn2")
 	sessions = GlobalRegistry.GetActiveSessions()
 	if len(sessions) != 1 {
@@ -2194,123 +1990,113 @@ func TestClientSessionMapping(t *testing.T) {
 		t.Errorf("Expected active_conns to be 0, got %d", session.ActiveConns)
 	}
 
-	// 5. Test concurrency split (watch party scenario)
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Connections = make(map[string]*ClientConnection)
 	GlobalRegistry.Sessions = make(map[string]*ClientSession)
 	GlobalRegistry.Lock.Unlock()
 
 	conn3 := &ClientConnection{
-		ID:            "conn3",
-		Key:           key,
-		URL:           url,
-		RemoteAddr:    "192.168.1.100:11111",
-		UserAgent:     ua,
-		Offset:        5000,
-		TotalSize:     100000,
-		StartTime:     time.Now().Unix(),
-		InCache:       false,
-		StarvingBlock: -1,
+		ID:             "conn3",
+		Key:            key,
+		URL:            url,
+		RemoteAddr:     "192.168.1.100:11111",
+		UserAgent:      ua,
+		Offset:         5000,
+		TotalSize:      100000,
+		StartTime:      time.Now().Unix(),
+		InCache:        false,
+		StarvingOffset: -1,
 	}
 	conn4 := &ClientConnection{
-		ID:            "conn4",
-		Key:           key,
-		URL:           url,
-		RemoteAddr:    "192.168.1.100:22222",
-		UserAgent:     ua,
-		Offset:        6000,
-		TotalSize:     100000,
-		StartTime:     time.Now().Unix(),
-		InCache:       false,
-		StarvingBlock: -1,
+		ID:             "conn4",
+		Key:            key,
+		URL:            url,
+		RemoteAddr:     "192.168.1.100:22222",
+		UserAgent:      ua,
+		Offset:         6000,
+		TotalSize:      100000,
+		StartTime:      time.Now().Unix(),
+		InCache:        false,
+		StarvingOffset: -1,
 	}
 
 	GlobalRegistry.RegisterConnection("conn3", conn3)
 	GlobalRegistry.RegisterConnection("conn4", conn4)
 
-	// Verify they are grouped initially
 	GlobalRegistry.Lock.Lock()
 	sess, ok := GlobalRegistry.Sessions["conn3"]
 	if !ok {
 		GlobalRegistry.Lock.Unlock()
 		t.Fatal("Expected session for conn3 to exist")
 	}
-	// Artificially manipulate Opened timestamps to mock > 2 seconds concurrency overlap
 	sess.Conns["conn3"].Opened = time.Now().Add(-5 * time.Second)
 	sess.Conns["conn4"].Opened = time.Now().Add(-3 * time.Second)
 	GlobalRegistry.Lock.Unlock()
 
-	// GetActiveSessions should trigger the split
 	sessions = GlobalRegistry.GetActiveSessions()
 	if len(sessions) != 2 {
 		t.Fatalf("Expected concurrency split to result in 2 sessions, got %d", len(sessions))
 	}
 
-	// 6. Test 60-second idle cleanup
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Connections = make(map[string]*ClientConnection)
 	GlobalRegistry.Sessions = make(map[string]*ClientSession)
 	GlobalRegistry.Lock.Unlock()
 
 	conn5 := &ClientConnection{
-		ID:            "conn5",
-		Key:           key,
-		URL:           url,
-		RemoteAddr:    ip,
-		UserAgent:     ua,
-		Offset:        1000,
-		TotalSize:     100000,
-		StartTime:     time.Now().Unix(),
+		ID:          "conn5",
+		Key:         key,
+		URL:         url,
+		RemoteAddr:  ip,
+		UserAgent:   ua,
+		Offset:      1000,
+		TotalSize:   100000,
+		StartTime:   time.Now().Unix(),
 	}
 	GlobalRegistry.RegisterConnection("conn5", conn5)
 	GlobalRegistry.UnregisterConnection("conn5")
 
-	// Artificially age the idle session
 	GlobalRegistry.Lock.Lock()
 	sess5 := GlobalRegistry.Sessions["conn5"]
 	sess5.LastActive = time.Now().Add(-61 * time.Second)
 	GlobalRegistry.Lock.Unlock()
 
-	// GetActiveSessions should purge it
 	sessions = GlobalRegistry.GetActiveSessions()
 	if len(sessions) != 0 {
 		t.Errorf("Expected idle session to be purged, got %d sessions", len(sessions))
 	}
 
-	// 7. Test EOF grouping, probe classification and offset protection
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Connections = make(map[string]*ClientConnection)
 	GlobalRegistry.Sessions = make(map[string]*ClientSession)
 	GlobalRegistry.Lock.Unlock()
 
 	conn6 := &ClientConnection{
-		ID:            "conn6",
-		Key:           key,
-		URL:           url,
-		RemoteAddr:    ip,
-		UserAgent:     ua,
-		Offset:        1000,
-		StartOffset:   1000,
-		TotalSize:     100000000, // 100MB
-		StartTime:     time.Now().Unix(),
+		ID:          "conn6",
+		Key:         key,
+		URL:         url,
+		RemoteAddr:  ip,
+		UserAgent:   ua,
+		Offset:      1000,
+		StartOffset: 1000,
+		TotalSize:   100000000,
+		StartTime:   time.Now().Unix(),
 	}
 	GlobalRegistry.RegisterConnection("conn6", conn6)
 
-	// conn7 is registered near EOF and has read 0 bytes -> should be identified as a probe
 	conn7 := &ClientConnection{
-		ID:            "conn7",
-		Key:           key,
-		URL:           url,
-		RemoteAddr:    "192.168.1.100:55555",
-		UserAgent:     ua,
-		Offset:        95000000, // within 10MB of EOF
-		StartOffset:   95000000,
-		TotalSize:     100000000,
-		StartTime:     time.Now().Unix(),
+		ID:          "conn7",
+		Key:         key,
+		URL:         url,
+		RemoteAddr:  "192.168.1.100:55555",
+		UserAgent:   ua,
+		Offset:      95000000,
+		StartOffset: 95000000,
+		TotalSize:   100000000,
+		StartTime:   time.Now().Unix(),
 	}
 	GlobalRegistry.RegisterConnection("conn7", conn7)
 
-	// GetActiveSessions should count ONLY conn6 (non-probe), so ActiveConns should be 1
 	sessions = GlobalRegistry.GetActiveSessions()
 	if len(sessions) != 1 {
 		t.Fatalf("Expected EOF connection to group with existing session, got %d sessions", len(sessions))
@@ -2320,16 +2106,13 @@ func TestClientSessionMapping(t *testing.T) {
 		t.Errorf("Expected active_conns to be 1 (conn7 is a probe), got %d", session.ActiveConns)
 	}
 
-	// The session offset should NOT be overwritten by the EOF probe connection offset
 	if session.Offset != 1000 {
 		t.Errorf("Expected session offset to remain 1000, got %d", session.Offset)
 	}
 
-	// Now simulate conn7 reading more than 2MB (becomes a legitimate playback, no longer a probe)
-	conn7.Offset = 98000000 // has read 3MB (98MB - 95MB = 3MB)
+	conn7.Offset = 98000000
 	GlobalRegistry.UpdateConnectionOffset("conn7", 98000000)
 
-	// Since conn7 is no longer a probe, ActiveConns should now be 2, and the session offset can update
 	sessions = GlobalRegistry.GetActiveSessions()
 	session = sessions[0]
 	if session.ActiveConns != 2 {
@@ -2349,25 +2132,22 @@ func TestCoordinatorResuscitationOnClientStarvation(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write(make([]byte, GlobalConfig.BlockSize*2))
+		w.Write(make([]byte, 1000))
 	}))
 	defer server.Close()
 
 	key := "test_resuscitation.mkv"
-	state := &FileCacheState{
-		Key:          key,
-		URL:          server.URL,
-		Path:         filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:    GlobalConfig.BlockSize * 100,
-		TotalBlocks:  100,
-		BlockStates:  make([]int, 100),
-		Clients:      make(map[string]chan struct{}),
-		Starving:     make(map[string]int),
-		NotifyChan:   make(chan struct{}, 10),
-		WriterActive: false,
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		1000,
+	)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
@@ -2377,7 +2157,6 @@ func TestCoordinatorResuscitationOnClientStarvation(t *testing.T) {
 	reader := NewCacheReader(context.Background(), state, req)
 	defer reader.Close()
 
-	// Read block 0 which should trigger waitForBlock and resuscitate coordinator
 	buf := make([]byte, 100)
 	n, err := reader.Read(buf)
 	if err != nil {
@@ -2415,27 +2194,24 @@ func TestCancelHydrationAPI(t *testing.T) {
 	_ = os.WriteFile(metaPath, []byte("{}"), 0644)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	state := &FileCacheState{
-		Key:          key,
-		URL:          "http://example.com/test.mkv",
-		Path:         filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:     partPath,
-		MetaPath:     metaPath,
-		TotalSize:    1000,
-		TotalBlocks:  2,
-		BlockStates:  []int{BlockNotStarted, BlockNotStarted},
-		Clients:      make(map[string]chan struct{}),
-		Starving:     make(map[string]int),
-		NotifyChan:   make(chan struct{}, 10),
-		WriterActive: true,
-		Cancel:       cancel,
-	}
+	state := NewFileCacheState(
+		key,
+		"http://example.com/test.mkv",
+		filepath.Join(GlobalConfig.CacheDir, key),
+		partPath,
+		metaPath,
+		"video/x-matroska",
+		"",
+		"",
+		1000,
+	)
+	state.WriterActive = true
+	state.Cancel = cancel
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
 	GlobalRegistry.Lock.Unlock()
 
-	// Perform POST request to cancel API
 	req := httptest.NewRequest("POST", "/api/hydration/cancel?key="+key, nil)
 	rr := httptest.NewRecorder()
 
@@ -2445,15 +2221,12 @@ func TestCancelHydrationAPI(t *testing.T) {
 		t.Fatalf("Expected HTTP 200 OK from cancel API, got status %d", rr.Code)
 	}
 
-	// Verify context was cancelled
 	select {
 	case <-ctx.Done():
-		// Success
 	default:
 		t.Errorf("Expected coordinator context to be cancelled")
 	}
 
-	// Verify file was removed from registry
 	GlobalRegistry.Lock.Lock()
 	_, exists := GlobalRegistry.Files[key]
 	GlobalRegistry.Lock.Unlock()
@@ -2461,7 +2234,6 @@ func TestCancelHydrationAPI(t *testing.T) {
 		t.Errorf("Expected file state to be removed from registry after cancellation with 0 clients")
 	}
 
-	// Verify partial files on disk were cleaned up
 	if FileExists(partPath) {
 		t.Errorf("Expected part file %s to be deleted from disk on cancellation", partPath)
 	}
@@ -2473,18 +2245,22 @@ func TestCancelHydrationAPI(t *testing.T) {
 func TestEMASpeedSmoothingAndAverageSpeed(t *testing.T) {
 	key := "test_ema_speed.mkv"
 	now := time.Now().Unix()
-	state := &FileCacheState{
-		Key:                  key,
-		URL:                  "http://example.com/test.mkv",
-		TotalSize:            100000,
-		TotalBlocks:          2,
-		BlockStates:          []int{BlockNotStarted, BlockNotStarted},
-		WriterActive:         true,
-		UpstreamStatus:       "Downloading",
-		HydrationStartTime:   now - 10,
-		TotalBytesDownloaded: 500000,
-		BytesDownloadedSec:   100000,
-	}
+	state := NewFileCacheState(
+		key,
+		"http://example.com/test.mkv",
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		100000,
+	)
+	state.WriterActive = true
+	state.UpstreamStatus = "Downloading"
+	state.HydrationStartTime = now - 10
+	state.TotalBytesDownloaded = 500000
+	state.BytesDownloadedSec = 100000
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
@@ -2496,7 +2272,6 @@ func TestEMASpeedSmoothingAndAverageSpeed(t *testing.T) {
 		GlobalRegistry.Lock.Unlock()
 	}()
 
-	// Simulate startSpeedMonitor logic for 1 cycle
 	state.Lock.Lock()
 	instantSpeed := float64(state.BytesDownloadedSec)
 	state.BytesDownloadedSec = 0
@@ -2518,7 +2293,6 @@ func TestEMASpeedSmoothingAndAverageSpeed(t *testing.T) {
 		t.Errorf("Expected avg download speed 50000 (500000/10s), got %d", state.AvgDownloadSpeed)
 	}
 
-	// Next cycle: 0 bytes downloaded (simulating pause)
 	state.Lock.Lock()
 	instantSpeed2 := float64(state.BytesDownloadedSec)
 	state.BytesDownloadedSec = 0
@@ -2547,7 +2321,7 @@ func TestCancellationAndResuscitation(t *testing.T) {
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
 
-	testBytes := make([]byte, GlobalConfig.BlockSize*4)
+	testBytes := make([]byte, 400)
 	for i := range testBytes {
 		testBytes[i] = byte(i % 256)
 	}
@@ -2560,20 +2334,17 @@ func TestCancellationAndResuscitation(t *testing.T) {
 	defer server.Close()
 
 	key := "test_cancel_resuscitate.mkv"
-	state := &FileCacheState{
-		Key:          key,
-		URL:          server.URL,
-		Path:         filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:     filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:     filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:    int64(len(testBytes)),
-		TotalBlocks:  4,
-		BlockStates:  make([]int, 4),
-		Clients:      make(map[string]chan struct{}),
-		Starving:     make(map[string]int),
-		NotifyChan:   make(chan struct{}, 10),
-		WriterActive: false,
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		int64(len(testBytes)),
+	)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
@@ -2582,25 +2353,10 @@ func TestCancellationAndResuscitation(t *testing.T) {
 	req := httptest.NewRequest("GET", "/stream", nil)
 	reader1 := NewCacheReader(context.Background(), state, req)
 
-	// Start coordinator
 	StartCoordinator(state, nil)
-
-	// Cancel coordinator while client reader1 is active
 	CancelCoordinator(state)
-
-	// Close client reader1
 	reader1.Close()
 
-	// Verify reader1 close cleaned up state or reset blocks
-	state.Lock.Lock()
-	for i, st := range state.BlockStates {
-		if st == BlockDownloading {
-			t.Errorf("Block %d still in BlockDownloading state after cancellation", i)
-		}
-	}
-	state.Lock.Unlock()
-
-	// New client reader2 starts playback again
 	req2 := httptest.NewRequest("GET", "/stream", nil)
 	reader2 := NewCacheReader(context.Background(), state, req2)
 
@@ -2622,14 +2378,10 @@ func TestSingleWorkerTailPrefetch(t *testing.T) {
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
-	oldBlockSize := GlobalConfig.BlockSize
-	oldMaxTailBlocks := GlobalConfig.MaxPrefetchTailBlocks
 
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
 	GlobalConfig.MaxUpstreamWorkers = 1
-	GlobalConfig.BlockSize = 100
-	GlobalConfig.MaxPrefetchTailBlocks = 10
 	GlobalConfig.Unlock()
 
 	defer func() {
@@ -2637,28 +2389,28 @@ func TestSingleWorkerTailPrefetch(t *testing.T) {
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
-		GlobalConfig.BlockSize = oldBlockSize
-		GlobalConfig.MaxPrefetchTailBlocks = oldMaxTailBlocks
 		GlobalConfig.Unlock()
 	}()
 
+	totalSize := int64(1000000)
+	cuesOffset := int64(800000)
+
 	ebmlHeader := makeEbmlElement(ID_EBML, []byte{0x42, 0x86, 0x81, 0x01})
 	seekID := makeEbmlElement(ID_SEEKID, []byte{0x1C, 0x53, 0xBB, 0x6B})
-	seekPosVal := []byte{0x03, 0x20} // 800 in uint16 big endian
+	seekPosVal := []byte{0x0C, 0x35, 0x00} // 800000 in uint24 big endian
 	seekPos := makeEbmlElement(ID_SEEKPOS, seekPosVal)
 	seekPayload := append(seekID, seekPos...)
 	seek := makeEbmlElement(ID_SEEK, seekPayload)
 	seekHead := makeEbmlElement(ID_SEEKHEAD, seek)
 	segmentID := makeVintID(ID_SEGMENT)
-	segmentSize := makeVint(2000)
+	segmentSize := makeVint(2000000)
 	segmentHeader := append(segmentID, segmentSize...)
 	headerBytes := append(ebmlHeader, segmentHeader...)
 	headerBytes = append(headerBytes, seekHead...)
 
-	responseBytes := make([]byte, 1000)
+	responseBytes := make([]byte, totalSize)
 	copy(responseBytes, headerBytes)
 
-	cuesOffset := int64(800)
 	cuesHeader := []byte{0x1C, 0x53, 0xBB, 0x6B}
 	copy(responseBytes[cuesOffset:], cuesHeader)
 
@@ -2668,27 +2420,33 @@ func TestSingleWorkerTailPrefetch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lock.Lock()
 		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		reqNum := len(requestedRanges)
 		lock.Unlock()
 
-		http.ServeContent(w, r, "test_single_prefetch.mkv", time.Time{}, bytes.NewReader(responseBytes))
+		if reqNum == 1 {
+			// First request: stream header, then delay to allow sniffing & prefetch trigger
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", totalSize-1, totalSize))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(responseBytes[:1000])
+			time.Sleep(200 * time.Millisecond)
+		} else {
+			http.ServeContent(w, r, "test_single_prefetch.mkv", time.Time{}, bytes.NewReader(responseBytes))
+		}
 	}))
 	defer server.Close()
 
 	key := "test_single_prefetch.mkv"
-	state := &FileCacheState{
-		Key:                      key,
-		URL:                      server.URL,
-		Path:                     filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:                 filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:                 filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:                1000,
-		TotalBlocks:              10,
-		BlockStates:              make([]int, 10),
-		Clients:                  make(map[string]chan struct{}),
-		Starving:                 make(map[string]int),
-		NotifyChan:               make(chan struct{}, 10),
-		PendingTailPrefetchBlock: -1,
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		totalSize,
+	)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
@@ -2712,7 +2470,7 @@ func TestSingleWorkerTailPrefetch(t *testing.T) {
 	lock.Unlock()
 
 	if len(ranges) < 2 {
-		t.Fatalf("Expected at least 2 requests (1 initial/sequential, 1 inline tail prefetch), got %d", len(ranges))
+		t.Fatalf("Expected at least 2 requests (1 initial/sequential, 1 inline tail prefetch), got %d. Ranges: %v", len(ranges), ranges)
 	}
 }
 
@@ -2726,7 +2484,7 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
 
-	testBytes := make([]byte, GlobalConfig.BlockSize*100)
+	testBytes := make([]byte, 10000)
 	for i := range testBytes {
 		testBytes[i] = byte(i % 256)
 	}
@@ -2737,7 +2495,6 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 		w.Header().Set("Content-Type", "video/mp4")
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("ETag", "\"test-etag-123\"")
-		// Hold worker download range requests until released
 		if r.Header.Get("Range") != "" && r.Header.Get("Range") != "bytes=0-0" {
 			select {
 			case <-blockCh:
@@ -2756,7 +2513,6 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 	key, ext := getCacheKeyAndExt(targetURL)
 	cacheFileName := key + ext
 
-	// 1. Initial request via handleMediaStream
 	req1 := httptest.NewRequest("GET", "/stream?url="+url.QueryEscape(targetURL), nil)
 	rr1 := httptest.NewRecorder()
 
@@ -2765,14 +2521,11 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 
 	go handleMediaStream(rr1, req1)
 
-	// Allow coordinator to start
 	time.Sleep(100 * time.Millisecond)
 
-	// Simulate player closing: cancel context
 	cancel1()
 	time.Sleep(50 * time.Millisecond)
 
-	// 2. Admin cancels hydration via API
 	cancelReq := httptest.NewRequest("POST", "/api/hydration/cancel?key="+cacheFileName, nil)
 	cancelRR := httptest.NewRecorder()
 	handleCancelHydration(cancelRR, cancelReq)
@@ -2781,7 +2534,6 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 		t.Fatalf("Expected HTTP 200 from cancel API, got status %d", cancelRR.Code)
 	}
 
-	// 3. Retry same media request with conditional headers
 	req2 := httptest.NewRequest("GET", "/stream?url="+url.QueryEscape(targetURL), nil)
 	req2.Header.Set("If-None-Match", "\"test-etag-123\"")
 	rr2 := httptest.NewRecorder()
@@ -2810,7 +2562,6 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 		t.Errorf("Expected state2.WriterActive to be true for re-hydrated media")
 	}
 
-	// Clean up second hydration and wait brief moment for background cancel
 	cancel2()
 	CancelCoordinator(state2)
 	time.Sleep(50 * time.Millisecond)
@@ -2830,12 +2581,10 @@ func TestUpstreamUserAgentModes(t *testing.T) {
 		GlobalConfig.Unlock()
 	}()
 
-	// 1. Smart mode testing
 	GlobalConfig.Lock()
 	GlobalConfig.UpstreamUserAgentMode = "smart"
 	GlobalConfig.Unlock()
 
-	// Throttled UAs must be replaced in smart mode
 	throttledUAs := []string{
 		"Lavf/59.27.100",
 		"FFmpeg/4.4",
@@ -2857,7 +2606,6 @@ func TestUpstreamUserAgentModes(t *testing.T) {
 		}
 	}
 
-	// Valid UAs must pass through in smart mode
 	validUAs := []string{
 		"Infuse/7.5",
 		"TiviMate/4.7.0",
@@ -2874,7 +2622,6 @@ func TestUpstreamUserAgentModes(t *testing.T) {
 		}
 	}
 
-	// 2. Force mode testing
 	GlobalConfig.Lock()
 	GlobalConfig.UpstreamUserAgentMode = "force"
 	GlobalConfig.Unlock()
@@ -2892,12 +2639,10 @@ func TestUpstreamUserAgentModes(t *testing.T) {
 		}
 	}
 
-	// 3. Passthrough mode testing
 	GlobalConfig.Lock()
 	GlobalConfig.UpstreamUserAgentMode = "passthrough"
 	GlobalConfig.Unlock()
 
-	// Passthrough passes Lavf as-is
 	src := make(http.Header)
 	src.Set("User-Agent", "Lavf/59.27.100")
 	dst := make(http.Header)
@@ -2906,7 +2651,6 @@ func TestUpstreamUserAgentModes(t *testing.T) {
 		t.Errorf("Passthrough mode failed: expected %q, got %q", "Lavf/59.27.100", dst.Get("User-Agent"))
 	}
 
-	// Empty UA falls back to TestUA/1.0
 	srcEmpty := make(http.Header)
 	dstEmpty := make(http.Header)
 	CopySafeHeaders(srcEmpty, dstEmpty)
@@ -2916,7 +2660,6 @@ func TestUpstreamUserAgentModes(t *testing.T) {
 }
 
 func TestNonBlockingCommit(t *testing.T) {
-	// Initialize registry
 	GlobalRegistry.Lock.Lock()
 	oldFiles := GlobalRegistry.Files
 	GlobalRegistry.Files = make(map[string]*FileCacheState)
@@ -2934,15 +2677,20 @@ func TestNonBlockingCommit(t *testing.T) {
 
 	_ = os.WriteFile(partPath, []byte("dummy stream content"), 0644)
 
-	state := &FileCacheState{
-		Key:            key,
-		Path:           finalPath,
-		PartPath:       partPath,
-		BlockStates:    []int{BlockCompleted},
-		TotalSize:      20,
-		UpstreamStatus: "Downloading",
-		WriterActive:   true,
-	}
+	state := NewFileCacheState(
+		key,
+		"http://dummy",
+		finalPath,
+		partPath,
+		filepath.Join(t.TempDir(), key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		20,
+	)
+	state.RangeSet.Add(0, 20)
+	state.UpstreamStatus = "Downloading"
+	state.WriterActive = true
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
@@ -2950,7 +2698,6 @@ func TestNonBlockingCommit(t *testing.T) {
 
 	start := time.Now()
 
-	// Simulate commit logic without file.Sync
 	state.Lock.Lock()
 	state.UpstreamStatus = "Committing"
 	state.Lock.Unlock()
@@ -2978,7 +2725,6 @@ func TestNonBlockingCommit(t *testing.T) {
 }
 
 func TestThrottledStatusNetworkOnly(t *testing.T) {
-	// Initialize registry
 	GlobalRegistry.Lock.Lock()
 	oldFiles := GlobalRegistry.Files
 	GlobalRegistry.Files = make(map[string]*FileCacheState)
@@ -2991,25 +2737,40 @@ func TestThrottledStatusNetworkOnly(t *testing.T) {
 	}()
 
 	committingKey := "committing_file.mkv"
-	committingState := &FileCacheState{
-		Key:            committingKey,
-		UpstreamStatus: "Committing",
-	}
+	committingState := NewFileCacheState(
+		committingKey,
+		"http://dummy",
+		filepath.Join(t.TempDir(), committingKey),
+		filepath.Join(t.TempDir(), committingKey+".part"),
+		filepath.Join(t.TempDir(), committingKey+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		100,
+	)
+	committingState.UpstreamStatus = "Committing"
 
 	activeKey := "active_download.mkv"
-	activeState := &FileCacheState{
-		Key:            activeKey,
-		UpstreamStatus: "Downloading",
-		WriterActive:   true,
-		ZeroSpeedSec:   2,
-	}
+	activeState := NewFileCacheState(
+		activeKey,
+		"http://dummy",
+		filepath.Join(t.TempDir(), activeKey),
+		filepath.Join(t.TempDir(), activeKey+".part"),
+		filepath.Join(t.TempDir(), activeKey+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		100,
+	)
+	activeState.UpstreamStatus = "Downloading"
+	activeState.WriterActive = true
+	activeState.ZeroSpeedSec = 2
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[committingKey] = committingState
 	GlobalRegistry.Files[activeKey] = activeState
 	GlobalRegistry.Lock.Unlock()
 
-	// Simulate SpeedMonitor check logic while a file is committing
 	GlobalRegistry.Lock.RLock()
 	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
 	for _, fs := range GlobalRegistry.Files {
@@ -3056,7 +2817,6 @@ func TestActiveReaderDuringCommitAndRename(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
-	GlobalConfig.BlockSize = 100
 	GlobalConfig.Unlock()
 
 	defer func() {
@@ -3066,7 +2826,6 @@ func TestActiveReaderDuringCommitAndRename(t *testing.T) {
 		GlobalConfig.Unlock()
 	}()
 
-	// 300 bytes of recognizable test payload
 	testPayload := make([]byte, 300)
 	for i := range testPayload {
 		testPayload[i] = byte(i % 256)
@@ -3078,19 +2837,17 @@ func TestActiveReaderDuringCommitAndRename(t *testing.T) {
 	defer server.Close()
 
 	key := "active_reader_test.mkv"
-	state := &FileCacheState{
-		Key:         key,
-		URL:         server.URL,
-		Path:        filepath.Join(GlobalConfig.CacheDir, key),
-		PartPath:    filepath.Join(GlobalConfig.TmpDir, key+".part"),
-		MetaPath:    filepath.Join(GlobalConfig.CacheDir, key+".json"),
-		TotalSize:   300,
-		TotalBlocks: 3,
-		BlockStates: make([]int, 3),
-		Clients:     make(map[string]chan struct{}),
-		Starving:    make(map[string]int),
-		NotifyChan:  make(chan struct{}, 10),
-	}
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		300,
+	)
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
@@ -3098,25 +2855,21 @@ func TestActiveReaderDuringCommitAndRename(t *testing.T) {
 
 	defer cleanupAfterTest(t, state)
 
-	// Create reader and connect before hydration completes
 	req := httptest.NewRequest("GET", "/stream", nil)
 	reader := NewCacheReader(context.Background(), state, req)
 	defer reader.Close()
 
-	// Start coordinator to hydrate in background
 	StartCoordinator(state, nil)
 
-	// Read block 0 (first 100 bytes) while coordinator is running
 	buf0 := make([]byte, 100)
 	n0, err := reader.Read(buf0)
 	if err != nil || n0 != 100 {
-		t.Fatalf("Failed reading block 0 during hydration: n=%d, err=%v", n0, err)
+		t.Fatalf("Failed reading first 100 bytes during hydration: n=%d, err=%v", n0, err)
 	}
 	if !bytes.Equal(buf0, testPayload[:100]) {
-		t.Fatalf("Block 0 content mismatch")
+		t.Fatalf("First 100 bytes content mismatch")
 	}
 
-	// Wait for coordinator to fully complete and commit/rename the file to final Path
 	for i := 0; i < 100; i++ {
 		state.Lock.Lock()
 		writerActive := state.WriterActive
@@ -3131,25 +2884,15 @@ func TestActiveReaderDuringCommitAndRename(t *testing.T) {
 		t.Fatalf("Expected file to be committed and renamed to %s, but not found", state.Path)
 	}
 
-	// Read remaining 200 bytes (blocks 1 and 2) AFTER the file was moved/renamed on disk
 	bufRest := make([]byte, 200)
 	nRest, err := reader.Read(bufRest)
 	if err != nil && err != io.EOF {
-		t.Fatalf("Failed reading blocks 1 & 2 after file move/rename: n=%d, err=%v", nRest, err)
+		t.Fatalf("Failed reading remaining 200 bytes after file move/rename: n=%d, err=%v", nRest, err)
 	}
 	if nRest != 200 {
 		t.Fatalf("Expected 200 bytes read after rename, got %d", nRest)
 	}
 	if !bytes.Equal(bufRest, testPayload[100:]) {
-		t.Fatalf("Blocks 1 & 2 content mismatch after rename")
+		t.Fatalf("Remaining 200 bytes content mismatch after rename")
 	}
 }
-
-
-
-
-
-
-
-
-

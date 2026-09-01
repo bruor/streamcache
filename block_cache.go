@@ -15,12 +15,6 @@ import (
 	"time"
 )
 
-const (
-	BlockNotStarted  = 0
-	BlockDownloading = 1
-	BlockCompleted   = 2
-)
-
 type FileMeta struct {
 	URL           string `json:"url"`
 	TotalSize     int64  `json:"total_size"`
@@ -29,67 +23,65 @@ type FileMeta struct {
 	LastModified  string `json:"last_modified"`
 	LastValidated int64  `json:"last_validated"` // Unix timestamp
 	Completed     bool   `json:"completed"`
-	BlockStates   []int  `json:"block_states,omitempty"`
 }
 
 type ClientConnection struct {
-	ID            string `json:"id"`
-	Key           string `json:"key"`
-	URL           string `json:"url"`
-	RemoteAddr    string `json:"remote_addr"`
-	UserAgent     string `json:"user_agent"`
-	Offset        int64  `json:"offset"`
-	StartOffset   int64  `json:"start_offset"`
-	TotalSize     int64  `json:"total_size"`
-	StartTime     int64  `json:"start_time"` // Unix timestamp
-	InCache       bool   `json:"in_cache"`
-	StarvingBlock int    `json:"starving_block"` // -1 if not starving
+	ID             string `json:"id"`
+	Key            string `json:"key"`
+	URL            string `json:"url"`
+	RemoteAddr     string `json:"remote_addr"`
+	UserAgent      string `json:"user_agent"`
+	Offset         int64  `json:"offset"`
+	StartOffset    int64  `json:"start_offset"`
+	TotalSize      int64  `json:"total_size"`
+	StartTime      int64  `json:"start_time"` // Unix timestamp
+	InCache        bool   `json:"in_cache"`
+	StarvingOffset int64  `json:"starving_offset"` // -1 if not starving
 }
 
 type ClientSession struct {
-	ID            string                      `json:"id"`
-	Key           string                      `json:"key"`
-	URL           string                      `json:"url"`
-	RemoteAddr    string                      `json:"remote_addr"`
-	UserAgent     string                      `json:"user_agent"`
-	Offset        int64                       `json:"offset"`
-	MaxOffset     int64                       `json:"max_offset"`
-	TotalSize     int64                       `json:"total_size"`
-	StartTime     int64                       `json:"start_time"` // Unix timestamp
-	LastActive    time.Time                   `json:"last_active"`
-	InCache       bool                        `json:"in_cache"`
-	StarvingBlock int                         `json:"starving_block"` // -1 if not starving
-	ActiveConns   int                         `json:"active_conns"`
-	Conns         map[string]*SessionConnInfo `json:"-"`
+	ID             string                      `json:"id"`
+	Key            string                      `json:"key"`
+	URL            string                      `json:"url"`
+	RemoteAddr     string                      `json:"remote_addr"`
+	UserAgent      string                      `json:"user_agent"`
+	Offset         int64                       `json:"offset"`
+	MaxOffset      int64                       `json:"max_offset"`
+	TotalSize      int64                       `json:"total_size"`
+	StartTime      int64                       `json:"start_time"` // Unix timestamp
+	LastActive     time.Time                   `json:"last_active"`
+	InCache        bool                        `json:"in_cache"`
+	StarvingOffset int64                       `json:"starving_offset"` // -1 if not starving
+	ActiveConns    int                         `json:"active_conns"`
+	Conns          map[string]*SessionConnInfo `json:"-"`
 }
 
 type SessionConnInfo struct {
 	Opened time.Time
 }
 
-
 type FileCacheState struct {
-	Key          string
-	URL          string
-	Path         string
-	PartPath     string
-	MetaPath     string
-	TotalSize    int64
-	TotalBlocks  int
-	BlockStates  []int
-	ContentType  string
-	ETag         string
-	LastModified string
+	Key           string
+	URL           string
+	Path          string
+	PartPath      string
+	MetaPath      string
+	TotalSize     int64
+	RangeSet      *RangeSet
+	Cond          *sync.Cond
+	ContentType   string
+	ETag          string
+	LastModified  string
 	LastValidated int64
 
-	Lock         sync.Mutex
-	Cancel       context.CancelFunc
-	WriterActive bool
-	Clients      map[string]chan struct{}
-	Starving     map[string]int // Map of clientID -> starving block index
-	File         *os.File       // Open handle to writing file
-	NotifyChan   chan struct{}  // Channel to wake coordinator on client starvation
-	BytesDownloadedSec   int64
+	Lock               sync.Mutex
+	Cancel             context.CancelFunc
+	WriterActive       bool
+	Clients            map[string]chan struct{}
+	Starving           map[string]int64 // Map of clientID -> starving byte offset
+	File               *os.File         // Open handle to writing file
+	NotifyChan         chan struct{}    // Channel to wake coordinator on client starvation
+	BytesDownloadedSec int64
 	TotalBytesDownloaded int64
 	HydrationStartTime   int64
 	DownloadSpeed        int64
@@ -98,12 +90,35 @@ type FileCacheState struct {
 	ZeroSpeedSec         int
 	UpstreamStatus       string
 	UpstreamUserAgent    string
-	RecentConnections  map[string]*ConnectionInfo
-	ObservedCooldown   float64
-	ActiveWorkers      []*Worker
-	WorkersLock        sync.Mutex
-	PendingTailPrefetchBlock int
-	Sniffed            bool
+	RecentConnections    map[string]*ConnectionInfo
+	ObservedCooldown     float64
+	ActiveWorkers        []*Worker
+	WorkersLock          sync.Mutex
+	PendingTailPrefetchOffset int64 // -1 if none
+	Sniffed              bool
+}
+
+func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod string, totalSize int64) *FileCacheState {
+	s := &FileCacheState{
+		Key:                       key,
+		URL:                       targetURL,
+		Path:                      cacheFilePath,
+		PartPath:                  partPath,
+		MetaPath:                  metaPath,
+		TotalSize:                 totalSize,
+		RangeSet:                  NewRangeSet(),
+		ContentType:               contentType,
+		ETag:                      etag,
+		LastModified:              lastMod,
+		LastValidated:             time.Now().Unix(),
+		Clients:                   make(map[string]chan struct{}),
+		Starving:                  make(map[string]int64),
+		NotifyChan:                make(chan struct{}, 20),
+		UpstreamStatus:            "Idle",
+		PendingTailPrefetchOffset: -1,
+	}
+	s.Cond = sync.NewCond(&s.Lock)
+	return s
 }
 
 type ConnectionInfo struct {
@@ -420,7 +435,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		}
 		matchedSession.ActiveConns = len(matchedSession.Conns)
 		matchedSession.LastActive = time.Now()
-		
+
 		isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-10*1024*1024
 		wasNotPreceded := matchedSession.MaxOffset < conn.TotalSize-15*1024*1024
 		readLimitNotExceeded := (conn.Offset - conn.StartOffset) <= 2*1024*1024
@@ -436,7 +451,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		if !conn.InCache {
 			matchedSession.InCache = false
 		}
-		matchedSession.StarvingBlock = conn.StarvingBlock
+		matchedSession.StarvingOffset = conn.StarvingOffset
 	} else {
 		if r.Sessions == nil {
 			r.Sessions = make(map[string]*ClientSession)
@@ -450,19 +465,19 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		}
 
 		newSession := &ClientSession{
-			ID:            connID,
-			Key:           conn.Key,
-			URL:           conn.URL,
-			RemoteAddr:    conn.RemoteAddr,
-			UserAgent:     conn.UserAgent,
-			Offset:        conn.Offset,
-			MaxOffset:     initialMaxOffset,
-			TotalSize:     conn.TotalSize,
-			StartTime:     time.Now().Unix(),
-			LastActive:    time.Now(),
-			InCache:       conn.InCache,
-			StarvingBlock: conn.StarvingBlock,
-			ActiveConns:   1,
+			ID:             connID,
+			Key:            conn.Key,
+			URL:            conn.URL,
+			RemoteAddr:     conn.RemoteAddr,
+			UserAgent:      conn.UserAgent,
+			Offset:         conn.Offset,
+			MaxOffset:      initialMaxOffset,
+			TotalSize:      conn.TotalSize,
+			StartTime:      time.Now().Unix(),
+			LastActive:     time.Now(),
+			InCache:        conn.InCache,
+			StarvingOffset: conn.StarvingOffset,
+			ActiveConns:    1,
 			Conns: map[string]*SessionConnInfo{
 				connID: {Opened: time.Now()},
 			},
@@ -534,16 +549,16 @@ func (r *CacheRegistry) SetConnectionInCache(connID string, inCache bool) {
 	}
 }
 
-func (r *CacheRegistry) UpdateConnectionStarvation(connID string, starvingBlock int) {
+func (r *CacheRegistry) UpdateConnectionStarvation(connID string, starvingOffset int64) {
 	r.Lock.Lock()
 	defer r.Lock.Unlock()
 	if r.Connections != nil {
 		if conn, ok := r.Connections[connID]; ok {
-			conn.StarvingBlock = starvingBlock
+			conn.StarvingOffset = starvingOffset
 			if r.Sessions != nil {
 				for _, session := range r.Sessions {
 					if _, exists := session.Conns[connID]; exists {
-						session.StarvingBlock = starvingBlock
+						session.StarvingOffset = starvingOffset
 						session.LastActive = time.Now()
 						break
 					}
@@ -591,19 +606,19 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 							}
 
 							newSession := &ClientSession{
-								ID:            cc.ID,
-								Key:           cc.Key,
-								URL:           cc.URL,
-								RemoteAddr:    cc.RemoteAddr,
-								UserAgent:     cc.UserAgent,
-								Offset:        cc.Offset,
-								MaxOffset:     initialMaxOffset,
-								TotalSize:     cc.TotalSize,
-								StartTime:     cc.StartTime,
-								LastActive:    now,
-								InCache:       cc.InCache,
-								StarvingBlock: cc.StarvingBlock,
-								ActiveConns:   1,
+								ID:             cc.ID,
+								Key:            cc.Key,
+								URL:            cc.URL,
+								RemoteAddr:     cc.RemoteAddr,
+								UserAgent:      cc.UserAgent,
+								Offset:         cc.Offset,
+								MaxOffset:      initialMaxOffset,
+								TotalSize:      cc.TotalSize,
+								StartTime:      cc.StartTime,
+								LastActive:     now,
+								InCache:        cc.InCache,
+								StarvingOffset: cc.StarvingOffset,
+								ActiveConns:    1,
 								Conns: map[string]*SessionConnInfo{
 									id: info,
 								},

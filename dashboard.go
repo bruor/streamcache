@@ -57,28 +57,28 @@ func (lb *LogBroker) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-type BlockUpdateEvent struct {
+type RangeUpdateEvent struct {
 	Key            string `json:"key"`
-	Blocks         []int  `json:"blocks"`
-	State          int    `json:"state"`
+	Start          int64  `json:"start"`
+	End            int64  `json:"end"`
 	UpstreamStatus string `json:"upstream_status,omitempty"`
 }
 
-func (lb *LogBroker) BroadcastBlockUpdate(key string, blocks []int, state int) {
-	if len(blocks) == 0 {
+func (lb *LogBroker) BroadcastRangeUpdate(key string, start, end int64) {
+	if start >= end {
 		return
 	}
-	evtData, err := json.Marshal(BlockUpdateEvent{
-		Key:    key,
-		Blocks: blocks,
-		State:  state,
+	evtData, err := json.Marshal(RangeUpdateEvent{
+		Key:   key,
+		Start: start,
+		End:   end,
 	})
 	if err != nil {
 		return
 	}
 
 	evt := SSEEvent{
-		Type: "block_update",
+		Type: "range_update",
 		Data: string(evtData),
 	}
 
@@ -198,51 +198,43 @@ func buildStatePayload() ([]byte, error) {
 	GlobalRegistry.Lock.RUnlock()
 
 	type sseFile struct {
-		Key            string   `json:"key"`
-		URL            string   `json:"url"`
-		TotalSize      int64    `json:"total_size"`
-		TotalBlocks    int      `json:"total_blocks"`
-		BlockStates    []int    `json:"block_states"`
-		ActiveWriter   bool     `json:"active_writer"`
-		ActiveClients  int      `json:"active_clients"`
-		StarvingQueue  []int    `json:"starving_queue"`
-		DownloadSpeed  int64    `json:"download_speed"`
-		AvgDownloadSpeed int64  `json:"avg_download_speed"`
-		UpstreamStatus string   `json:"upstream_status"`
-		ConnectionsLast30s int  `json:"connections_last_30s"`
-		ObservedCooldown   float64 `json:"observed_cooldown"`
-		UpstreamUserAgent  string  `json:"upstream_user_agent"`
+		Key                string    `json:"key"`
+		URL                string    `json:"url"`
+		TotalSize          int64     `json:"total_size"`
+		Ranges             [][]int64 `json:"ranges"`
+		DownloadedBytes    int64     `json:"downloaded_bytes"`
+		ActiveWriter       bool      `json:"active_writer"`
+		ActiveClients      int       `json:"active_clients"`
+		StarvingQueue      []int64   `json:"starving_queue"`
+		DownloadSpeed      int64     `json:"download_speed"`
+		AvgDownloadSpeed   int64     `json:"avg_download_speed"`
+		UpstreamStatus     string    `json:"upstream_status"`
+		ConnectionsLast30s int       `json:"connections_last_30s"`
+		ObservedCooldown   float64   `json:"observed_cooldown"`
+		UpstreamUserAgent  string    `json:"upstream_user_agent"`
 	}
 
 	var activeFiles []sseFile
 	for _, fileState := range files {
 		fileState.Lock.Lock()
 		k := fileState.Key
+		downloaded := fileState.RangeSet.TotalBytes()
+		isCompleted := fileState.RangeSet.IsComplete(fileState.TotalSize)
 
-		// Skip completed files from active downloads list, unless they are still committing
-		isCompleted := len(fileState.BlockStates) > 0
-		for _, status := range fileState.BlockStates {
-			if status != BlockCompleted {
-				isCompleted = false
-				break
-			}
-		}
 		if isCompleted && fileState.UpstreamStatus != "Committing" {
 			fileState.Lock.Unlock()
 			continue
 		}
 
-		// Deep copy block states array to prevent race conditions
-		blocks := make([]int, len(fileState.BlockStates))
-		copy(blocks, fileState.BlockStates)
+		ranges := fileState.RangeSet.ToSlices()
 
-		// Collect unique starvation blocks
-		starveSet := make(map[int]bool)
-		var starveQueue []int
-		for _, block := range fileState.Starving {
-			if !starveSet[block] {
-				starveSet[block] = true
-				starveQueue = append(starveQueue, block)
+		// Collect unique starvation offsets
+		starveSet := make(map[int64]bool)
+		var starveQueue []int64
+		for _, offset := range fileState.Starving {
+			if !starveSet[offset] {
+				starveSet[offset] = true
+				starveQueue = append(starveQueue, offset)
 			}
 		}
 
@@ -271,8 +263,8 @@ func buildStatePayload() ([]byte, error) {
 			Key:                k,
 			URL:                fileState.URL,
 			TotalSize:          fileState.TotalSize,
-			TotalBlocks:        fileState.TotalBlocks,
-			BlockStates:        blocks,
+			Ranges:             ranges,
+			DownloadedBytes:    downloaded,
 			ActiveWriter:       fileState.WriterActive,
 			ActiveClients:      len(fileState.Clients),
 			StarvingQueue:      starveQueue,
@@ -286,11 +278,16 @@ func buildStatePayload() ([]byte, error) {
 		fileState.Lock.Unlock()
 	}
 
-
 	// Sort active files from most complete to least complete (descending)
 	sort.Slice(activeFiles, func(i, j int) bool {
-		compI := calculateCompleteness(activeFiles[i].BlockStates)
-		compJ := calculateCompleteness(activeFiles[j].BlockStates)
+		compI := 0.0
+		if activeFiles[i].TotalSize > 0 {
+			compI = float64(activeFiles[i].DownloadedBytes) / float64(activeFiles[i].TotalSize)
+		}
+		compJ := 0.0
+		if activeFiles[j].TotalSize > 0 {
+			compJ = float64(activeFiles[j].DownloadedBytes) / float64(activeFiles[j].TotalSize)
+		}
 		if compI == compJ {
 			return activeFiles[i].Key < activeFiles[j].Key
 		}
@@ -305,7 +302,7 @@ func buildStatePayload() ([]byte, error) {
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
-		"server_instance_id":      ServerInstanceID,
+		"server_instance_id":     ServerInstanceID,
 		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
 		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
 		"disk_free_bytes":        freeSpace,
@@ -315,17 +312,4 @@ func buildStatePayload() ([]byte, error) {
 	}
 
 	return json.Marshal(data)
-}
-
-func calculateCompleteness(blocks []int) float64 {
-	if len(blocks) == 0 {
-		return 0
-	}
-	completed := 0
-	for _, status := range blocks {
-		if status == BlockCompleted {
-			completed++
-		}
-	}
-	return float64(completed) / float64(len(blocks))
 }

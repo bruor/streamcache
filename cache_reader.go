@@ -44,14 +44,7 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		remoteAddr = "Internal"
 	}
 
-	// Check if all blocks are already completed to set InCache correctly
-	isCompleted := len(state.BlockStates) > 0
-	for _, status := range state.BlockStates {
-		if status != BlockCompleted {
-			isCompleted = false
-			break
-		}
-	}
+	isCompleted := state.RangeSet.IsComplete(state.TotalSize)
 
 	// Copy necessary state fields and release state.Lock before invoking GlobalRegistry.RegisterConnection
 	// to avoid a deadlock due to lock inversion with GlobalRegistry.Lock.
@@ -66,17 +59,17 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 	}
 
 	conn := &ClientConnection{
-		ID:            clientID,
-		Key:           key,
-		URL:           url,
-		RemoteAddr:    remoteAddr,
-		UserAgent:     userAgent,
-		Offset:        startOffset,
-		StartOffset:   startOffset,
-		TotalSize:     totalSize,
-		StartTime:     time.Now().Unix(),
-		InCache:       isCompleted,
-		StarvingBlock: -1,
+		ID:             clientID,
+		Key:            key,
+		URL:            url,
+		RemoteAddr:     remoteAddr,
+		UserAgent:      userAgent,
+		Offset:         startOffset,
+		StartOffset:    startOffset,
+		TotalSize:      totalSize,
+		StartTime:      time.Now().Unix(),
+		InCache:        isCompleted,
+		StarvingOffset: -1,
 	}
 	GlobalRegistry.RegisterConnection(clientID, conn)
 
@@ -126,22 +119,10 @@ func (r *CacheReader) Close() error {
 
 	log.Printf("[Reader] Unregistered client %s from media %s", r.clientID, r.state.Key)
 
-	// Check if the file is completed and we are the last client exiting.
-	// If so, we finalize the cache file on disk (handles Windows file locks).
-	// We check if all blocks are completed to ensure we only finalize fully completed files.
-	isCompleted := len(r.state.BlockStates) > 0
-	for _, status := range r.state.BlockStates {
-		if status != BlockCompleted {
-			isCompleted = false
-			break
-		}
-	}
-
+	isCompleted := r.state.RangeSet.IsComplete(r.state.TotalSize)
 	shouldFinalize := len(r.state.Clients) == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
 	shouldCleanUpIncomplete := len(r.state.Clients) == 0 && !isCompleted && !r.state.WriterActive
 
-	// If the file was already finalized immediately by the coordinator,
-	// ensure the file handle is closed when the last client exits to prevent fd leaks.
 	var fileToClose *os.File
 	if len(r.state.Clients) == 0 && !r.state.WriterActive && r.state.File != nil && !shouldFinalize {
 		fileToClose = r.state.File
@@ -223,15 +204,59 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		p = p[:r.state.TotalSize-off]
 	}
 
-	blockSize := GlobalConfig.GetBlockSize()
-	startBlock := int(off / blockSize)
-	endBlock := int((off + int64(len(p)) - 1) / blockSize)
+	// Wait until at least some bytes are available from `off`
+	for {
+		avail := r.state.RangeSet.AvailableFrom(off)
+		if avail > 0 || r.state.RangeSet.IsComplete(r.state.TotalSize) {
+			r.state.Lock.Lock()
+			delete(r.state.Starving, r.clientID)
+			r.state.Lock.Unlock()
+			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
+			break
+		}
 
-	// Wait for all required blocks to be Completed
-	for b := startBlock; b <= endBlock; b++ {
-		err := r.waitForBlock(b)
-		if err != nil {
-			return 0, err
+		select {
+		case <-r.ctx.Done():
+			r.state.Lock.Lock()
+			delete(r.state.Starving, r.clientID)
+			r.state.Lock.Unlock()
+			return 0, r.ctx.Err()
+		default:
+		}
+
+		r.state.Lock.Lock()
+		if !r.state.WriterActive {
+			r.state.Lock.Unlock()
+			log.Printf("[Reader] Upstream coordinator inactive for %s while offset %d is required. Resuscitation triggered.", r.state.Key, off)
+			StartCoordinator(r.state, nil)
+			r.state.Lock.Lock()
+		}
+
+		r.state.Starving[r.clientID] = off
+		clientChan := r.state.Clients[r.clientID]
+		r.state.Lock.Unlock()
+
+		GlobalRegistry.UpdateConnectionStarvation(r.clientID, off)
+
+		select {
+		case r.state.NotifyChan <- struct{}{}:
+		default:
+		}
+
+		if clientChan == nil {
+			return 0, errors.New("client unregistered")
+		}
+
+		select {
+		case _, ok := <-clientChan:
+			if !ok {
+				return 0, errors.New("client channel closed")
+			}
+		case <-r.ctx.Done():
+			r.state.Lock.Lock()
+			delete(r.state.Starving, r.clientID)
+			r.state.Lock.Unlock()
+			return 0, r.ctx.Err()
 		}
 	}
 
@@ -241,105 +266,21 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, err
 	}
 
-	n, err = file.ReadAt(p, off)
+	avail := r.state.RangeSet.AvailableFrom(off)
+	toRead := int64(len(p))
+	if avail > 0 && toRead > avail {
+		toRead = avail
+	}
+
+	n, err = file.ReadAt(p[:toRead], off)
 	if n > 0 {
-		// Update client read offset
 		GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
 
-		// Check if file is fully completed (all blocks are completed)
-		r.state.Lock.Lock()
-		isCompleted := len(r.state.BlockStates) > 0
-		for _, status := range r.state.BlockStates {
-			if status != BlockCompleted {
-				isCompleted = false
-				break
-			}
-		}
-		r.state.Lock.Unlock()
-
-		if isCompleted {
+		if r.state.RangeSet.IsComplete(r.state.TotalSize) {
 			GlobalRegistry.SetConnectionInCache(r.clientID, true)
-		}
-
-		// Purge page cache on Linux to prevent memory bloat
-		if !GlobalConfig.GetDisableFadvise() {
-			FadviseDontNeed(file.Fd(), off, int64(n))
 		}
 	}
 	return n, err
-}
-
-func (r *CacheReader) waitForBlock(blockIndex int) error {
-	r.state.Lock.Lock()
-	clientChan := r.state.Clients[r.clientID]
-	r.state.Lock.Unlock()
-
-	if clientChan == nil {
-		r.state.Lock.Lock()
-		delete(r.state.Starving, r.clientID)
-		r.state.Lock.Unlock()
-		GlobalRegistry.UnregisterConnection(r.clientID)
-		return errors.New("client unregistered")
-	}
-
-	for {
-		// Check for cancellation before acquiring lock
-		select {
-		case <-r.ctx.Done():
-			r.state.Lock.Lock()
-			delete(r.state.Starving, r.clientID)
-			r.state.Lock.Unlock()
-			return r.ctx.Err()
-		default:
-		}
-
-		r.state.Lock.Lock()
-		status := r.state.BlockStates[blockIndex]
-
-		if status == BlockCompleted {
-			delete(r.state.Starving, r.clientID)
-			r.state.Lock.Unlock()
-			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
-			return nil
-		}
-
-		if !r.state.WriterActive {
-			r.state.Lock.Unlock()
-			log.Printf("[Reader] Upstream coordinator inactive for %s while block %d is required. Resuscitation triggered.", r.state.Key, blockIndex)
-			StartCoordinator(r.state, nil)
-			r.state.Lock.Lock()
-		}
-
-		// Mark client as starving and trigger on-demand download request
-		r.state.Starving[r.clientID] = blockIndex
-		r.state.Lock.Unlock()
-
-		GlobalRegistry.UpdateConnectionStarvation(r.clientID, blockIndex)
-
-		// Signal the Coordinator to wake up and evaluate the Jump request
-		select {
-		case r.state.NotifyChan <- struct{}{}:
-		default:
-		}
-
-		// Block and wait for a completion update OR request cancellation
-		select {
-		case _, ok := <-clientChan:
-			if !ok {
-				r.state.Lock.Lock()
-				delete(r.state.Starving, r.clientID)
-				r.state.Lock.Unlock()
-				return errors.New("client channel closed")
-			}
-			// Woken up by coordinator write. Check block status again.
-		case <-r.ctx.Done():
-			// Client disconnected! Unregister and return cancellation error
-			r.state.Lock.Lock()
-			delete(r.state.Starving, r.clientID)
-			r.state.Lock.Unlock()
-			return r.ctx.Err()
-		}
-	}
 }
 
 func (r *CacheReader) Read(p []byte) (int, error) {

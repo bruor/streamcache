@@ -1069,26 +1069,14 @@
         }
 
         function renderCanvas(canvas, fileData, timestamp) {
-            if (!canvas || !fileData || !fileData.block_states) return;
+            if (!canvas || !fileData) return;
             const ctx = canvas.getContext('2d');
             const dpr = window.devicePixelRatio || 1;
             const rect = canvas.getBoundingClientRect();
             
             const displayWidth = rect.width || canvas.clientWidth || 300;
-            const total = fileData.total_blocks || fileData.block_states.length;
-            if (total === 0) return;
-            
-            const gap = 1.5;
-            const targetBlockSize = 6; // Target size for individual block tiles
-            
-            let cols = Math.floor((displayWidth + gap) / (targetBlockSize + gap));
-            if (cols < 1) cols = 1;
-            if (total < cols) cols = total;
-            
-            const rows = Math.ceil(total / cols);
-            const blockWidth = (displayWidth - (cols - 1) * gap) / cols;
-            const blockHeight = Math.max(5, Math.min(7, blockWidth));
-            const displayHeight = rows * blockHeight + (rows - 1) * gap;
+            const displayHeight = 14;
+            const total = fileData.total_size || 1;
             
             if (canvas.width !== Math.floor(displayWidth * dpr) || canvas.height !== Math.floor(displayHeight * dpr)) {
                 canvas.width = Math.floor(displayWidth * dpr);
@@ -1100,70 +1088,42 @@
             ctx.scale(dpr, dpr);
             ctx.clearRect(0, 0, displayWidth, displayHeight);
             
-            const now = timestamp || performance.now();
-            const pulse = 0.625 + 0.375 * Math.sin((now / 1000) * Math.PI * 2);
+            // Draw background track
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+            ctx.fillRect(0, 0, displayWidth, displayHeight);
 
-            for (let i = 0; i < total; i++) {
-                const row = Math.floor(i / cols);
-                const col = i % cols;
-                const x = col * (blockWidth + gap);
-                const y = row * (blockHeight + gap);
-                
-                const st = fileData.block_states[i];
-                if (st === 2) {
-                    ctx.fillStyle = '#39ff14'; // accent-green
-                    ctx.shadowColor = 'transparent';
-                    ctx.shadowBlur = 0;
-                } else if (st === 1) {
-                    ctx.fillStyle = `rgba(0, 240, 255, ${pulse.toFixed(3)})`; // pulsing cyan
-                    ctx.shadowColor = '#00f0ff';
-                    ctx.shadowBlur = Math.round(4 * pulse);
-                } else {
-                    ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
-                    ctx.shadowColor = 'transparent';
-                    ctx.shadowBlur = 0;
+            // Draw completed ranges
+            if (fileData.ranges && fileData.ranges.length > 0) {
+                ctx.fillStyle = '#39ff14'; // accent green
+                for (let i = 0; i < fileData.ranges.length; i++) {
+                    const r = fileData.ranges[i];
+                    const startX = (r[0] / total) * displayWidth;
+                    const endX = (r[1] / total) * displayWidth;
+                    const w = Math.max(1.5, endX - startX);
+                    ctx.fillRect(startX, 0, w, displayHeight);
                 }
-                
-                // Draw rounded rectangle block tile
-                const radius = 1.5;
-                const w = blockWidth;
-                const h = blockHeight;
-                ctx.beginPath();
-                ctx.moveTo(x + radius, y);
-                ctx.lineTo(x + w - radius, y);
-                ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
-                ctx.lineTo(x + w, y + h - radius);
-                ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
-                ctx.lineTo(x + radius, y + h);
-                ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
-                ctx.lineTo(x, y + radius);
-                ctx.quadraticCurveTo(x, y, x + radius, y);
-                ctx.closePath();
-                ctx.fill();
             }
+
+            // Draw starving markers
+            if (fileData.starving_queue && fileData.starving_queue.length > 0) {
+                ctx.fillStyle = '#ff9f1c'; // accent orange
+                for (let i = 0; i < fileData.starving_queue.length; i++) {
+                    const off = fileData.starving_queue[i];
+                    const sx = (off / total) * displayWidth;
+                    ctx.fillRect(Math.max(0, sx - 1.5), 0, 3, displayHeight);
+                }
+            }
+
             ctx.restore();
-        }
-
-        function paintCanvasBlocks(canvas, fileData, blocks, state) {
-            renderCanvas(canvas, fileData);
-            checkAndTriggerPulseAnimation();
-        }
-
-        function calculateCompletedBlocks(fileData) {
-            if (!fileData || !fileData.block_states) return 0;
-            let completed = 0;
-            for (let i = 0; i < fileData.block_states.length; i++) {
-                if (fileData.block_states[i] === 2) completed++;
-            }
-            return completed;
         }
 
         function updateFileBadgeAndMeta(key) {
             const fileData = fileStore[key];
             if (!fileData) return;
             
-            const completed = calculateCompletedBlocks(fileData);
-            const percent = ((completed / fileData.total_blocks) * 100).toFixed(1);
+            const downloaded = fileData.downloaded_bytes || 0;
+            const total = fileData.total_size || 1;
+            const percent = ((downloaded / total) * 100).toFixed(1);
             const rawStatus = fileData.upstream_status || 'Downloading';
             const statusLower = rawStatus.toLowerCase();
             
@@ -1207,8 +1167,8 @@
                             <span class="download-meta-value">${formatBytes(fileData.total_size)}</span>
                         </div>
                         <div class="download-meta-card">
-                            <span class="download-meta-label">Blocks</span>
-                            <span class="download-meta-value">${completed}/${fileData.total_blocks}</span>
+                            <span class="download-meta-label">Downloaded</span>
+                            <span class="download-meta-value">${formatBytes(downloaded)}</span>
                         </div>
                         <div class="download-meta-card">
                             <span class="download-meta-label">Upstream UA</span>
@@ -1266,8 +1226,8 @@
                         key: file.key,
                         url: file.url,
                         total_size: file.total_size,
-                        total_blocks: file.total_blocks,
-                        block_states: new Uint8Array(file.block_states || file.total_blocks),
+                        ranges: file.ranges || [],
+                        downloaded_bytes: file.downloaded_bytes || 0,
                         active_clients: file.active_clients,
                         starving_queue: file.starving_queue,
                         download_speed: file.download_speed,
@@ -1279,9 +1239,10 @@
                     };
                     fileStore[file.key] = fileData;
                 } else {
-                    // Update metadata fields
                     fileData.url = file.url;
                     fileData.total_size = file.total_size;
+                    fileData.ranges = file.ranges || fileData.ranges;
+                    fileData.downloaded_bytes = file.downloaded_bytes !== undefined ? file.downloaded_bytes : fileData.downloaded_bytes;
                     fileData.active_clients = file.active_clients;
                     fileData.starving_queue = file.starving_queue;
                     fileData.download_speed = file.download_speed;
@@ -1290,9 +1251,6 @@
                     fileData.connections_last_30s = file.connections_last_30s;
                     fileData.observed_cooldown = file.observed_cooldown;
                     fileData.upstream_user_agent = file.upstream_user_agent;
-                    if (file.block_states && file.block_states.length === fileData.total_blocks) {
-                        fileData.block_states.set(file.block_states);
-                    }
                 }
                 
                 let card = document.getElementById(`download-card-${file.key}`);
@@ -1321,7 +1279,6 @@
                     renderCanvas(canvas, fileData);
                 }
             });
-            checkAndTriggerPulseAnimation();
         }
 
         async function cancelHydration(key) {
@@ -1378,9 +1335,9 @@
                 if (conn.active_conns === 0) {
                     statusClass = 'idle';
                     statusText = 'Buffered / Idle';
-                } else if (conn.starving_block !== -1) {
+                } else if (conn.starving_offset !== -1 && conn.starving_offset !== undefined) {
                     statusClass = 'starving';
-                    statusText = `Starving (Block ${conn.starving_block})`;
+                    statusText = `Starving (${formatBytes(conn.starving_offset)})`;
                 }
 
                 let originBadge = '';
@@ -1390,9 +1347,9 @@
                 } else {
                     originBadge = `<span class="session-origin-badge cdn">CDN</span>`;
                     const fileData = fileStore[conn.key];
-                    if (fileData && fileData.total_blocks > 0) {
-                        const completed = calculateCompletedBlocks(fileData);
-                        const percent = ((completed / fileData.total_blocks) * 100).toFixed(1);
+                    if (fileData && fileData.total_size > 0) {
+                        const downloaded = fileData.downloaded_bytes || 0;
+                        const percent = ((downloaded / fileData.total_size) * 100).toFixed(1);
                         const rawStatus = fileData.upstream_status || 'Downloading';
                         const statusLower = rawStatus.toLowerCase();
                         let badgeText = `${rawStatus} ${percent}%`;
@@ -1513,33 +1470,34 @@
                 appendLog(event.data);
             });
 
-            // 2. Real-time block update events
-            es.addEventListener('block_update', function(event) {
+            // 2. Real-time range update events
+            es.addEventListener('range_update', function(event) {
                 try {
                     const evtData = JSON.parse(event.data);
                     const key = evtData.key;
-                    const blocks = evtData.blocks || [];
-                    const state = evtData.state;
+                    const start = evtData.start;
+                    const end = evtData.end;
                     
                     const fileData = fileStore[key];
                     if (fileData) {
                         if (evtData.upstream_status) {
                             fileData.upstream_status = evtData.upstream_status;
                         }
-                        blocks.forEach(b => {
-                            if (b >= 0 && b < fileData.total_blocks) {
-                                fileData.block_states[b] = state;
-                            }
-                        });
+                        if (!fileData.ranges) fileData.ranges = [];
+                        fileData.ranges.push([start, end]);
+                        fileData.downloaded_bytes = (fileData.downloaded_bytes || 0) + (end - start);
+                        if (fileData.downloaded_bytes > fileData.total_size) {
+                            fileData.downloaded_bytes = fileData.total_size;
+                        }
                         
                         const canvas = document.getElementById(`canvas-${key}`);
                         if (canvas) {
-                            paintCanvasBlocks(canvas, fileData, blocks, state);
+                            renderCanvas(canvas, fileData);
                         }
                         updateFileBadgeAndMeta(key);
                     }
                 } catch(e) {
-                    console.error("Error handling block_update:", e);
+                    console.error("Error handling range_update:", e);
                 }
             });
 
