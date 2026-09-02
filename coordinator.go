@@ -274,9 +274,38 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			startOffset:      startOffset,
 			cancel:           wCancel,
 			currentOffset:    startOffset,
+			targetEndOffset:  state.TotalSize,
 			spawnTimeNano:    time.Now().UnixNano(),
 			lastByteTimeNano: time.Now().UnixNano(),
 		}
+
+		// Find next downstream boundary (next cached chunk or downstream worker)
+		gapStart, gapEnd, found := state.RangeSet.FindNextGap(startOffset, state.TotalSize)
+		if found && gapStart == startOffset && gapEnd > startOffset {
+			w.targetEndOffset = gapEnd
+		}
+		for _, other := range state.ActiveWorkers {
+			otherCur := atomic.LoadInt64(&other.currentOffset)
+			if otherCur > startOffset && otherCur < w.targetEndOffset {
+				w.targetEndOffset = otherCur
+			}
+			if other.startOffset > startOffset && other.startOffset < w.targetEndOffset {
+				w.targetEndOffset = other.startOffset
+			}
+		}
+
+		// Immediately clamp any trailing active workers running behind startOffset
+		for _, other := range state.ActiveWorkers {
+			otherCur := atomic.LoadInt64(&other.currentOffset)
+			if otherCur < startOffset {
+				otherTarget := atomic.LoadInt64(&other.targetEndOffset)
+				if otherTarget <= 0 || otherTarget > startOffset {
+					atomic.StoreInt64(&other.targetEndOffset, startOffset)
+					log.Printf("[Coord] Immediately clamped Worker %d target boundary to %d (handed off to Worker %d)", other.id, startOffset, w.id)
+				}
+			}
+		}
+
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, removeWorker, parentCancel)
 	}
@@ -291,11 +320,25 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			startOffset:      startOffset,
 			cancel:           wCancel,
 			currentOffset:    startOffset,
+			targetEndOffset:  state.TotalSize,
 			isPrefetchHelper: true,
 			spawnTimeNano:    time.Now().UnixNano(),
 			lastByteTimeNano: time.Now().UnixNano(),
 		}
 		atomic.StoreInt32(&w.isPrefetching, 1)
+
+		// Immediately clamp any trailing active workers running behind startOffset
+		for _, other := range state.ActiveWorkers {
+			otherCur := atomic.LoadInt64(&other.currentOffset)
+			if otherCur < startOffset {
+				otherTarget := atomic.LoadInt64(&other.targetEndOffset)
+				if otherTarget <= 0 || otherTarget > startOffset {
+					atomic.StoreInt64(&other.targetEndOffset, startOffset)
+					log.Printf("[Coord] Immediately clamped Worker %d target boundary to %d (metadata prefetch Worker %d)", other.id, startOffset, w.id)
+				}
+			}
+		}
+
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, removeWorker, parentCancel)
 	}
@@ -648,18 +691,16 @@ func runDownloadWorker(
 	}
 	defer closeConnection()
 
-	// Pre-flight check: locate the next unclaimed gap for this worker
-	if !w.isPrefetchHelper {
+	// Pre-flight check: if the assigned start offset is already satisfied on disk, find next unclaimed gap
+	if state.RangeSet.Contains(currentOffset) && !w.isPrefetchHelper {
 		gapStart, gapEnd, found := state.FindNextUnclaimedGap(w.id, currentOffset)
 		if !found {
-			log.Printf("[Worker-%d] No unclaimed gaps remain for file. Worker coalescing and exiting.", w.id)
+			log.Printf("[Worker-%d] Start offset %d already satisfied and no unclaimed gaps remain. Exiting.", w.id, currentOffset)
 			return
 		}
 		currentOffset = gapStart
 		atomic.StoreInt64(&w.currentOffset, currentOffset)
 		atomic.StoreInt64(&w.targetEndOffset, gapEnd)
-	} else {
-		atomic.StoreInt64(&w.targetEndOffset, state.TotalSize)
 	}
 
 	buf := make([]byte, 128*1024)
