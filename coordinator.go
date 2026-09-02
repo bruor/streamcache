@@ -100,6 +100,7 @@ type Worker struct {
 	spawnTimeNano     int64 // Unix nano timestamp of worker spawn
 	connStartTimeNano int64 // Unix nano timestamp of connection start, guarded atomically
 	connBytesWritten  int64 // bytes read on this connection, guarded atomically
+	lastByteTimeNano  int64 // Unix nano timestamp of last byte received from upstream, guarded atomically
 	isPrefetching     int32 // 1 if prefetching tail metadata, 0 otherwise, guarded atomically
 	isPrefetchHelper  bool
 }
@@ -268,11 +269,12 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		workerIdGen++
 		wCtx, wCancel := context.WithCancel(parentCtx)
 		w := &Worker{
-			id:            workerIdGen,
-			startOffset:   startOffset,
-			cancel:        wCancel,
-			currentOffset: startOffset,
-			spawnTimeNano: time.Now().UnixNano(),
+			id:               workerIdGen,
+			startOffset:      startOffset,
+			cancel:           wCancel,
+			currentOffset:    startOffset,
+			spawnTimeNano:    time.Now().UnixNano(),
+			lastByteTimeNano: time.Now().UnixNano(),
 		}
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, removeWorker, parentCancel)
@@ -290,6 +292,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			currentOffset:    startOffset,
 			isPrefetchHelper: true,
 			spawnTimeNano:    time.Now().UnixNano(),
+			lastByteTimeNano: time.Now().UnixNano(),
 		}
 		atomic.StoreInt32(&w.isPrefetching, 1)
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
@@ -378,41 +381,30 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		if len(starvingOffsets) > 0 {
 			for _, sb := range starvingOffsets {
 				stallTimeout := GlobalConfig.GetStarvationStallTimeout()
-				isStalledOnStarvation := false
-				state.Lock.Lock()
-				for clientID, starveOff := range state.Starving {
-					if starveOff == sb {
-						if since, ok := state.StarvingSince[clientID]; ok {
-							if time.Since(since) >= stallTimeout {
-								isStalledOnStarvation = true
-								break
-							}
-						}
-					}
-				}
-				state.Lock.Unlock()
-
 				suppressed := false
 				state.WorkersLock.Lock()
 				for _, w := range state.ActiveWorkers {
 					wCurrent := atomic.LoadInt64(&w.currentOffset)
 
-					connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
-					var elapsed time.Duration
-					if connStartNano > 0 {
-						elapsed = time.Since(time.Unix(0, connStartNano))
+					lastByteNano := atomic.LoadInt64(&w.lastByteTimeNano)
+					var workerStallDuration time.Duration
+					if lastByteNano > 0 {
+						workerStallDuration = time.Since(time.Unix(0, lastByteNano))
 					} else if w.spawnTimeNano > 0 {
-						elapsed = time.Since(time.Unix(0, w.spawnTimeNano))
+						workerStallDuration = time.Since(time.Unix(0, w.spawnTimeNano))
 					}
 
-					// If a worker is already dedicated to this starving offset and within stall timeout, suppress
-					if w.startOffset == sb && elapsed < stallTimeout {
+					isWorkerStalled := stallTimeout > 0 && workerStallDuration >= stallTimeout
+
+					// If a worker is already dedicated to this starving offset and has not stalled, suppress
+					if w.startOffset == sb && !isWorkerStalled {
 						suppressed = true
 						break
 					}
 
-					if isStalledOnStarvation {
-						log.Printf("[Coord] Worker %d stalled at offset %d for >= %s during client starvation at %d. Breaking out of suppression.", w.id, wCurrent, stallTimeout, sb)
+					if isWorkerStalled {
+						log.Printf("[Coord] Worker %d starved of incoming bytes for %s (>= %s threshold) with client starving at %d. Breaking out of suppression.",
+							w.id, workerStallDuration.Round(time.Millisecond), stallTimeout, sb)
 						continue
 					}
 
@@ -490,8 +482,17 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 							elapsed = time.Since(time.Unix(0, w.spawnTimeNano))
 						}
 
+						lastByteNano := atomic.LoadInt64(&w.lastByteTimeNano)
+						var workerStallDuration time.Duration
+						if lastByteNano > 0 {
+							workerStallDuration = time.Since(time.Unix(0, lastByteNano))
+						} else if w.spawnTimeNano > 0 {
+							workerStallDuration = time.Since(time.Unix(0, w.spawnTimeNano))
+						}
+						isWorkerStalled := stallTimeout > 0 && workerStallDuration >= stallTimeout
+
 						minTime := GlobalConfig.GetSchedulerMinTime()
-						eligible := minTime <= 0 || elapsed >= minTime || isStalledOnStarvation
+						eligible := minTime <= 0 || elapsed >= minTime || isWorkerStalled
 
 						if eligible && atomic.LoadInt32(&w.isPrefetching) == 0 {
 							var minDistanceToClient int64 = 1e18
@@ -762,6 +763,7 @@ func runDownloadWorker(
 			backoff = 2 * time.Second
 
 			atomic.StoreInt64(&w.connStartTimeNano, time.Now().UnixNano())
+			atomic.StoreInt64(&w.lastByteTimeNano, time.Now().UnixNano())
 			atomic.StoreInt64(&w.connBytesWritten, 0)
 
 			connID = fmt.Sprintf("worker-%d-%d", w.id, time.Now().UnixNano())
@@ -819,6 +821,7 @@ func runDownloadWorker(
 			currentOffset += int64(n)
 			atomic.StoreInt64(&w.currentOffset, currentOffset)
 			atomic.AddInt64(&w.connBytesWritten, int64(n))
+			atomic.StoreInt64(&w.lastByteTimeNano, time.Now().UnixNano())
 
 			atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
 			atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))

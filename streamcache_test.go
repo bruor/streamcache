@@ -3062,7 +3062,7 @@ func TestStarvationStallTimeoutBreakout(t *testing.T) {
 	GlobalRegistry.Lock.Unlock()
 
 	StartCoordinator(state, nil)
-	time.Sleep(100 * time.Millisecond) // Allow worker 1 to connect and write 100 bytes
+	time.Sleep(20 * time.Millisecond) // Worker 1 connects and begins download
 
 	// Simulate client starving at offset 200 (within 512KB of worker 1's position at 100)
 	state.Lock.Lock()
@@ -3075,7 +3075,7 @@ func TestStarvationStallTimeoutBreakout(t *testing.T) {
 	default:
 	}
 
-	// 1. Check immediately: client has been starving for < 100ms stall timeout -> jump should be suppressed
+	// 1. Check immediately: worker has been idle for < 100ms stall timeout -> jump should be suppressed
 	time.Sleep(30 * time.Millisecond)
 	lock.Lock()
 	initialReqCount := len(requestedRanges)
