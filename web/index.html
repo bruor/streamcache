@@ -416,11 +416,9 @@
 
         .block-canvas {
             width: 100%;
-            height: 14px;
-            border-radius: 4px;
-            background: rgba(0, 0, 0, 0.4);
-            border: 1px solid var(--card-border);
-            margin-top: 0.8rem;
+            height: 26px;
+            background: transparent;
+            margin-top: 0.6rem;
             display: block;
         }
 
@@ -1111,7 +1109,9 @@
             const rect = canvas.getBoundingClientRect();
             
             const displayWidth = rect.width || canvas.clientWidth || 300;
-            const displayHeight = 16;
+            const displayHeight = 26;
+            const trackY = 6;
+            const trackHeight = 14;
             const total = fileData.total_size || 1;
             
             if (canvas.width !== Math.floor(displayWidth * dpr) || canvas.height !== Math.floor(displayHeight * dpr)) {
@@ -1124,19 +1124,25 @@
             ctx.scale(dpr, dpr);
             ctx.clearRect(0, 0, displayWidth, displayHeight);
             
-            // Draw background track
+            // Draw background track with subtle rounded pill
             ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
-            ctx.fillRect(0, 0, displayWidth, displayHeight);
+            if (ctx.roundRect) {
+                ctx.beginPath();
+                ctx.roundRect(0, trackY, displayWidth, trackHeight, 3);
+                ctx.fill();
+            } else {
+                ctx.fillRect(0, trackY, displayWidth, trackHeight);
+            }
 
-            // Draw completed ranges (accent green)
+            // Draw completed ranges (vibrant emerald green)
             if (fileData.ranges && fileData.ranges.length > 0) {
-                ctx.fillStyle = '#39ff14';
+                ctx.fillStyle = '#00e676';
                 for (let i = 0; i < fileData.ranges.length; i++) {
                     const r = fileData.ranges[i];
                     const startX = (r[0] / total) * displayWidth;
                     const endX = (r[1] / total) * displayWidth;
                     const w = Math.max(1.5, endX - startX);
-                    ctx.fillRect(startX, 0, w, displayHeight);
+                    ctx.fillRect(startX, trackY, w, trackHeight);
                 }
             }
 
@@ -1146,49 +1152,59 @@
                 for (let i = 0; i < fileData.starving_queue.length; i++) {
                     const off = fileData.starving_queue[i];
                     const sx = (off / total) * displayWidth;
-                    ctx.fillRect(Math.max(0, sx - 1.5), 0, 3, displayHeight);
+                    ctx.fillRect(Math.max(0, sx - 1.5), trackY, 3, trackHeight);
                 }
             }
 
-            // Draw active client playback position needles
+            // Draw active client playback position needles (high-visibility diamond playheads)
             if (fileData.client_positions && fileData.client_positions.length > 0) {
                 for (let i = 0; i < fileData.client_positions.length; i++) {
                     const cp = fileData.client_positions[i];
-                    const posX = Math.max(0, Math.min(displayWidth - 2, (cp.offset / total) * displayWidth));
-                    
-                    if (cp.is_starving) {
-                        // Alert Red needle with pulse glow
-                        ctx.save();
-                        ctx.shadowColor = '#ff3333';
-                        ctx.shadowBlur = 6;
-                        ctx.fillStyle = '#ff3333';
-                        ctx.fillRect(posX - 1, 0, 2.5, displayHeight);
-                        
-                        // Top indicator triangle
-                        ctx.beginPath();
-                        ctx.moveTo(posX - 3, 0);
-                        ctx.lineTo(posX + 3, 0);
-                        ctx.lineTo(posX, 4);
-                        ctx.closePath();
-                        ctx.fill();
-                        ctx.restore();
-                    } else {
-                        // Neon Cyan needle with glow
-                        ctx.save();
-                        ctx.shadowColor = '#00f0ff';
-                        ctx.shadowBlur = 4;
-                        ctx.fillStyle = '#00f0ff';
-                        ctx.fillRect(posX - 0.75, 0, 2, displayHeight);
-                        
-                        // Top indicator triangle
-                        ctx.beginPath();
-                        ctx.moveTo(posX - 2.5, 0);
-                        ctx.lineTo(posX + 2.5, 0);
-                        ctx.lineTo(posX, 3.5);
-                        ctx.closePath();
-                        ctx.fill();
-                        ctx.restore();
-                    }
+                    const posX = Math.max(4, Math.min(displayWidth - 4, (cp.offset / total) * displayWidth));
+                    const isStarving = cp.is_starving;
+                    const color = isStarving ? '#ff3333' : '#00f0ff';
+                    const glowColor = isStarving ? 'rgba(255, 51, 51, 0.9)' : 'rgba(0, 240, 255, 0.9)';
+
+                    ctx.save();
+
+                    // 1. High-contrast needle shadow / black stem outline (makes it pop against neon green)
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+                    ctx.fillRect(posX - 2, 4, 4, 18);
+
+                    // 2. Colored needle core
+                    ctx.fillStyle = color;
+                    ctx.shadowColor = glowColor;
+                    ctx.shadowBlur = 6;
+                    ctx.fillRect(posX - 1, 4, 2, 18);
+
+                    // 3. Top Diamond Playhead Pin (protrudes above track)
+                    ctx.beginPath();
+                    ctx.moveTo(posX, 0);
+                    ctx.lineTo(posX + 4.5, 3.5);
+                    ctx.lineTo(posX, 7);
+                    ctx.lineTo(posX - 4.5, 3.5);
+                    ctx.closePath();
+                    ctx.fillStyle = color;
+                    ctx.shadowColor = glowColor;
+                    ctx.shadowBlur = 8;
+                    ctx.fill();
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = '#000000';
+                    ctx.stroke();
+
+                    // 4. Bottom Inverted Triangle Pin (protrudes below track)
+                    ctx.beginPath();
+                    ctx.moveTo(posX, 25);
+                    ctx.lineTo(posX + 3.5, 20);
+                    ctx.lineTo(posX - 3.5, 20);
+                    ctx.closePath();
+                    ctx.fillStyle = color;
+                    ctx.fill();
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = '#000000';
+                    ctx.stroke();
+
+                    ctx.restore();
                 }
             }
 
