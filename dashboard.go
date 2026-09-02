@@ -57,41 +57,6 @@ func (lb *LogBroker) Write(p []byte) (n int, err error) {
 	return n, err
 }
 
-type RangeUpdateEvent struct {
-	Key            string `json:"key"`
-	Start          int64  `json:"start"`
-	End            int64  `json:"end"`
-	UpstreamStatus string `json:"upstream_status,omitempty"`
-}
-
-func (lb *LogBroker) BroadcastRangeUpdate(key string, start, end int64) {
-	if start >= end {
-		return
-	}
-	evtData, err := json.Marshal(RangeUpdateEvent{
-		Key:   key,
-		Start: start,
-		End:   end,
-	})
-	if err != nil {
-		return
-	}
-
-	evt := SSEEvent{
-		Type: "range_update",
-		Data: string(evtData),
-	}
-
-	lb.lock.Lock()
-	defer lb.lock.Unlock()
-	for listener := range lb.listeners {
-		select {
-		case listener <- evt:
-		default:
-		}
-	}
-}
-
 func (lb *LogBroker) Register(ch chan SSEEvent) {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
@@ -118,14 +83,16 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eventChan := make(chan SSEEvent, 200)
-	GlobalLogBroker.Register(eventChan)
-	defer GlobalLogBroker.Unregister(eventChan)
+	if GlobalLogBroker != nil {
+		GlobalLogBroker.Register(eventChan)
+		defer GlobalLogBroker.Unregister(eventChan)
+	}
 
 	// Send initial state
 	sendStateUpdate(w, flusher)
 
-	stateTicker := time.NewTicker(5 * time.Second)
-	defer stateTicker.Stop()
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
 
 	// Handle SSE Stream
 	for {
@@ -138,12 +105,17 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 
-		case <-stateTicker.C:
+		case <-timer.C:
 			// Periodically send full state update
 			err := sendStateUpdate(w, flusher)
 			if err != nil {
 				return
 			}
+			interval := 3 * time.Second
+			if GlobalRegistry != nil && GlobalRegistry.HasActiveActivity() {
+				interval = 250 * time.Millisecond
+			}
+			timer.Reset(interval)
 
 		case <-r.Context().Done():
 			// Client disconnected
@@ -197,21 +169,32 @@ func buildStatePayload() ([]byte, error) {
 	}
 	GlobalRegistry.Lock.RUnlock()
 
+	type sseClientPos struct {
+		ID         string `json:"id"`
+		Offset     int64  `json:"offset"`
+		RemoteAddr string `json:"remote_addr"`
+		UserAgent  string `json:"user_agent"`
+		IsStarving bool   `json:"is_starving"`
+	}
+
 	type sseFile struct {
-		Key                string    `json:"key"`
-		URL                string    `json:"url"`
-		TotalSize          int64     `json:"total_size"`
-		Ranges             [][]int64 `json:"ranges"`
-		DownloadedBytes    int64     `json:"downloaded_bytes"`
-		ActiveWriter       bool      `json:"active_writer"`
-		ActiveClients      int       `json:"active_clients"`
-		StarvingQueue      []int64   `json:"starving_queue"`
-		DownloadSpeed      int64     `json:"download_speed"`
-		AvgDownloadSpeed   int64     `json:"avg_download_speed"`
-		UpstreamStatus     string    `json:"upstream_status"`
-		ConnectionsLast30s int       `json:"connections_last_30s"`
-		ObservedCooldown   float64   `json:"observed_cooldown"`
-		UpstreamUserAgent  string    `json:"upstream_user_agent"`
+		Key                string         `json:"key"`
+		URL                string         `json:"url"`
+		TotalSize          int64          `json:"total_size"`
+		Ranges             [][]int64      `json:"ranges"`
+		DownloadedBytes    int64          `json:"downloaded_bytes"`
+		ActiveWriter       bool           `json:"active_writer"`
+		ActiveClients      int            `json:"active_clients"`
+		StarvingQueue      []int64        `json:"starving_queue"`
+		DownloadSpeed      int64          `json:"download_speed"`
+		AvgDownloadSpeed   int64          `json:"avg_download_speed"`
+		UpstreamStatus     string         `json:"upstream_status"`
+		IsStalled          bool           `json:"is_stalled"`
+		StalledSeconds     int            `json:"stalled_seconds"`
+		ClientPositions    []sseClientPos `json:"client_positions"`
+		ConnectionsLast30s int            `json:"connections_last_30s"`
+		ObservedCooldown   float64        `json:"observed_cooldown"`
+		UpstreamUserAgent  string         `json:"upstream_user_agent"`
 	}
 
 	var activeFiles []sseFile
@@ -238,6 +221,20 @@ func buildStatePayload() ([]byte, error) {
 			}
 		}
 
+		// Collect client playback positions for this file
+		var clientPositions []sseClientPos
+		for _, sess := range activeSessions {
+			if sess.Key == k {
+				clientPositions = append(clientPositions, sseClientPos{
+					ID:         sess.ID,
+					Offset:     sess.Offset,
+					RemoteAddr: sess.RemoteAddr,
+					UserAgent:  sess.UserAgent,
+					IsStarving: sess.StarvingOffset != -1,
+				})
+			}
+		}
+
 		// Filter out connections that are both closed AND closed more than 30 seconds ago
 		filteredConns := make(map[string]*ConnectionInfo)
 		activeCount := 0
@@ -259,6 +256,11 @@ func buildStatePayload() ([]byte, error) {
 			effectiveUA = GlobalConfig.GetUpstreamUserAgent()
 		}
 
+		status := fileState.UpstreamStatus
+		if status == "" || status == "Idle" || status == "Throttled" {
+			status = "Downloading"
+		}
+
 		activeFiles = append(activeFiles, sseFile{
 			Key:                k,
 			URL:                fileState.URL,
@@ -270,7 +272,10 @@ func buildStatePayload() ([]byte, error) {
 			StarvingQueue:      starveQueue,
 			DownloadSpeed:      fileState.DownloadSpeed,
 			AvgDownloadSpeed:   fileState.AvgDownloadSpeed,
-			UpstreamStatus:     fileState.UpstreamStatus,
+			UpstreamStatus:     status,
+			IsStalled:          fileState.ZeroSpeedSec >= 3,
+			StalledSeconds:     fileState.ZeroSpeedSec,
+			ClientPositions:    clientPositions,
 			ConnectionsLast30s: activeCount + closedInLast30sCount,
 			ObservedCooldown:   fileState.ObservedCooldown,
 			UpstreamUserAgent:  effectiveUA,
@@ -305,6 +310,7 @@ func buildStatePayload() ([]byte, error) {
 		"server_instance_id":     ServerInstanceID,
 		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
 		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
+		"max_observed_speed":     GlobalRegistry.GetMaxObservedSpeed(),
 		"disk_free_bytes":        freeSpace,
 		"min_disk_free_bytes":    GlobalConfig.GetMinDiskFreeBytes(),
 		"active_downloads":       activeFiles,

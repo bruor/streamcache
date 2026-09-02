@@ -27,6 +27,7 @@ type Config struct {
 	UpstreamUserAgent       string
 	UpstreamUserAgentMode   string
 	MaxUpstreamRetries      int
+	StarvationStallTimeout  time.Duration
 }
 
 func (c *Config) Lock() {
@@ -142,6 +143,18 @@ func (c *Config) GetMaxUpstreamRetries() int {
 	return c.MaxUpstreamRetries
 }
 
+func (c *Config) GetStarvationStallTimeout() time.Duration {
+	if c == nil {
+		return 30 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.StarvationStallTimeout <= 0 {
+		return 30 * time.Second
+	}
+	return c.StarvationStallTimeout
+}
+
 func (c *Config) GetCacheMaxBytes() int64 {
 	if c == nil {
 		return 50 * 1024 * 1024 * 1024
@@ -237,6 +250,7 @@ func LoadConfig() {
 		UpstreamUserAgent:       getEnv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 		UpstreamUserAgentMode:   getEnv("UPSTREAM_USER_AGENT_MODE", "smart"),
 		MaxUpstreamRetries:      getEnvInt("MAX_UPSTREAM_RETRIES", 0),
+		StarvationStallTimeout:  getEnvDuration("STARVATION_STALL_TIMEOUT", 30*time.Second),
 	}
 
 	// Format port if missing colon

@@ -260,7 +260,69 @@
             white-space: nowrap;
             text-align: center;
             box-sizing: border-box;
-            transition: min-width 0.2s ease;
+            transition: all 0.2s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .download-speed-badge.stalled {
+            border-color: rgba(255, 159, 28, 0.7);
+            animation: pulse-glow-orange 1.5s infinite;
+        }
+
+        .collapsible-header-btn {
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            color: var(--text-sub);
+            font-family: var(--font-mono);
+            font-size: 0.78rem;
+            font-weight: 600;
+            padding: 3px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .collapsible-header-btn:hover {
+            background: rgba(0, 240, 255, 0.15);
+            color: var(--accent-secondary);
+            border-color: rgba(0, 240, 255, 0.4);
+        }
+
+        .collapsible-content {
+            transition: all 0.3s ease;
+            overflow: hidden;
+        }
+
+        .collapsible-content.collapsed {
+            display: none;
+        }
+
+        .canvas-container {
+            position: relative;
+            width: 100%;
+            margin-top: 0.8rem;
+        }
+
+        .canvas-tooltip {
+            position: absolute;
+            bottom: 125%;
+            transform: translateX(-50%);
+            background: rgba(14, 12, 26, 0.95);
+            border: 1px solid var(--accent-secondary);
+            border-radius: 6px;
+            padding: 4px 8px;
+            font-size: 0.72rem;
+            font-family: var(--font-mono);
+            color: #fff;
+            pointer-events: none;
+            white-space: nowrap;
+            z-index: 100;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+            display: none;
         }
 
         .cancel-hydration-btn {
@@ -839,12 +901,20 @@
             </div>
 
             <div class="card">
-                <div class="card-title">
-                    <span>Active Client Sessions</span>
-                    <span style="font-size: 0.85rem; color: var(--text-sub);" id="connections-count">0 Sessions</span>
+                <div class="card-title" style="margin-bottom: 0.8rem;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span>Active Client Sessions</span>
+                        <span style="font-size: 0.85rem; color: var(--text-sub);" id="connections-count">0 Sessions</span>
+                    </div>
+                    <button id="sessions-toggle-btn" class="collapsible-header-btn" onclick="toggleSessionsPanel()" title="Toggle Active Client Sessions visibility">
+                        <span id="sessions-toggle-icon">▶</span>
+                        <span id="sessions-toggle-text">Show Sessions</span>
+                    </button>
                 </div>
-                <div id="connections-container">
-                    <div class="empty-state">No active client connections.</div>
+                <div id="connections-collapsible" class="collapsible-content collapsed">
+                    <div id="connections-container">
+                        <div class="empty-state">No active client connections.</div>
+                    </div>
                 </div>
             </div>
 
@@ -1015,67 +1085,33 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
-        // --- HTML5 Canvas Multi-Row Block Grid Renderer with Animated Pulse ---
-        let isPulseAnimating = false;
-
-        function checkAndTriggerPulseAnimation() {
-            if (isPulseAnimating) return;
-            let hasDownloading = false;
-            for (const key in fileStore) {
-                const fd = fileStore[key];
-                if (fd && fd.block_states) {
-                    for (let i = 0; i < fd.block_states.length; i++) {
-                        if (fd.block_states[i] === 1) {
-                            hasDownloading = true;
-                            break;
-                        }
-                    }
-                }
-                if (hasDownloading) break;
-            }
-
-            if (hasDownloading) {
-                isPulseAnimating = true;
-                requestAnimationFrame(pulseAnimationLoop);
-            }
-        }
-
-        function pulseAnimationLoop(timestamp) {
-            let hasDownloading = false;
-            for (const key in fileStore) {
-                const fd = fileStore[key];
-                if (!fd || !fd.block_states) continue;
-                let fileHasDownloading = false;
-                for (let i = 0; i < fd.block_states.length; i++) {
-                    if (fd.block_states[i] === 1) {
-                        fileHasDownloading = true;
-                        hasDownloading = true;
-                        break;
-                    }
-                }
-                if (fileHasDownloading) {
-                    const canvas = document.getElementById(`canvas-${key}`);
-                    if (canvas) {
-                        renderCanvas(canvas, fd, timestamp);
-                    }
-                }
-            }
-
-            if (hasDownloading) {
-                requestAnimationFrame(pulseAnimationLoop);
+        let isSessionsExpanded = false;
+        function toggleSessionsPanel() {
+            isSessionsExpanded = !isSessionsExpanded;
+            const collapsible = document.getElementById('connections-collapsible');
+            const icon = document.getElementById('sessions-toggle-icon');
+            const text = document.getElementById('sessions-toggle-text');
+            if (isSessionsExpanded) {
+                if (collapsible) collapsible.classList.remove('collapsed');
+                if (icon) icon.innerText = '▼';
+                if (text) text.innerText = 'Hide Sessions';
             } else {
-                isPulseAnimating = false;
+                if (collapsible) collapsible.classList.add('collapsed');
+                if (icon) icon.innerText = '▶';
+                if (text) text.innerText = 'Show Sessions';
             }
         }
 
-        function renderCanvas(canvas, fileData, timestamp) {
+        let latestServerState = { max_observed_speed: 0 };
+
+        function renderCanvas(canvas, fileData) {
             if (!canvas || !fileData) return;
             const ctx = canvas.getContext('2d');
             const dpr = window.devicePixelRatio || 1;
             const rect = canvas.getBoundingClientRect();
             
             const displayWidth = rect.width || canvas.clientWidth || 300;
-            const displayHeight = 14;
+            const displayHeight = 16;
             const total = fileData.total_size || 1;
             
             if (canvas.width !== Math.floor(displayWidth * dpr) || canvas.height !== Math.floor(displayHeight * dpr)) {
@@ -1092,9 +1128,9 @@
             ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
             ctx.fillRect(0, 0, displayWidth, displayHeight);
 
-            // Draw completed ranges
+            // Draw completed ranges (accent green)
             if (fileData.ranges && fileData.ranges.length > 0) {
-                ctx.fillStyle = '#39ff14'; // accent green
+                ctx.fillStyle = '#39ff14';
                 for (let i = 0; i < fileData.ranges.length; i++) {
                     const r = fileData.ranges[i];
                     const startX = (r[0] / total) * displayWidth;
@@ -1104,9 +1140,9 @@
                 }
             }
 
-            // Draw starving markers
+            // Draw starving markers (accent orange)
             if (fileData.starving_queue && fileData.starving_queue.length > 0) {
-                ctx.fillStyle = '#ff9f1c'; // accent orange
+                ctx.fillStyle = '#ff9f1c';
                 for (let i = 0; i < fileData.starving_queue.length; i++) {
                     const off = fileData.starving_queue[i];
                     const sx = (off / total) * displayWidth;
@@ -1114,7 +1150,98 @@
                 }
             }
 
+            // Draw active client playback position needles
+            if (fileData.client_positions && fileData.client_positions.length > 0) {
+                for (let i = 0; i < fileData.client_positions.length; i++) {
+                    const cp = fileData.client_positions[i];
+                    const posX = Math.max(0, Math.min(displayWidth - 2, (cp.offset / total) * displayWidth));
+                    
+                    if (cp.is_starving) {
+                        // Alert Red needle with pulse glow
+                        ctx.save();
+                        ctx.shadowColor = '#ff3333';
+                        ctx.shadowBlur = 6;
+                        ctx.fillStyle = '#ff3333';
+                        ctx.fillRect(posX - 1, 0, 2.5, displayHeight);
+                        
+                        // Top indicator triangle
+                        ctx.beginPath();
+                        ctx.moveTo(posX - 3, 0);
+                        ctx.lineTo(posX + 3, 0);
+                        ctx.lineTo(posX, 4);
+                        ctx.closePath();
+                        ctx.fill();
+                        ctx.restore();
+                    } else {
+                        // Neon Cyan needle with glow
+                        ctx.save();
+                        ctx.shadowColor = '#00f0ff';
+                        ctx.shadowBlur = 4;
+                        ctx.fillStyle = '#00f0ff';
+                        ctx.fillRect(posX - 0.75, 0, 2, displayHeight);
+                        
+                        // Top indicator triangle
+                        ctx.beginPath();
+                        ctx.moveTo(posX - 2.5, 0);
+                        ctx.lineTo(posX + 2.5, 0);
+                        ctx.lineTo(posX, 3.5);
+                        ctx.closePath();
+                        ctx.fill();
+                        ctx.restore();
+                    }
+                }
+            }
+
             ctx.restore();
+        }
+
+        function setupCanvasTooltip(canvas, fileKey) {
+            if (canvas.dataset.hasTooltip) return;
+            canvas.dataset.hasTooltip = "true";
+            const tooltip = document.getElementById(`tooltip-${fileKey}`);
+            
+            canvas.addEventListener('mousemove', (e) => {
+                const fileData = fileStore[fileKey];
+                if (!fileData || !tooltip) return;
+                const rect = canvas.getBoundingClientRect();
+                const x = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+                const total = fileData.total_size || 1;
+                const hoveredOffset = Math.floor((x / rect.width) * total);
+                const pct = ((hoveredOffset / total) * 100).toFixed(1);
+                
+                // Check if offset is cached
+                let isCached = false;
+                if (fileData.ranges) {
+                    for (let i = 0; i < fileData.ranges.length; i++) {
+                        if (hoveredOffset >= fileData.ranges[i][0] && hoveredOffset < fileData.ranges[i][1]) {
+                            isCached = true;
+                            break;
+                        }
+                    }
+                }
+                
+                let text = `${formatBytes(hoveredOffset)} / ${formatBytes(total)} (${pct}%) - ${isCached ? 'Cached' : 'Missing'}`;
+                
+                // Check if near any client needle (within 8px)
+                if (fileData.client_positions) {
+                    for (let i = 0; i < fileData.client_positions.length; i++) {
+                        const cp = fileData.client_positions[i];
+                        const cpX = (cp.offset / total) * rect.width;
+                        if (Math.abs(cpX - x) <= 8) {
+                            text += ` | Playback: ${cp.id} (${cp.remote_addr})${cp.is_starving ? ' [STARVING]' : ''}`;
+                            break;
+                        }
+                    }
+                }
+                
+                tooltip.innerText = text;
+                tooltip.style.left = `${x}px`;
+                tooltip.style.display = 'block';
+            });
+            
+            canvas.addEventListener('mouseleave', () => {
+                if (tooltip) tooltip.style.display = 'none';
+            });
         }
 
         function updateFileBadgeAndMeta(key) {
@@ -1137,19 +1264,27 @@
 
             const speedEl = document.getElementById(`speed-badge-${key}`);
             if (speedEl) {
-                let currentStr = fileData.download_speed > 0 ? `${formatBytes(fileData.download_speed)}/s` : '0 B/s';
+                let currentSpeed = fileData.download_speed || 0;
+                let currentStr = currentSpeed > 0 ? `${formatBytes(currentSpeed)}/s` : '0 B/s';
                 let avgVal = fileData.avg_download_speed || 0;
                 let avgStr = avgVal > 0 ? ` (Avg: ${formatBytes(avgVal)}/s)` : '';
                 speedEl.innerText = `Speed: ${currentStr}${avgStr}`;
 
-                requestAnimationFrame(() => {
-                    const currentWidth = speedEl.getBoundingClientRect().width;
-                    const storedMaxWidth = speedEl.dataset.maxWidth ? parseFloat(speedEl.dataset.maxWidth) : 0;
-                    if (currentWidth > storedMaxWidth) {
-                        speedEl.dataset.maxWidth = currentWidth;
-                        speedEl.style.minWidth = `${Math.ceil(currentWidth)}px`;
-                    }
-                });
+                // Dynamic background gradient scaled from 0 to max_observed_speed
+                const maxObserved = latestServerState.max_observed_speed || 0;
+                if (maxObserved > 0 && currentSpeed > 0) {
+                    const fillPct = Math.min(100, Math.max(3, (currentSpeed / maxObserved) * 100)).toFixed(1);
+                    speedEl.style.background = `linear-gradient(90deg, rgba(0, 240, 255, 0.28) 0%, rgba(0, 240, 255, 0.28) ${fillPct}%, rgba(0, 240, 255, 0.05) ${fillPct}%, rgba(0, 240, 255, 0.05) 100%)`;
+                } else {
+                    speedEl.style.background = 'rgba(0, 240, 255, 0.06)';
+                }
+
+                // Orange stall halo alert
+                if (fileData.is_stalled) {
+                    speedEl.classList.add('stalled');
+                } else {
+                    speedEl.classList.remove('stalled');
+                }
             }
             
             const metaEl = document.getElementById(`meta-${key}`);
@@ -1230,9 +1365,12 @@
                         downloaded_bytes: file.downloaded_bytes || 0,
                         active_clients: file.active_clients,
                         starving_queue: file.starving_queue,
+                        client_positions: file.client_positions || [],
                         download_speed: file.download_speed,
                         avg_download_speed: file.avg_download_speed,
                         upstream_status: file.upstream_status,
+                        is_stalled: file.is_stalled,
+                        stalled_seconds: file.stalled_seconds,
                         connections_last_30s: file.connections_last_30s,
                         observed_cooldown: file.observed_cooldown,
                         upstream_user_agent: file.upstream_user_agent
@@ -1241,13 +1379,16 @@
                 } else {
                     fileData.url = file.url;
                     fileData.total_size = file.total_size;
-                    fileData.ranges = file.ranges || fileData.ranges;
-                    fileData.downloaded_bytes = file.downloaded_bytes !== undefined ? file.downloaded_bytes : fileData.downloaded_bytes;
+                    fileData.ranges = file.ranges || [];
+                    fileData.downloaded_bytes = file.downloaded_bytes || 0;
                     fileData.active_clients = file.active_clients;
                     fileData.starving_queue = file.starving_queue;
+                    fileData.client_positions = file.client_positions || [];
                     fileData.download_speed = file.download_speed;
                     fileData.avg_download_speed = file.avg_download_speed;
                     fileData.upstream_status = file.upstream_status;
+                    fileData.is_stalled = file.is_stalled;
+                    fileData.stalled_seconds = file.stalled_seconds;
                     fileData.connections_last_30s = file.connections_last_30s;
                     fileData.observed_cooldown = file.observed_cooldown;
                     fileData.upstream_user_agent = file.upstream_user_agent;
@@ -1267,7 +1408,10 @@
                                 <button class="cancel-hydration-btn" onclick="cancelHydration('${file.key}')" title="Cancel this in-progress hydration">Cancel Hydration</button>
                             </div>
                         </div>
-                        <canvas class="block-canvas" id="canvas-${file.key}"></canvas>
+                        <div class="canvas-container">
+                            <div class="canvas-tooltip" id="tooltip-${file.key}"></div>
+                            <canvas class="block-canvas" id="canvas-${file.key}"></canvas>
+                        </div>
                         <div class="download-meta" id="meta-${file.key}"></div>
                     `;
                     downloadsContainer.appendChild(card);
@@ -1277,6 +1421,7 @@
                 const canvas = document.getElementById(`canvas-${file.key}`);
                 if (canvas) {
                     renderCanvas(canvas, fileData);
+                    setupCanvasTooltip(canvas, file.key);
                 }
             });
         }
@@ -1470,40 +1615,10 @@
                 appendLog(event.data);
             });
 
-            // 2. Real-time range update events
-            es.addEventListener('range_update', function(event) {
-                try {
-                    const evtData = JSON.parse(event.data);
-                    const key = evtData.key;
-                    const start = evtData.start;
-                    const end = evtData.end;
-                    
-                    const fileData = fileStore[key];
-                    if (fileData) {
-                        if (evtData.upstream_status) {
-                            fileData.upstream_status = evtData.upstream_status;
-                        }
-                        if (!fileData.ranges) fileData.ranges = [];
-                        fileData.ranges.push([start, end]);
-                        fileData.downloaded_bytes = (fileData.downloaded_bytes || 0) + (end - start);
-                        if (fileData.downloaded_bytes > fileData.total_size) {
-                            fileData.downloaded_bytes = fileData.total_size;
-                        }
-                        
-                        const canvas = document.getElementById(`canvas-${key}`);
-                        if (canvas) {
-                            renderCanvas(canvas, fileData);
-                        }
-                        updateFileBadgeAndMeta(key);
-                    }
-                } catch(e) {
-                    console.error("Error handling range_update:", e);
-                }
-            });
-
-            // 3. Periodic full state update & metrics sync
+            // 2. Authoritative full state update & metrics sync (250ms when active / 3s when idle)
             es.addEventListener('state', function(event) {
                 const data = JSON.parse(event.data);
+                latestServerState = data;
 
                 if (data.server_instance_id) {
                     if (currentServerInstanceId === null) {

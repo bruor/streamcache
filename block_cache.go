@@ -79,6 +79,7 @@ type FileCacheState struct {
 	WriterActive       bool
 	Clients            map[string]chan struct{}
 	Starving           map[string]int64 // Map of clientID -> starving byte offset
+	StarvingSince      map[string]time.Time // Map of clientID -> when starvation began
 	File               *os.File         // Open handle to writing file
 	NotifyChan         chan struct{}    // Channel to wake coordinator on client starvation
 	BytesDownloadedSec int64
@@ -113,6 +114,7 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		LastValidated:             time.Now().Unix(),
 		Clients:                   make(map[string]chan struct{}),
 		Starving:                  make(map[string]int64),
+		StarvingSince:             make(map[string]time.Time),
 		NotifyChan:                make(chan struct{}, 20),
 		UpstreamStatus:            "Idle",
 		PendingTailPrefetchOffset: -1,
@@ -160,13 +162,14 @@ func (s *FileCacheState) RecordConnEnd(connID string) {
 }
 
 type CacheRegistry struct {
-	Lock           sync.RWMutex
-	Files          map[string]*FileCacheState
-	Connections    map[string]*ClientConnection
-	Sessions       map[string]*ClientSession
-	FailedProbes   map[string]time.Time
-	TotalCacheSize int64
-	Evicting       bool
+	Lock             sync.RWMutex
+	Files            map[string]*FileCacheState
+	Connections      map[string]*ClientConnection
+	Sessions         map[string]*ClientSession
+	FailedProbes     map[string]time.Time
+	TotalCacheSize   int64
+	MaxObservedSpeed int64
+	Evicting         bool
 }
 
 var GlobalRegistry *CacheRegistry
@@ -188,6 +191,24 @@ func InitRegistry() {
 	go startDiskFreeMonitor()
 
 	go GlobalRegistry.startSpeedMonitor()
+}
+
+func (r *CacheRegistry) HasActiveActivity() bool {
+	if r == nil {
+		return false
+	}
+	r.Lock.RLock()
+	defer r.Lock.RUnlock()
+	return len(r.Files) > 0 || len(r.Sessions) > 0
+}
+
+func (r *CacheRegistry) GetMaxObservedSpeed() int64 {
+	if r == nil {
+		return 0
+	}
+	r.Lock.RLock()
+	defer r.Lock.RUnlock()
+	return r.MaxObservedSpeed
 }
 
 func (r *CacheRegistry) RecordFailedProbe(key string, duration time.Duration) {
@@ -284,6 +305,14 @@ func (r *CacheRegistry) startSpeedMonitor() {
 			}
 			fileState.DownloadSpeed = int64(fileState.SmoothDownloadSpeed)
 
+			if fileState.DownloadSpeed > 0 {
+				r.Lock.Lock()
+				if fileState.DownloadSpeed > r.MaxObservedSpeed {
+					r.MaxObservedSpeed = fileState.DownloadSpeed
+				}
+				r.Lock.Unlock()
+			}
+
 			// Calculate overall average download speed
 			if fileState.HydrationStartTime > 0 {
 				elapsed := now - fileState.HydrationStartTime
@@ -293,18 +322,17 @@ func (r *CacheRegistry) startSpeedMonitor() {
 				fileState.AvgDownloadSpeed = fileState.TotalBytesDownloaded / elapsed
 			}
 
-			// Zero-speed provider throttling detection
+			// Zero-speed stall tracking
 			if fileState.WriterActive && !isAnyCommitting && fileState.UpstreamStatus != "Committing" {
 				if instantSpeed == 0 {
 					fileState.ZeroSpeedSec++
-					if fileState.ZeroSpeedSec >= 3 && fileState.UpstreamStatus == "Downloading" {
-						fileState.UpstreamStatus = "Throttled"
+					if fileState.ZeroSpeedSec == 3 {
 						shouldBroadcast = true
 					}
 				} else {
+					wasStalled := fileState.ZeroSpeedSec >= 3
 					fileState.ZeroSpeedSec = 0
-					if fileState.UpstreamStatus == "Throttled" {
-						fileState.UpstreamStatus = "Downloading"
+					if wasStalled {
 						shouldBroadcast = true
 					}
 				}

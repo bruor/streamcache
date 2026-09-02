@@ -97,6 +97,7 @@ type Worker struct {
 	cancel            context.CancelFunc
 	currentOffset     int64 // guarded atomically
 	speed             int64 // estimated speed (bytes/sec)
+	spawnTimeNano     int64 // Unix nano timestamp of worker spawn
 	connStartTimeNano int64 // Unix nano timestamp of connection start, guarded atomically
 	connBytesWritten  int64 // bytes read on this connection, guarded atomically
 	isPrefetching     int32 // 1 if prefetching tail metadata, 0 otherwise, guarded atomically
@@ -271,6 +272,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			startOffset:   startOffset,
 			cancel:        wCancel,
 			currentOffset: startOffset,
+			spawnTimeNano: time.Now().UnixNano(),
 		}
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, removeWorker, parentCancel)
@@ -287,6 +289,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			cancel:           wCancel,
 			currentOffset:    startOffset,
 			isPrefetchHelper: true,
+			spawnTimeNano:    time.Now().UnixNano(),
 		}
 		atomic.StoreInt32(&w.isPrefetching, 1)
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
@@ -339,170 +342,204 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 		select {
 		case <-state.NotifyChan:
+		case <-time.After(500 * time.Millisecond):
+		case <-parentCtx.Done():
+			return
+		}
+
+		state.Lock.Lock()
+		pendingTail := state.PendingTailPrefetchOffset
+		if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() > 1 {
+			state.PendingTailPrefetchOffset = -1
+			state.Lock.Unlock()
+			log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at offset %d", pendingTail)
+			spawnPrefetchWorker(pendingTail)
 			state.Lock.Lock()
-			pendingTail := state.PendingTailPrefetchOffset
-			if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() > 1 {
-				state.PendingTailPrefetchOffset = -1
-				state.Lock.Unlock()
-				log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at offset %d", pendingTail)
-				spawnPrefetchWorker(pendingTail)
-				state.Lock.Lock()
-			}
+		}
 
-			// Find all starving offsets that are not covered
-			var starvingOffsets []int64
-			for _, sb := range state.Starving {
-				if !state.RangeSet.Contains(sb) {
-					isBeingDownloaded := false
-					state.WorkersLock.Lock()
-					for _, w := range state.ActiveWorkers {
-						wOff := atomic.LoadInt64(&w.currentOffset)
-						if wOff <= sb && sb-wOff <= 512*1024 {
-							isBeingDownloaded = true
-							break
-						}
+		// Find all starving offsets that are not covered
+		var starvingOffsets []int64
+		for _, sb := range state.Starving {
+			if !state.RangeSet.Contains(sb) {
+				alreadyInList := false
+				for _, off := range starvingOffsets {
+					if off == sb {
+						alreadyInList = true
+						break
 					}
-					state.WorkersLock.Unlock()
+				}
+				if !alreadyInList {
+					starvingOffsets = append(starvingOffsets, sb)
+				}
+			}
+		}
+		state.Lock.Unlock()
 
-					if !isBeingDownloaded {
-						alreadyInList := false
-						for _, off := range starvingOffsets {
-							if off == sb {
-								alreadyInList = true
+		if len(starvingOffsets) > 0 {
+			for _, sb := range starvingOffsets {
+				stallTimeout := GlobalConfig.GetStarvationStallTimeout()
+				isStalledOnStarvation := false
+				state.Lock.Lock()
+				for clientID, starveOff := range state.Starving {
+					if starveOff == sb {
+						if since, ok := state.StarvingSince[clientID]; ok {
+							if time.Since(since) >= stallTimeout {
+								isStalledOnStarvation = true
 								break
 							}
 						}
-						if !alreadyInList {
-							starvingOffsets = append(starvingOffsets, sb)
-						}
 					}
 				}
-			}
+				state.Lock.Unlock()
 
-			if len(starvingOffsets) > 0 {
-				for _, sb := range starvingOffsets {
-					suppressed := false
-					state.WorkersLock.Lock()
-					for _, w := range state.ActiveWorkers {
-						wCurrent := atomic.LoadInt64(&w.currentOffset)
+				suppressed := false
+				state.WorkersLock.Lock()
+				for _, w := range state.ActiveWorkers {
+					wCurrent := atomic.LoadInt64(&w.currentOffset)
 
-						// 1. If worker is streaming within 512KB ahead/behind
-						if wCurrent <= sb && sb-wCurrent <= 512*1024 {
-							log.Printf("[Coord] Client Hydration Wait active for offset %d (worker %d is at %d). Suppressing jump.", sb, w.id, wCurrent)
-							suppressed = true
-							break
-						}
-
-						// If worker is prefetching tail metadata and target is within tail range
-						if atomic.LoadInt32(&w.isPrefetching) == 1 && sb >= wCurrent {
-							log.Printf("[Coord] Worker %d is pre-fetching tail metadata (at %d, client starving at %d). Suppressing pre-emption.", w.id, wCurrent, sb)
-							suppressed = true
-							break
-						}
-
-						// 2. Sequential catch-up ETA calculation
-						if wCurrent < sb {
-							gapStart, _, found := state.RangeSet.FindNextGap(wCurrent, sb)
-							if !found || gapStart == wCurrent {
-								wSpeed := atomic.LoadInt64(&w.speed)
-								if wSpeed == 0 {
-									connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
-									connBytes := atomic.LoadInt64(&w.connBytesWritten)
-									if connStartNano > 0 && connBytes > 0 {
-										elapsedSecs := time.Since(time.Unix(0, connStartNano)).Seconds()
-										if elapsedSecs > 0.1 {
-											wSpeed = int64(float64(connBytes) / elapsedSecs)
-										}
-									}
-								}
-
-								if wSpeed > 0 {
-									hydrationWait := GlobalConfig.GetClientHydrationWait()
-									bytesRemaining := sb - wCurrent
-									eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
-									if eta < hydrationWait {
-										log.Printf("[Coord] Client Hydration Wait active for offset %d (ETA %.2fs < threshold %s). Suppressing connection jump.", sb, eta.Seconds(), hydrationWait)
-										suppressed = true
-										break
-									}
-								}
-							}
-						}
+					connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
+					var elapsed time.Duration
+					if connStartNano > 0 {
+						elapsed = time.Since(time.Unix(0, connStartNano))
+					} else if w.spawnTimeNano > 0 {
+						elapsed = time.Since(time.Unix(0, w.spawnTimeNano))
 					}
-					state.WorkersLock.Unlock()
 
-					if suppressed {
+					// If a worker is already dedicated to this starving offset and within stall timeout, suppress
+					if w.startOffset == sb && elapsed < stallTimeout {
+						suppressed = true
+						break
+					}
+
+					if isStalledOnStarvation {
+						log.Printf("[Coord] Worker %d stalled at offset %d for >= %s during client starvation at %d. Breaking out of suppression.", w.id, wCurrent, stallTimeout, sb)
 						continue
 					}
 
-					state.WorkersLock.Lock()
-					activeCount = len(state.ActiveWorkers)
-					state.WorkersLock.Unlock()
+					// 1. If worker is streaming within 512KB ahead/behind
+					if wCurrent <= sb && sb-wCurrent <= 512*1024 {
+						log.Printf("[Coord] Client Hydration Wait active for offset %d (worker %d is at %d). Suppressing jump.", sb, w.id, wCurrent)
+						suppressed = true
+						break
+					}
 
-					maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
-					if activeCount < maxWorkers {
-						log.Printf("[Coord] Spawning new worker starting at starving offset %d (Active: %d/%d)", sb, activeCount+1, maxWorkers)
-						spawnWorker(sb)
-					} else {
-						// Worker limit reached. Find furthest worker to pre-empt
-						state.WorkersLock.Lock()
-						var workerToPreempt *Worker
-						maxDistance := int64(-1)
+					// If worker is prefetching tail metadata and target is within tail range
+					if atomic.LoadInt32(&w.isPrefetching) == 1 && sb >= wCurrent {
+						log.Printf("[Coord] Worker %d is pre-fetching tail metadata (at %d, client starving at %d). Suppressing pre-emption.", w.id, wCurrent, sb)
+						suppressed = true
+						break
+					}
 
-						for _, w := range state.ActiveWorkers {
-							wCurrent := atomic.LoadInt64(&w.currentOffset)
-
-							connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
-							var elapsed time.Duration
-							if connStartNano > 0 {
-								elapsed = time.Since(time.Unix(0, connStartNano))
-							}
-
-							minTime := GlobalConfig.GetSchedulerMinTime()
-							eligible := minTime <= 0 || elapsed >= minTime
-
-							if eligible && atomic.LoadInt32(&w.isPrefetching) == 0 {
-								var minDistanceToClient int64 = 1e18
-								for _, clientStarveOffset := range state.Starving {
-									dist := clientStarveOffset - wCurrent
-									if dist < 0 {
-										dist = -dist
-									}
-									if dist < minDistanceToClient {
-										minDistanceToClient = dist
+					// 2. Sequential catch-up ETA calculation
+					if wCurrent < sb {
+						gapStart, _, found := state.RangeSet.FindNextGap(wCurrent, sb)
+						if !found || gapStart == wCurrent {
+							wSpeed := atomic.LoadInt64(&w.speed)
+							if wSpeed == 0 {
+								connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
+								connBytes := atomic.LoadInt64(&w.connBytesWritten)
+								if connStartNano > 0 && connBytes > 0 {
+									elapsedSecs := time.Since(time.Unix(0, connStartNano)).Seconds()
+									if elapsedSecs > 0.1 {
+										wSpeed = int64(float64(connBytes) / elapsedSecs)
 									}
 								}
-								if minDistanceToClient > maxDistance {
-									maxDistance = minDistanceToClient
-									workerToPreempt = w
-								}
 							}
-						}
 
-						if workerToPreempt != nil {
-							log.Printf("[Coord] Pre-empting worker %d (at offset %d) to switch to starving offset %d",
-								workerToPreempt.id, atomic.LoadInt64(&workerToPreempt.currentOffset), sb)
-							workerToPreempt.cancel()
-
-							for i, aw := range state.ActiveWorkers {
-								if aw.id == workerToPreempt.id {
-									state.ActiveWorkers = append(state.ActiveWorkers[:i], state.ActiveWorkers[i+1:]...)
+							if wSpeed > 0 {
+								hydrationWait := GlobalConfig.GetClientHydrationWait()
+								bytesRemaining := sb - wCurrent
+								eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
+								if eta < hydrationWait {
+									log.Printf("[Coord] Client Hydration Wait active for offset %d (ETA %.2fs < threshold %s). Suppressing connection jump.", sb, eta.Seconds(), hydrationWait)
+									suppressed = true
 									break
 								}
 							}
-							state.WorkersLock.Unlock()
-
-							spawnWorker(sb)
-						} else {
-							state.WorkersLock.Unlock()
 						}
 					}
 				}
-			}
-			state.Lock.Unlock()
+				state.WorkersLock.Unlock()
 
-		case <-parentCtx.Done():
-			return
+				if suppressed {
+					continue
+				}
+
+				state.WorkersLock.Lock()
+				activeCount = len(state.ActiveWorkers)
+				state.WorkersLock.Unlock()
+
+				maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
+				if activeCount < maxWorkers {
+					log.Printf("[Coord] Spawning new worker starting at starving offset %d (Active: %d/%d)", sb, activeCount+1, maxWorkers)
+					spawnWorker(sb)
+				} else {
+					// Worker limit reached. Find furthest worker to pre-empt
+					state.WorkersLock.Lock()
+					var workerToPreempt *Worker
+					maxDistance := int64(-1)
+
+					for _, w := range state.ActiveWorkers {
+						wCurrent := atomic.LoadInt64(&w.currentOffset)
+
+						connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
+						var elapsed time.Duration
+						if connStartNano > 0 {
+							elapsed = time.Since(time.Unix(0, connStartNano))
+						} else if w.spawnTimeNano > 0 {
+							elapsed = time.Since(time.Unix(0, w.spawnTimeNano))
+						}
+
+						minTime := GlobalConfig.GetSchedulerMinTime()
+						eligible := minTime <= 0 || elapsed >= minTime || isStalledOnStarvation
+
+						if eligible && atomic.LoadInt32(&w.isPrefetching) == 0 {
+							var minDistanceToClient int64 = 1e18
+							state.Lock.Lock()
+							for _, clientStarveOffset := range state.Starving {
+								dist := clientStarveOffset - wCurrent
+								if dist < 0 {
+									dist = -dist
+								}
+								if dist < minDistanceToClient {
+									minDistanceToClient = dist
+								}
+							}
+							state.Lock.Unlock()
+							if minDistanceToClient > maxDistance {
+								maxDistance = minDistanceToClient
+								workerToPreempt = w
+							}
+						}
+					}
+
+					if workerToPreempt != nil {
+						log.Printf("[Coord] Pre-empting worker %d (at offset %d) to switch to starving offset %d",
+							workerToPreempt.id, atomic.LoadInt64(&workerToPreempt.currentOffset), sb)
+						workerToPreempt.cancel()
+
+						for i, aw := range state.ActiveWorkers {
+							if aw.id == workerToPreempt.id {
+								state.ActiveWorkers = append(state.ActiveWorkers[:i], state.ActiveWorkers[i+1:]...)
+								break
+							}
+						}
+						state.WorkersLock.Unlock()
+
+						state.Lock.Lock()
+						for clientID, starveOff := range state.Starving {
+							if starveOff == sb {
+								state.StarvingSince[clientID] = time.Now()
+							}
+						}
+						state.Lock.Unlock()
+
+						spawnWorker(sb)
+					} else {
+						state.WorkersLock.Unlock()
+					}
+				}
+			}
 		}
 	}
 }
@@ -791,10 +828,6 @@ func runDownloadWorker(
 			if readElapsed > 0 {
 				instantSpeed := int64(float64(n) / readElapsed)
 				atomic.StoreInt64(&w.speed, instantSpeed)
-			}
-
-			if GlobalLogBroker != nil {
-				GlobalLogBroker.BroadcastRangeUpdate(state.Key, currentOffset-int64(n), currentOffset)
 			}
 		}
 

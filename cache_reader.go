@@ -116,6 +116,7 @@ func (r *CacheReader) Close() error {
 		delete(r.state.Clients, r.clientID)
 	}
 	delete(r.state.Starving, r.clientID)
+	delete(r.state.StarvingSince, r.clientID)
 
 	log.Printf("[Reader] Unregistered client %s from media %s", r.clientID, r.state.Key)
 
@@ -210,6 +211,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		if avail > 0 || r.state.RangeSet.IsComplete(r.state.TotalSize) {
 			r.state.Lock.Lock()
 			delete(r.state.Starving, r.clientID)
+			delete(r.state.StarvingSince, r.clientID)
 			r.state.Lock.Unlock()
 			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
 			break
@@ -219,6 +221,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		case <-r.ctx.Done():
 			r.state.Lock.Lock()
 			delete(r.state.Starving, r.clientID)
+			delete(r.state.StarvingSince, r.clientID)
 			r.state.Lock.Unlock()
 			return 0, r.ctx.Err()
 		default:
@@ -232,6 +235,12 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			r.state.Lock.Lock()
 		}
 
+		if _, exists := r.state.StarvingSince[r.clientID]; !exists {
+			if r.state.StarvingSince == nil {
+				r.state.StarvingSince = make(map[string]time.Time)
+			}
+			r.state.StarvingSince[r.clientID] = time.Now()
+		}
 		r.state.Starving[r.clientID] = off
 		clientChan := r.state.Clients[r.clientID]
 		r.state.Lock.Unlock()
@@ -255,6 +264,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		case <-r.ctx.Done():
 			r.state.Lock.Lock()
 			delete(r.state.Starving, r.clientID)
+			delete(r.state.StarvingSince, r.clientID)
 			r.state.Lock.Unlock()
 			return 0, r.ctx.Err()
 		}
