@@ -452,16 +452,20 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						continue
 					}
 
-					// 1. If worker is streaming within 512KB ahead/behind
+					// 1. If worker is streaming within 512KB ahead/behind (live playback cursor)
 					if wCurrent <= sb && sb-wCurrent <= 512*1024 {
-						log.Printf("[Coord] Client Hydration Wait active for offset %d (worker %d is at %d). Suppressing jump.", sb, w.id, wCurrent)
+						if GlobalConfig.GetLogVerbose() {
+							log.Printf("[Coord] [Verbose] Client Hydration Wait active for offset %d (worker %d is at %d). Suppressing jump.", sb, w.id, wCurrent)
+						}
 						suppressed = true
 						break
 					}
 
 					// If worker is prefetching tail metadata and target is within tail range
 					if atomic.LoadInt32(&w.isPrefetching) == 1 && sb >= wCurrent {
-						log.Printf("[Coord] Worker %d is pre-fetching tail metadata (at %d, client starving at %d). Suppressing pre-emption.", w.id, wCurrent, sb)
+						if GlobalConfig.GetLogVerbose() {
+							log.Printf("[Coord] [Verbose] Worker %d is pre-fetching tail metadata (at %d, client starving at %d). Suppressing pre-emption.", w.id, wCurrent, sb)
+						}
 						suppressed = true
 						break
 					}
@@ -487,7 +491,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								bytesRemaining := sb - wCurrent
 								eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
 								if eta < hydrationWait {
-									log.Printf("[Coord] Client Hydration Wait active for offset %d (ETA %.2fs < threshold %s). Suppressing connection jump.", sb, eta.Seconds(), hydrationWait)
+									if GlobalConfig.GetLogVerbose() {
+										log.Printf("[Coord] [Verbose] Client Hydration Wait active for offset %d (ETA %.2fs < threshold %s). Suppressing connection jump.", sb, eta.Seconds(), hydrationWait)
+									}
 									suppressed = true
 									break
 								}

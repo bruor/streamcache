@@ -28,6 +28,7 @@ type Config struct {
 	UpstreamUserAgentMode   string
 	MaxUpstreamRetries      int
 	StarvationStallTimeout  time.Duration
+	LogVerbose              bool
 }
 
 func (c *Config) Lock() {
@@ -231,6 +232,24 @@ func (c *Config) GetUpstreamUserAgentMode() string {
 	return mode
 }
 
+func (c *Config) GetLogVerbose() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.LogVerbose
+}
+
+func (c *Config) SetLogVerbose(val bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.LogVerbose = val
+}
+
 var GlobalConfig *Config
 
 func LoadConfig() {
@@ -251,6 +270,7 @@ func LoadConfig() {
 		UpstreamUserAgentMode:   getEnv("UPSTREAM_USER_AGENT_MODE", "smart"),
 		MaxUpstreamRetries:      getEnvInt("MAX_UPSTREAM_RETRIES", 0),
 		StarvationStallTimeout:  getEnvDuration("STARVATION_STALL_TIMEOUT", 30*time.Second),
+		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 	}
 
 	// Format port if missing colon
