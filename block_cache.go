@@ -130,6 +130,18 @@ type ConnectionInfo struct {
 }
 
 func (s *FileCacheState) SetUpstreamStatus(status string) {
+	targetStatus := status
+	if status == "Connecting" || status == "Retrying" {
+		s.WorkersLock.Lock()
+		for _, w := range s.ActiveWorkers {
+			if atomic.LoadInt64(&w.connBytesWritten) > 0 || atomic.LoadInt64(&w.speed) > 0 {
+				targetStatus = "Downloading"
+				break
+			}
+		}
+		s.WorkersLock.Unlock()
+	}
+
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
 
@@ -142,23 +154,6 @@ func (s *FileCacheState) SetUpstreamStatus(status string) {
 			}
 		}
 		return
-	}
-
-	targetStatus := status
-	if status == "Connecting" || status == "Retrying" {
-		s.WorkersLock.Lock()
-		hasActiveDownloader := false
-		for _, w := range s.ActiveWorkers {
-			if atomic.LoadInt64(&w.connBytesWritten) > 0 || atomic.LoadInt64(&w.speed) > 0 {
-				hasActiveDownloader = true
-				break
-			}
-		}
-		s.WorkersLock.Unlock()
-
-		if hasActiveDownloader {
-			targetStatus = "Downloading"
-		}
 	}
 
 	if s.UpstreamStatus != targetStatus {

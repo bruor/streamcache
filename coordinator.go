@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -546,8 +547,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 						if eligible && atomic.LoadInt32(&w.isPrefetching) == 0 {
 							var minDistanceToClient int64 = 1e18
-							state.Lock.Lock()
-							for _, clientStarveOffset := range state.Starving {
+							for _, clientStarveOffset := range starvingOffsets {
 								dist := clientStarveOffset - wCurrent
 								if dist < 0 {
 									dist = -dist
@@ -556,7 +556,6 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 									minDistanceToClient = dist
 								}
 							}
-							state.Lock.Unlock()
 							if minDistanceToClient > maxDistance {
 								maxDistance = minDistanceToClient
 								workerToPreempt = w
@@ -748,6 +747,7 @@ func runDownloadWorker(
 			currentOffset = gapStart
 			atomic.StoreInt64(&w.currentOffset, currentOffset)
 			atomic.StoreInt64(&w.targetEndOffset, gapEnd)
+			atomic.StoreInt64(&w.lastByteTimeNano, time.Now().UnixNano())
 		}
 
 		if currentOffset >= state.TotalSize {
@@ -813,6 +813,7 @@ func runDownloadWorker(
 				currentOffset = gapStart
 				atomic.StoreInt64(&w.currentOffset, currentOffset)
 				atomic.StoreInt64(&w.targetEndOffset, gapEnd)
+				atomic.StoreInt64(&w.lastByteTimeNano, time.Now().UnixNano())
 				continue
 			}
 
@@ -906,6 +907,7 @@ func runDownloadWorker(
 				currentOffset = gapStart
 				atomic.StoreInt64(&w.currentOffset, currentOffset)
 				atomic.StoreInt64(&w.targetEndOffset, gapEnd)
+				atomic.StoreInt64(&w.lastByteTimeNano, time.Now().UnixNano())
 				continue
 			}
 		}
@@ -924,6 +926,24 @@ func runDownloadWorker(
 			if w.isPrefetchHelper {
 				log.Printf("[Worker-%d] Prefetch helper completed read up to %d.", w.id, currentOffset)
 				return
+			}
+
+			// Clean bounded range completion check on EOF
+			if err == io.EOF {
+				targetEnd := atomic.LoadInt64(&w.targetEndOffset)
+				if currentOffset >= targetEnd || state.RangeSet.Contains(currentOffset) {
+					log.Printf("[Worker-%d] Bounded upstream stream completed cleanly to %d. Leapfrogging to next unclaimed gap...", w.id, currentOffset)
+					gapStart, gapEnd, found := state.FindNextUnclaimedGap(w.id, currentOffset)
+					if !found {
+						log.Printf("[Worker-%d] All remaining gaps completed or in-flight. Worker coalescing and exiting.", w.id)
+						return
+					}
+					currentOffset = gapStart
+					atomic.StoreInt64(&w.currentOffset, currentOffset)
+					atomic.StoreInt64(&w.targetEndOffset, gapEnd)
+					atomic.StoreInt64(&w.lastByteTimeNano, time.Now().UnixNano())
+					continue
+				}
 			}
 
 			if handleFailure(false, "[Worker-%d] Upstream read error at %d: %v", w.id, currentOffset, err) {
@@ -961,6 +981,11 @@ func (s *FileCacheState) FindNextUnclaimedGap(workerID int, fromOffset int64) (s
 		}
 	}
 	s.WorkersLock.Unlock()
+
+	// Sort in-flight ranges ascending by start offset
+	sort.Slice(inFlight, func(i, j int) bool {
+		return inFlight[i].start < inFlight[j].start
+	})
 
 	isClaimed := func(gStart, gEnd int64) (bool, int64, int64) {
 		for _, ifr := range inFlight {
