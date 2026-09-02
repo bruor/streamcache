@@ -212,7 +212,9 @@
 
         .download-badge.throttled,
         .download-badge.retrying,
-        .download-badge.connecting {
+        .download-badge.connecting,
+        .download-badge.reconnecting,
+        .download-badge.stalled {
             background: rgba(255, 159, 28, 0.15);
             color: var(--accent-orange);
             border: 1px solid rgba(255, 159, 28, 0.35);
@@ -1254,9 +1256,15 @@
             const downloaded = fileData.downloaded_bytes || 0;
             const total = fileData.total_size || 1;
             const percent = ((downloaded / total) * 100).toFixed(1);
-            const rawStatus = fileData.upstream_status || 'Downloading';
-            const statusLower = rawStatus.toLowerCase();
+            let rawStatus = fileData.upstream_status || 'Downloading';
             
+            // Refine status label for intuitive clarity
+            if (rawStatus === 'Connecting' && downloaded > 0) {
+                rawStatus = 'Reconnecting';
+            } else if (rawStatus === 'Downloading' && fileData.is_stalled) {
+                rawStatus = 'Stalled';
+            }
+            const statusLower = rawStatus.toLowerCase();
             let statusText = `${rawStatus} ${percent}%`;
 
             const badgeEl = document.getElementById(`badge-${key}`);

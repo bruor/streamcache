@@ -29,11 +29,12 @@ func InitHTTPClient() {
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout: 10 * time.Second,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-		ReadBufferSize:      512 * 1024, // 512KB read buffer for high-bandwidth 1Gbps+ streams
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		ReadBufferSize:        512 * 1024, // 512KB read buffer for high-bandwidth 1Gbps+ streams
 		// Disable TLS certificate verification if required (IPTV providers sometimes use self-signed certs)
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
