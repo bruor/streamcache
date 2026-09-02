@@ -96,6 +96,7 @@ type Worker struct {
 	startOffset       int64
 	cancel            context.CancelFunc
 	currentOffset     int64 // guarded atomically
+	targetEndOffset   int64 // guarded atomically
 	speed             int64 // estimated speed (bytes/sec)
 	spawnTimeNano     int64 // Unix nano timestamp of worker spawn
 	connStartTimeNano int64 // Unix nano timestamp of connection start, guarded atomically
@@ -647,15 +648,18 @@ func runDownloadWorker(
 	}
 	defer closeConnection()
 
-	// Pre-flight check: was this start offset already satisfied by another worker during connect?
-	if state.RangeSet.Contains(currentOffset) && !w.isPrefetchHelper {
-		gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
+	// Pre-flight check: locate the next unclaimed gap for this worker
+	if !w.isPrefetchHelper {
+		gapStart, gapEnd, found := state.FindNextUnclaimedGap(w.id, currentOffset)
 		if !found {
-			log.Printf("[Worker-%d] Start offset %d already satisfied and file complete. Exiting.", w.id, currentOffset)
+			log.Printf("[Worker-%d] No unclaimed gaps remain for file. Worker coalescing and exiting.", w.id)
 			return
 		}
 		currentOffset = gapStart
 		atomic.StoreInt64(&w.currentOffset, currentOffset)
+		atomic.StoreInt64(&w.targetEndOffset, gapEnd)
+	} else {
+		atomic.StoreInt64(&w.targetEndOffset, state.TotalSize)
 	}
 
 	buf := make([]byte, 128*1024)
@@ -683,25 +687,20 @@ func runDownloadWorker(
 			continue
 		}
 
-		// Dynamically compute next boundary (next cached chunk or downstream worker start)
-		boundary := state.GetNextBoundary(w.id, currentOffset)
-
-		// Check if current offset is already covered in RangeSet or past boundary
-		if boundary <= currentOffset || state.RangeSet.Contains(currentOffset) {
-			gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
+		// Check if current offset is already covered or past target end
+		targetEnd := atomic.LoadInt64(&w.targetEndOffset)
+		if !w.isPrefetchHelper && (targetEnd <= currentOffset || state.RangeSet.Contains(currentOffset)) {
+			gapStart, gapEnd, found := state.FindNextUnclaimedGap(w.id, currentOffset)
 			if !found {
-				log.Printf("[Worker-%d] Range from %d to EOF completed. Worker coalescing and exiting.", w.id, currentOffset)
+				log.Printf("[Worker-%d] All remaining gaps completed or in-flight. Worker coalescing and exiting.", w.id)
 				closeConnection()
 				return
 			}
-			log.Printf("[Worker-%d] Reached completed range or boundary at %d. Leapfrogging to next gap at %d", w.id, currentOffset, gapStart)
+			log.Printf("[Worker-%d] Reached completed range or boundary at %d. Leapfrogging to next unclaimed gap at [%d, %d)", w.id, currentOffset, gapStart, gapEnd)
 			closeConnection()
 			currentOffset = gapStart
 			atomic.StoreInt64(&w.currentOffset, currentOffset)
-			boundary = state.GetNextBoundary(w.id, currentOffset)
-			if boundary <= currentOffset {
-				return
-			}
+			atomic.StoreInt64(&w.targetEndOffset, gapEnd)
 		}
 
 		if currentOffset >= state.TotalSize {
@@ -718,7 +717,12 @@ func runDownloadWorker(
 				continue
 			}
 
-			rangeHeader := fmt.Sprintf("bytes=%d-%d", currentOffset, boundary-1)
+			reqEnd := atomic.LoadInt64(&w.targetEndOffset)
+			if reqEnd <= currentOffset || reqEnd > state.TotalSize {
+				reqEnd = state.TotalSize
+			}
+
+			rangeHeader := fmt.Sprintf("bytes=%d-%d", currentOffset, reqEnd-1)
 			req.Header.Set("Range", rangeHeader)
 
 			CopySafeHeaders(initialHeader, req.Header)
@@ -754,12 +758,14 @@ func runDownloadWorker(
 			if state.RangeSet.Contains(currentOffset) && !w.isPrefetchHelper {
 				log.Printf("[Worker-%d] Offset %d satisfied during connect handshake. Cleanly aborting connection.", w.id, currentOffset)
 				_ = resp.Body.Close()
-				gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
+				gapStart, gapEnd, found := state.FindNextUnclaimedGap(w.id, currentOffset)
 				if !found {
+					log.Printf("[Worker-%d] All remaining gaps completed or in-flight. Worker coalescing and exiting.", w.id)
 					return
 				}
 				currentOffset = gapStart
 				atomic.StoreInt64(&w.currentOffset, currentOffset)
+				atomic.StoreInt64(&w.targetEndOffset, gapEnd)
 				continue
 			}
 
@@ -840,18 +846,19 @@ func runDownloadWorker(
 				atomic.StoreInt64(&w.speed, instantSpeed)
 			}
 
-			// In-flight collision & boundary check: check if worker reached downstream boundary or cached range
-			curBoundary := state.GetNextBoundary(w.id, currentOffset)
-			if currentOffset >= curBoundary || state.RangeSet.Contains(currentOffset) {
-				log.Printf("[Worker-%d] Reached downstream boundary or cached data at offset %d (target: %d). Leapfrogging to next gap...", w.id, currentOffset, curBoundary)
+			// In-flight collision & boundary check: check if worker reached target end or cached range
+			targetEnd := atomic.LoadInt64(&w.targetEndOffset)
+			if !w.isPrefetchHelper && (currentOffset >= targetEnd || state.RangeSet.Contains(currentOffset)) {
+				log.Printf("[Worker-%d] Reached target boundary %d at offset %d. Leapfrogging to next unclaimed gap...", w.id, targetEnd, currentOffset)
 				closeConnection()
-				gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
+				gapStart, gapEnd, found := state.FindNextUnclaimedGap(w.id, currentOffset)
 				if !found {
-					log.Printf("[Worker-%d] All remaining gaps completed. Worker coalescing and exiting.", w.id)
+					log.Printf("[Worker-%d] All remaining gaps completed or in-flight. Worker coalescing and exiting.", w.id)
 					return
 				}
 				currentOffset = gapStart
 				atomic.StoreInt64(&w.currentOffset, currentOffset)
+				atomic.StoreInt64(&w.targetEndOffset, gapEnd)
 				continue
 			}
 		}
@@ -880,33 +887,88 @@ func runDownloadWorker(
 	}
 }
 
-func (s *FileCacheState) GetNextBoundary(workerID int, currentOffset int64) int64 {
-	boundary := s.TotalSize
-
-	// 1. Next cached chunk boundary from RangeSet
-	gapStart, gapEnd, found := s.RangeSet.FindNextGap(currentOffset, s.TotalSize)
-	if found && gapStart == currentOffset && gapEnd > currentOffset {
-		boundary = gapEnd
-	} else if found && gapStart > currentOffset {
-		boundary = gapStart
+// FindNextUnclaimedGap searches for the next un-downloaded byte gap that is NOT currently
+// being downloaded in-flight by any other active worker.
+func (s *FileCacheState) FindNextUnclaimedGap(workerID int, fromOffset int64) (start, end int64, found bool) {
+	if s.TotalSize <= 0 {
+		return 0, 0, false
 	}
 
-	// 2. Next downstream active worker position
+	// 1. Gather all in-flight ranges claimed by other active workers
+	type inFlightRange struct {
+		start int64
+		end   int64
+	}
+	var inFlight []inFlightRange
 	s.WorkersLock.Lock()
 	for _, other := range s.ActiveWorkers {
 		if other.id != workerID {
-			otherCurrent := atomic.LoadInt64(&other.currentOffset)
-			if otherCurrent > currentOffset && otherCurrent < boundary {
-				boundary = otherCurrent
+			cur := atomic.LoadInt64(&other.currentOffset)
+			targetEnd := atomic.LoadInt64(&other.targetEndOffset)
+			if targetEnd <= 0 || targetEnd > s.TotalSize {
+				targetEnd = s.TotalSize
 			}
-			if other.startOffset > currentOffset && other.startOffset < boundary {
-				boundary = other.startOffset
+			if cur < targetEnd {
+				inFlight = append(inFlight, inFlightRange{start: cur, end: targetEnd})
 			}
 		}
 	}
 	s.WorkersLock.Unlock()
 
-	return boundary
+	isClaimed := func(gStart, gEnd int64) (bool, int64, int64) {
+		for _, ifr := range inFlight {
+			// If gap overlaps with an in-flight worker range:
+			if gStart < ifr.end && gEnd > ifr.start {
+				if gStart < ifr.start {
+					// There is an un-claimed segment before ifr begins!
+					return false, gStart, ifr.start
+				}
+				// Otherwise this gap is claimed at gStart; un-claimed resumes at ifr.end
+				return true, gStart, ifr.end
+			}
+		}
+		return false, gStart, gEnd
+	}
+
+	// 2. Search forward from fromOffset to TotalSize
+	curr := fromOffset
+	for curr < s.TotalSize {
+		gStart, gEnd, ok := s.RangeSet.FindNextGap(curr, s.TotalSize)
+		if !ok {
+			break
+		}
+		claimed, freeStart, freeEnd := isClaimed(gStart, gEnd)
+		if !claimed && freeEnd > freeStart {
+			return freeStart, freeEnd, true
+		}
+		if freeEnd > curr {
+			curr = freeEnd
+		} else {
+			curr = gEnd
+		}
+	}
+
+	// 3. Wrap around from 0 to fromOffset for unfulfilled backfill gaps
+	if fromOffset > 0 {
+		curr = 0
+		for curr < fromOffset {
+			gStart, gEnd, ok := s.RangeSet.FindNextGap(curr, fromOffset)
+			if !ok {
+				break
+			}
+			claimed, freeStart, freeEnd := isClaimed(gStart, gEnd)
+			if !claimed && freeEnd > freeStart {
+				return freeStart, freeEnd, true
+			}
+			if freeEnd > curr {
+				curr = freeEnd
+			} else {
+				curr = gEnd
+			}
+		}
+	}
+
+	return 0, 0, false
 }
 
 func safeSignal(ch chan struct{}) {
