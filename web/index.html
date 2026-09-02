@@ -1317,15 +1317,15 @@
                             <span class="download-meta-value">${formatBytes(downloaded)}</span>
                         </div>
                         <div class="download-meta-card">
-                            <span class="download-meta-label">Upstream UA</span>
-                            <span class="download-meta-value" title="${upstreamUA}">${uaTrunc}</span>
+                            <span class="download-meta-label">Upstream Workers</span>
+                            <span class="download-meta-value" style="color: var(--accent-cyan); font-weight: 600;">${fileData.active_workers || 1} / ${fileData.max_workers || 2}</span>
                         </div>
                         <div class="download-meta-card">
                             <span class="download-meta-label">Active Clients</span>
                             <span class="download-meta-value" ${fileData.starving_queue && fileData.starving_queue.length > 0 ? 'style="color: var(--accent-orange); font-weight: 600;"' : ''}>${fileData.active_clients}</span>
                         </div>
-                        <div class="download-meta-card">
-                            <span class="download-meta-label">Connections (30s)</span>
+                        <div class="download-meta-card" title="Total connection handshakes opened/closed in the last 30 seconds">
+                            <span class="download-meta-label">Reconnects (30s)</span>
                             <span class="download-meta-value">${fileData.connections_last_30s || 0}</span>
                         </div>
                         ${fileData.observed_cooldown > 0 ? `

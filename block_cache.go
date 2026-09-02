@@ -131,15 +131,42 @@ type ConnectionInfo struct {
 
 func (s *FileCacheState) SetUpstreamStatus(status string) {
 	s.Lock.Lock()
-	if s.UpstreamStatus != status {
-		s.UpstreamStatus = status
-		s.Lock.Unlock()
-		if GlobalLogBroker != nil {
-			go GlobalLogBroker.BroadcastStateUpdate()
+	defer s.Lock.Unlock()
+
+	// Terminal states cannot be overridden by worker transitions
+	if s.UpstreamStatus == "Committing" || s.UpstreamStatus == "Completed" || s.UpstreamStatus == "Cancelled" {
+		if status == "Committing" || status == "Completed" || status == "Cancelled" {
+			s.UpstreamStatus = status
+			if GlobalLogBroker != nil {
+				go GlobalLogBroker.BroadcastStateUpdate()
+			}
 		}
 		return
 	}
-	s.Lock.Unlock()
+
+	targetStatus := status
+	if status == "Connecting" || status == "Retrying" {
+		s.WorkersLock.Lock()
+		hasActiveDownloader := false
+		for _, w := range s.ActiveWorkers {
+			if atomic.LoadInt64(&w.connBytesWritten) > 0 || atomic.LoadInt64(&w.speed) > 0 {
+				hasActiveDownloader = true
+				break
+			}
+		}
+		s.WorkersLock.Unlock()
+
+		if hasActiveDownloader {
+			targetStatus = "Downloading"
+		}
+	}
+
+	if s.UpstreamStatus != targetStatus {
+		s.UpstreamStatus = targetStatus
+		if GlobalLogBroker != nil {
+			go GlobalLogBroker.BroadcastStateUpdate()
+		}
+	}
 }
 
 func (s *FileCacheState) RecordConnStart(connID string) {

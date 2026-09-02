@@ -185,6 +185,8 @@ func buildStatePayload() ([]byte, error) {
 		DownloadedBytes    int64          `json:"downloaded_bytes"`
 		ActiveWriter       bool           `json:"active_writer"`
 		ActiveClients      int            `json:"active_clients"`
+		ActiveWorkers      int            `json:"active_workers"`
+		MaxWorkers         int            `json:"max_workers"`
 		StarvingQueue      []int64        `json:"starving_queue"`
 		DownloadSpeed      int64          `json:"download_speed"`
 		AvgDownloadSpeed   int64          `json:"avg_download_speed"`
@@ -269,6 +271,8 @@ func buildStatePayload() ([]byte, error) {
 			DownloadedBytes:    downloaded,
 			ActiveWriter:       fileState.WriterActive,
 			ActiveClients:      len(fileState.Clients),
+			ActiveWorkers:      activeCount,
+			MaxWorkers:         GlobalConfig.GetMaxUpstreamWorkers(),
 			StarvingQueue:      starveQueue,
 			DownloadSpeed:      fileState.DownloadSpeed,
 			AvgDownloadSpeed:   fileState.AvgDownloadSpeed,

@@ -683,18 +683,25 @@ func runDownloadWorker(
 			continue
 		}
 
-		// Check if current offset is already covered in RangeSet
-		if state.RangeSet.Contains(currentOffset) {
+		// Dynamically compute next boundary (next cached chunk or downstream worker start)
+		boundary := state.GetNextBoundary(w.id, currentOffset)
+
+		// Check if current offset is already covered in RangeSet or past boundary
+		if boundary <= currentOffset || state.RangeSet.Contains(currentOffset) {
 			gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
 			if !found {
 				log.Printf("[Worker-%d] Range from %d to EOF completed. Worker coalescing and exiting.", w.id, currentOffset)
 				closeConnection()
 				return
 			}
-			log.Printf("[Worker-%d] Reached completed range at %d. Leapfrogging to next gap at %d", w.id, currentOffset, gapStart)
+			log.Printf("[Worker-%d] Reached completed range or boundary at %d. Leapfrogging to next gap at %d", w.id, currentOffset, gapStart)
 			closeConnection()
 			currentOffset = gapStart
 			atomic.StoreInt64(&w.currentOffset, currentOffset)
+			boundary = state.GetNextBoundary(w.id, currentOffset)
+			if boundary <= currentOffset {
+				return
+			}
 		}
 
 		if currentOffset >= state.TotalSize {
@@ -711,7 +718,7 @@ func runDownloadWorker(
 				continue
 			}
 
-			rangeHeader := fmt.Sprintf("bytes=%d-%d", currentOffset, state.TotalSize-1)
+			rangeHeader := fmt.Sprintf("bytes=%d-%d", currentOffset, boundary-1)
 			req.Header.Set("Range", rangeHeader)
 
 			CopySafeHeaders(initialHeader, req.Header)
@@ -832,6 +839,21 @@ func runDownloadWorker(
 				instantSpeed := int64(float64(n) / readElapsed)
 				atomic.StoreInt64(&w.speed, instantSpeed)
 			}
+
+			// In-flight collision & boundary check: check if worker reached downstream boundary or cached range
+			curBoundary := state.GetNextBoundary(w.id, currentOffset)
+			if currentOffset >= curBoundary || state.RangeSet.Contains(currentOffset) {
+				log.Printf("[Worker-%d] Reached downstream boundary or cached data at offset %d (target: %d). Leapfrogging to next gap...", w.id, currentOffset, curBoundary)
+				closeConnection()
+				gapStart, _, found := state.RangeSet.FindNextGap(currentOffset, state.TotalSize)
+				if !found {
+					log.Printf("[Worker-%d] All remaining gaps completed. Worker coalescing and exiting.", w.id)
+					return
+				}
+				currentOffset = gapStart
+				atomic.StoreInt64(&w.currentOffset, currentOffset)
+				continue
+			}
 		}
 
 		if err != nil {
@@ -856,6 +878,35 @@ func runDownloadWorker(
 			continue
 		}
 	}
+}
+
+func (s *FileCacheState) GetNextBoundary(workerID int, currentOffset int64) int64 {
+	boundary := s.TotalSize
+
+	// 1. Next cached chunk boundary from RangeSet
+	gapStart, gapEnd, found := s.RangeSet.FindNextGap(currentOffset, s.TotalSize)
+	if found && gapStart == currentOffset && gapEnd > currentOffset {
+		boundary = gapEnd
+	} else if found && gapStart > currentOffset {
+		boundary = gapStart
+	}
+
+	// 2. Next downstream active worker position
+	s.WorkersLock.Lock()
+	for _, other := range s.ActiveWorkers {
+		if other.id != workerID {
+			otherCurrent := atomic.LoadInt64(&other.currentOffset)
+			if otherCurrent > currentOffset && otherCurrent < boundary {
+				boundary = otherCurrent
+			}
+			if other.startOffset > currentOffset && other.startOffset < boundary {
+				boundary = other.startOffset
+			}
+		}
+	}
+	s.WorkersLock.Unlock()
+
+	return boundary
 }
 
 func safeSignal(ch chan struct{}) {
