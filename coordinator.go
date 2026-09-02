@@ -772,7 +772,12 @@ func runDownloadWorker(
 			for _, ch := range state.Clients {
 				safeSignal(ch)
 			}
+			sniffed := state.Sniffed
 			state.Lock.Unlock()
+
+			if !sniffed {
+				sniffAndSchedulePrefetch(state, file)
+			}
 
 			currentOffset += int64(n)
 			atomic.StoreInt64(&w.currentOffset, currentOffset)
@@ -947,7 +952,7 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 			state.Lock.Unlock()
 		} else if n >= 8 {
 			firstBoxType := string(data[4:8])
-			if firstBoxType == "ftyp" || firstBoxType == "free" || firstBoxType == "moov" || firstBoxType == "mdat" {
+			if firstBoxType == "ftyp" || firstBoxType == "free" || firstBoxType == "wide" || firstBoxType == "skip" || firstBoxType == "moov" || firstBoxType == "mdat" {
 				isMp4 = true
 				isFastStart, moovOffset, hasMdatSize = IsMp4FastStart(data)
 				state.Lock.Lock()
@@ -963,18 +968,14 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 			tailStartOffset = cuesOffset
 		}
 
-		if tailStartOffset > 0 && tailStartOffset < state.TotalSize {
+		if tailStartOffset > 0 && tailStartOffset < state.TotalSize && tailStartOffset > avail {
 			tailBytes := state.TotalSize - tailStartOffset
-			// Sanity check: only prefetch if tail metadata is less than 20% of the entire file
-			if tailBytes > 0 && tailBytes < state.TotalSize/5 {
+			if tailBytes > 0 {
 				if !state.RangeSet.Contains(tailStartOffset) {
 					state.Lock.Lock()
 					state.PendingTailPrefetchOffset = tailStartOffset
 					state.Lock.Unlock()
-					select {
-					case state.NotifyChan <- struct{}{}:
-					default:
-					}
+					safeSignal(state.NotifyChan)
 					log.Printf("[Coord] Non-faststart container detected. Scheduled exact tail prefetch from byte offset %d (%d bytes)", tailStartOffset, tailBytes)
 				} else {
 					log.Printf("[Coord] Metadata tail bytes already cached. Skipping pre-fetch.")

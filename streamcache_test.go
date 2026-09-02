@@ -1833,6 +1833,99 @@ func TestSequentialLastBlockPrefetch(t *testing.T) {
 	}
 }
 
+func TestMp4NonFastStartOpportunisticPrefetch(t *testing.T) {
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	totalSize := int64(1000016)
+	mdatSize := int64(800000)
+	ftyp := buildMp4Box("ftyp", 16, 8)
+	mdat := buildMp4Box("mdat", mdatSize, 0)
+	moov := buildMp4Box("moov", totalSize-int64(len(ftyp))-mdatSize, 0)
+
+	responseBytes := make([]byte, totalSize)
+	copy(responseBytes[0:], ftyp)
+	copy(responseBytes[len(ftyp):], mdat)
+	expectedMoovOffset := int64(len(ftyp)) + mdatSize
+	copy(responseBytes[expectedMoovOffset:], moov)
+
+	var lock sync.Mutex
+	var requestedRanges []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		reqNum := len(requestedRanges)
+		lock.Unlock()
+
+		if reqNum == 1 {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", totalSize-1, totalSize))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(responseBytes[:130*1024]) // Write enough to pass 128KB header threshold
+			time.Sleep(150 * time.Millisecond)
+		} else {
+			http.ServeContent(w, r, "test_prefetch.mp4", time.Time{}, bytes.NewReader(responseBytes))
+		}
+	}))
+	defer server.Close()
+
+	key := "test_prefetch.mp4"
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/mp4",
+		"",
+		"",
+		totalSize,
+	)
+	defer cleanupAfterTest(t, state)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	req := httptest.NewRequest("GET", "/stream", nil)
+	reader := NewCacheReader(context.Background(), state, req)
+	defer reader.Close()
+
+	StartCoordinator(state, nil)
+
+	buf := make([]byte, 1024)
+	_, _ = reader.Read(buf)
+
+	time.Sleep(300 * time.Millisecond)
+
+	lock.Lock()
+	ranges := make([]string, len(requestedRanges))
+	copy(ranges, requestedRanges)
+	lock.Unlock()
+
+	if len(ranges) < 2 {
+		t.Fatalf("Expected at least 2 requests (1 sequential, 1 opportunistic moov prefetch), got %d. Ranges: %v", len(ranges), ranges)
+	}
+
+	expectedPrefetchRange := fmt.Sprintf("bytes=%d-%d", expectedMoovOffset, totalSize-1)
+	foundPrefetch := false
+	for _, rng := range ranges {
+		if rng == expectedPrefetchRange {
+			foundPrefetch = true
+			break
+		}
+	}
+	if !foundPrefetch {
+		t.Errorf("Expected opportunistic prefetch range %s in requests, but got %v", expectedPrefetchRange, ranges)
+	}
+}
+
 func TestCommittingStateIncluded(t *testing.T) {
 	GlobalRegistry.Lock.Lock()
 	oldFiles := GlobalRegistry.Files

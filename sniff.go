@@ -34,15 +34,11 @@ func IsMp4FastStart(data []byte) (isFastStart bool, moovOffset int64, hasMdatSiz
 
 		if boxType == "mdat" {
 			// Found mdat first, meaning moov is at the end.
-			if boxSize == 0 {
-				// Box goes to EOF, so moov size/offset is implicit
+			if boxSize <= 0 {
+				// Box goes to EOF, so moov cannot follow mdat
 				return false, 0, false
 			}
 			// moovOffset is right after mdat
-			if boxSize == 1 {
-				// 64-bit size was read into boxSize
-				return false, currentOffset + boxSize, true
-			}
 			return false, currentOffset + boxSize, true
 		}
 

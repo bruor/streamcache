@@ -71,6 +71,27 @@ func TestIsMp4FastStart(t *testing.T) {
 	if !hasMdatSize3 {
 		t.Errorf("Expected hasMdatSize=true")
 	}
+
+	// 4. Non-optimized MP4 with wide box preceding mdat
+	ftyp4 := buildMp4Box("ftyp", 16, 8)
+	wide4 := buildMp4Box("wide", 8, 0)
+	mdat4 := buildMp4Box("mdat", 1000, 0)
+	moov4 := buildMp4Box("moov", 8, 0)
+	data4 := append(ftyp4, wide4...)
+	data4 = append(data4, mdat4...)
+	data4 = append(data4, moov4...)
+
+	isFastStart4, moovOffset4, hasMdatSize4 := IsMp4FastStart(data4)
+	if isFastStart4 {
+		t.Errorf("Expected non-optimized MP4, got isFastStart=true")
+	}
+	expectedOffset4 := int64(len(ftyp4)) + int64(len(wide4)) + 1000
+	if moovOffset4 != expectedOffset4 {
+		t.Errorf("Expected moovOffset=%d, got %d", expectedOffset4, moovOffset4)
+	}
+	if !hasMdatSize4 {
+		t.Errorf("Expected hasMdatSize=true")
+	}
 }
 
 // Helpers for EBML generation
