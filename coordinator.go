@@ -426,10 +426,28 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		if len(starvingOffsets) > 0 {
 			for _, sb := range starvingOffsets {
 				stallTimeout := GlobalConfig.GetStarvationStallTimeout()
-				suppressed := false
+
 				state.WorkersLock.Lock()
+
+				removeWorkerLocked := func(wID int) {
+					for i, aw := range state.ActiveWorkers {
+						if aw.id == wID {
+							state.ActiveWorkers = append(state.ActiveWorkers[:i], state.ActiveWorkers[i+1:]...)
+							break
+						}
+					}
+				}
+
+				// 1. Classify workers covering sb into healthy vs. stalled
+				var healthyWorkers []*Worker
+				var stalledWorkers []*Worker
+
 				for _, w := range state.ActiveWorkers {
 					wCurrent := atomic.LoadInt64(&w.currentOffset)
+					wTargetEnd := atomic.LoadInt64(&w.targetEndOffset)
+					if wTargetEnd <= 0 || wTargetEnd > state.TotalSize {
+						wTargetEnd = state.TotalSize
+					}
 
 					lastByteNano := atomic.LoadInt64(&w.lastByteTimeNano)
 					var workerStallDuration time.Duration
@@ -438,41 +456,27 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 					} else if w.spawnTimeNano > 0 {
 						workerStallDuration = time.Since(time.Unix(0, w.spawnTimeNano))
 					}
-
 					isWorkerStalled := stallTimeout > 0 && workerStallDuration >= stallTimeout
 
-					// If a worker is already dedicated to this starving offset and has not stalled, suppress
-					if w.startOffset == sb && !isWorkerStalled {
-						suppressed = true
-						break
-					}
+					covers := false
 
-					if isWorkerStalled {
-						log.Printf("[Coord] Worker %d starved of incoming bytes for %s (>= %s threshold) with client starving at %d. Breaking out of suppression.",
-							w.id, workerStallDuration.Round(time.Millisecond), stallTimeout, sb)
-						continue
-					}
-
-					// 1. If worker is streaming within 512KB ahead/behind (live playback cursor)
+					// a) Proximity window (live cursor within 512KB)
 					if wCurrent <= sb && sb-wCurrent <= 512*1024 {
-						if GlobalConfig.GetLogVerbose() {
-							log.Printf("[Coord] [Verbose] Client Hydration Wait active for offset %d (worker %d is at %d). Suppressing jump.", sb, w.id, wCurrent)
-						}
-						suppressed = true
-						break
+						covers = true
 					}
 
-					// If worker is prefetching tail metadata and target is within tail range
-					if atomic.LoadInt32(&w.isPrefetching) == 1 && sb >= wCurrent {
-						if GlobalConfig.GetLogVerbose() {
-							log.Printf("[Coord] [Verbose] Worker %d is pre-fetching tail metadata (at %d, client starving at %d). Suppressing pre-emption.", w.id, wCurrent, sb)
-						}
-						suppressed = true
-						break
+					// b) Claimed in-flight gap: sb is within [wCurrent, wTargetEnd)
+					if !covers && wCurrent <= sb && sb < wTargetEnd {
+						covers = true
 					}
 
-					// 2. Sequential catch-up ETA calculation
-					if wCurrent < sb {
+					// c) Prefetching metadata
+					if !covers && atomic.LoadInt32(&w.isPrefetching) == 1 && sb >= wCurrent {
+						covers = true
+					}
+
+					// d) Sequential catch-up ETA calculation
+					if !covers && wCurrent < sb {
 						gapStart, _, found := state.RangeSet.FindNextGap(wCurrent, sb)
 						if !found || gapStart == wCurrent {
 							wSpeed := atomic.LoadInt64(&w.speed)
@@ -492,39 +496,108 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 								bytesRemaining := sb - wCurrent
 								eta := time.Duration(float64(bytesRemaining)/float64(wSpeed)) * time.Second
 								if eta < hydrationWait {
-									if GlobalConfig.GetLogVerbose() {
-										log.Printf("[Coord] [Verbose] Client Hydration Wait active for offset %d (ETA %.2fs < threshold %s). Suppressing connection jump.", sb, eta.Seconds(), hydrationWait)
-									}
-									suppressed = true
-									break
+									covers = true
 								}
 							}
 						}
 					}
-				}
-				state.WorkersLock.Unlock()
 
-				if suppressed {
+					if covers {
+						if isWorkerStalled {
+							stalledWorkers = append(stalledWorkers, w)
+						} else {
+							healthyWorkers = append(healthyWorkers, w)
+						}
+					}
+				}
+
+				// Case 1: At least one healthy worker is actively covering sb -> Suppress!
+				if len(healthyWorkers) > 0 {
+					if GlobalConfig.GetLogVerbose() {
+						log.Printf("[Coord] [Verbose] Client Hydration Wait active for offset %d (worker %d is at %d). Suppressing jump.",
+							sb, healthyWorkers[0].id, atomic.LoadInt64(&healthyWorkers[0].currentOffset))
+					}
+					// Clean up any superseded stalled workers on this same offset
+					for _, sw := range stalledWorkers {
+						log.Printf("[Coord] Reaping redundant stalled worker %d (at offset %d) superseded by active worker %d",
+							sw.id, atomic.LoadInt64(&sw.currentOffset), healthyWorkers[0].id)
+						sw.cancel()
+						removeWorkerLocked(sw.id)
+					}
+					state.WorkersLock.Unlock()
 					continue
 				}
 
-				state.WorkersLock.Lock()
-				activeCount = len(state.ActiveWorkers)
-				state.WorkersLock.Unlock()
+				// Case 2: All workers covering sb are stalled (True Stall Breakout!)
+				if len(stalledWorkers) > 0 {
+					primaryStalled := stalledWorkers[0]
+					lastByteNano := atomic.LoadInt64(&primaryStalled.lastByteTimeNano)
+					var stallDuration time.Duration
+					if lastByteNano > 0 {
+						stallDuration = time.Since(time.Unix(0, lastByteNano))
+					} else if primaryStalled.spawnTimeNano > 0 {
+						stallDuration = time.Since(time.Unix(0, primaryStalled.spawnTimeNano))
+					}
+					log.Printf("[Coord] Worker %d starved of incoming bytes for %s (>= %s threshold) with client starving at %d. Breaking out of suppression and reconnecting.",
+						primaryStalled.id, stallDuration.Round(time.Millisecond), stallTimeout, sb)
 
+					for _, sw := range stalledWorkers {
+						sw.cancel()
+						removeWorkerLocked(sw.id)
+					}
+					state.WorkersLock.Unlock()
+
+					state.Lock.Lock()
+					for clientID, starveOff := range state.Starving {
+						if starveOff == sb {
+							state.StarvingSince[clientID] = time.Now()
+						}
+					}
+					state.Lock.Unlock()
+
+					spawnWorker(sb)
+					continue
+				}
+
+				// Case 3: No worker covers sb (player seek or uncovered gap)
+				activeCount = len(state.ActiveWorkers)
 				maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
 				if activeCount < maxWorkers {
+					state.WorkersLock.Unlock()
 					log.Printf("[Coord] Spawning new worker starting at starving offset %d (Active: %d/%d)", sb, activeCount+1, maxWorkers)
 					spawnWorker(sb)
-				} else {
-					// Worker limit reached. Find furthest worker to pre-empt
-					state.WorkersLock.Lock()
-					var workerToPreempt *Worker
+					continue
+				}
+
+				// Worker limit reached. Find worker to pre-empt:
+				// Priority 1: Pick any worker in ActiveWorkers that is stalled
+				var workerToPreempt *Worker
+				for _, w := range state.ActiveWorkers {
+					if atomic.LoadInt32(&w.isPrefetching) != 0 {
+						continue
+					}
+					lastByteNano := atomic.LoadInt64(&w.lastByteTimeNano)
+					var wStall time.Duration
+					if lastByteNano > 0 {
+						wStall = time.Since(time.Unix(0, lastByteNano))
+					} else if w.spawnTimeNano > 0 {
+						wStall = time.Since(time.Unix(0, w.spawnTimeNano))
+					}
+					if stallTimeout > 0 && wStall >= stallTimeout {
+						workerToPreempt = w
+						break
+					}
+				}
+
+				// Priority 2: If no stalled worker, find furthest worker past minTime
+				if workerToPreempt == nil {
 					maxDistance := int64(-1)
-
+					minTime := GlobalConfig.GetSchedulerMinTime()
 					for _, w := range state.ActiveWorkers {
+						if atomic.LoadInt32(&w.isPrefetching) != 0 {
+							continue
+						}
 						wCurrent := atomic.LoadInt64(&w.currentOffset)
-
 						connStartNano := atomic.LoadInt64(&w.connStartTimeNano)
 						var elapsed time.Duration
 						if connStartNano > 0 {
@@ -532,20 +605,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						} else if w.spawnTimeNano > 0 {
 							elapsed = time.Since(time.Unix(0, w.spawnTimeNano))
 						}
-
-						lastByteNano := atomic.LoadInt64(&w.lastByteTimeNano)
-						var workerStallDuration time.Duration
-						if lastByteNano > 0 {
-							workerStallDuration = time.Since(time.Unix(0, lastByteNano))
-						} else if w.spawnTimeNano > 0 {
-							workerStallDuration = time.Since(time.Unix(0, w.spawnTimeNano))
-						}
-						isWorkerStalled := stallTimeout > 0 && workerStallDuration >= stallTimeout
-
-						minTime := GlobalConfig.GetSchedulerMinTime()
-						eligible := minTime <= 0 || elapsed >= minTime || isWorkerStalled
-
-						if eligible && atomic.LoadInt32(&w.isPrefetching) == 0 {
+						if minTime <= 0 || elapsed >= minTime {
 							var minDistanceToClient int64 = 1e18
 							for _, clientStarveOffset := range starvingOffsets {
 								dist := clientStarveOffset - wCurrent
@@ -562,32 +622,26 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 							}
 						}
 					}
+				}
 
-					if workerToPreempt != nil {
-						log.Printf("[Coord] Pre-empting worker %d (at offset %d) to switch to starving offset %d",
-							workerToPreempt.id, atomic.LoadInt64(&workerToPreempt.currentOffset), sb)
-						workerToPreempt.cancel()
+				if workerToPreempt != nil {
+					log.Printf("[Coord] Pre-empting worker %d (at offset %d) to switch to starving offset %d",
+						workerToPreempt.id, atomic.LoadInt64(&workerToPreempt.currentOffset), sb)
+					workerToPreempt.cancel()
+					removeWorkerLocked(workerToPreempt.id)
+					state.WorkersLock.Unlock()
 
-						for i, aw := range state.ActiveWorkers {
-							if aw.id == workerToPreempt.id {
-								state.ActiveWorkers = append(state.ActiveWorkers[:i], state.ActiveWorkers[i+1:]...)
-								break
-							}
+					state.Lock.Lock()
+					for clientID, starveOff := range state.Starving {
+						if starveOff == sb {
+							state.StarvingSince[clientID] = time.Now()
 						}
-						state.WorkersLock.Unlock()
-
-						state.Lock.Lock()
-						for clientID, starveOff := range state.Starving {
-							if starveOff == sb {
-								state.StarvingSince[clientID] = time.Now()
-							}
-						}
-						state.Lock.Unlock()
-
-						spawnWorker(sb)
-					} else {
-						state.WorkersLock.Unlock()
 					}
+					state.Lock.Unlock()
+
+					spawnWorker(sb)
+				} else {
+					state.WorkersLock.Unlock()
 				}
 			}
 		}

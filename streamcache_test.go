@@ -3110,6 +3110,125 @@ func TestStarvationStallTimeoutBreakout(t *testing.T) {
 	}
 }
 
+func TestStarvationStallTimeoutMultiWorker(t *testing.T) {
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	tmpDir := t.TempDir()
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	defer func() {
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+	}()
+
+	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldWait := GlobalConfig.ClientHydrationWait
+	oldMinTime := GlobalConfig.SchedulerMinTime
+	oldStallTimeout := GlobalConfig.StarvationStallTimeout
+
+	GlobalConfig.MaxUpstreamWorkers = 2
+	GlobalConfig.ClientHydrationWait = 2 * time.Second
+	GlobalConfig.SchedulerMinTime = 50 * time.Millisecond
+	GlobalConfig.StarvationStallTimeout = 100 * time.Millisecond
+
+	defer func() {
+		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
+		GlobalConfig.ClientHydrationWait = oldWait
+		GlobalConfig.SchedulerMinTime = oldMinTime
+		GlobalConfig.StarvationStallTimeout = oldStallTimeout
+	}()
+
+	var lock sync.Mutex
+	var requestedRanges []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lock.Lock()
+		requestedRanges = append(requestedRanges, r.Header.Get("Range"))
+		reqIdx := len(requestedRanges)
+		lock.Unlock()
+
+		if reqIdx == 1 {
+			// Worker 1: establish connection at offset 0, send 100 bytes, then stall
+			w.Header().Set("Content-Range", "bytes 0-99/1000")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(make([]byte, 100))
+			// Keep socket open / stall without sending more bytes
+			time.Sleep(1 * time.Second)
+		} else {
+			// Worker 2 (breakout): responds immediately for offset 200
+			w.Header().Set("Content-Range", "bytes 200-999/1000")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(make([]byte, 800))
+		}
+	}))
+	defer server.Close()
+
+	key := "test_starvation_stall_mw.mkv"
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		1000,
+	)
+	defer cleanupAfterTest(t, state)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	StartCoordinator(state, nil)
+	time.Sleep(20 * time.Millisecond) // Worker 1 connects and begins download
+
+	// Simulate client starving at offset 200 (within 512KB of worker 1's position at 100)
+	state.Lock.Lock()
+	state.Starving["client-starve"] = 200
+	state.StarvingSince["client-starve"] = time.Now()
+	state.Lock.Unlock()
+
+	select {
+	case state.NotifyChan <- struct{}{}:
+	default:
+	}
+
+	// 1. Initial check: worker 1 idle < 100ms -> suppressed
+	time.Sleep(30 * time.Millisecond)
+	lock.Lock()
+	initialReqCount := len(requestedRanges)
+	lock.Unlock()
+
+	if initialReqCount != 1 {
+		t.Fatalf("Expected initial suppression with MaxUpstreamWorkers=2, got %d requests: %v", initialReqCount, requestedRanges)
+	}
+
+	// 2. Wait until StarvationStallTimeout (100ms) elapses
+	time.Sleep(150 * time.Millisecond)
+
+	select {
+	case state.NotifyChan <- struct{}{}:
+	default:
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	lock.Lock()
+	finalRanges := make([]string, len(requestedRanges))
+	copy(finalRanges, requestedRanges)
+	lock.Unlock()
+
+	if len(finalRanges) < 2 {
+		t.Fatalf("Expected breakout after StarvationStallTimeout with MaxUpstreamWorkers=2, got %d requests: %v", len(finalRanges), finalRanges)
+	}
+
+	expectedRange := "bytes=200-999"
+	if finalRanges[1] != expectedRange {
+		t.Errorf("Expected breakout worker (index 1) to request %q, got %v", expectedRange, finalRanges)
+	}
+}
+
 func TestDashboardSSEStateStream(t *testing.T) {
 	GlobalRegistry.Lock.Lock()
 	oldFiles := GlobalRegistry.Files
