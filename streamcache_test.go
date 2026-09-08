@@ -3682,5 +3682,134 @@ func TestConcurrentHydrationDuringCommit(t *testing.T) {
 	}
 }
 
+func TestSeekForwardSpawnsSecondaryWorker(t *testing.T) {
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldHydrationWait := GlobalConfig.ClientHydrationWait
+	GlobalConfig.MaxUpstreamWorkers = 2
+	GlobalConfig.ClientHydrationWait = 2 * time.Second
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
+		GlobalConfig.ClientHydrationWait = oldHydrationWait
+		GlobalConfig.Unlock()
+	}()
+
+	totalSize := int64(10 * 1024 * 1024) // 10MB
+	seekOffset := int64(7 * 1024 * 1024)  // 7MB (skip forward)
+
+	var workerRequests []string
+	var reqLock sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqLock.Lock()
+		workerRequests = append(workerRequests, r.Header.Get("Range"))
+		reqLock.Unlock()
+
+		rangeHdr := r.Header.Get("Range")
+		// Simulate a slow stream so Worker 1 is still early in the file when seek occurs
+		w.Header().Set("Content-Type", "video/x-matroska")
+		if strings.HasPrefix(rangeHdr, "bytes=0-") {
+			w.WriteHeader(http.StatusOK)
+			// Slowly write 64KB chunks
+			buf := make([]byte, 64*1024)
+			for i := 0; i < 10; i++ {
+				_, _ = w.Write(buf)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		} else if strings.Contains(rangeHdr, fmt.Sprintf("bytes=%d-", seekOffset)) {
+			w.WriteHeader(http.StatusPartialContent)
+			buf := make([]byte, 64*1024)
+			for i := range buf {
+				buf[i] = 0xAB
+			}
+			_, _ = w.Write(buf)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	key := "seek_forward_test.mkv"
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		totalSize,
+	)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		CancelCoordinator(state)
+		cleanupAfterTest(t, state)
+	}()
+
+	// 1. Start hydration from offset 0
+	StartCoordinator(state, nil)
+
+	// Wait for Worker 1 to start downloading
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Client joins and immediately skips forward to seekOffset (7MB)
+	req := httptest.NewRequest("GET", "/stream", nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-", seekOffset))
+	reader := NewCacheReader(context.Background(), state, req)
+	defer reader.Close()
+
+	// 3. Reader attempts to read from seekOffset in a goroutine
+	readDone := make(chan struct{})
+	readBuf := make([]byte, 1024)
+	go func() {
+		n, err := reader.ReadAt(readBuf, seekOffset)
+		if err == nil && n == 1024 {
+			close(readDone)
+		}
+	}()
+
+	// 4. Verify that a secondary worker is spawned for seekOffset within timeout
+	select {
+	case <-readDone:
+		// Success! Reader received bytes at seekOffset
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Timeout waiting for seek forward read. Secondary worker was not spawned to satisfy seekOffset %d", seekOffset)
+	}
+
+	// Verify that workerRequests contains a request for seekOffset
+	reqLock.Lock()
+	defer reqLock.Unlock()
+	foundSecondaryWorker := false
+	expectedPrefix := fmt.Sprintf("bytes=%d-", seekOffset)
+	for _, reqRange := range workerRequests {
+		if strings.HasPrefix(reqRange, expectedPrefix) {
+			foundSecondaryWorker = true
+			break
+		}
+	}
+
+	if !foundSecondaryWorker {
+		t.Errorf("Expected upstream request starting at %s, got: %v", expectedPrefix, workerRequests)
+	}
+}
+
+
 
 

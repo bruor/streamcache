@@ -430,12 +430,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 						covers = true
 					}
 
-					// b) Claimed in-flight gap: sb is within [wCurrent, wTargetEnd)
-					if !covers && wCurrent <= sb && sb < wTargetEnd {
-						covers = true
-					}
-
-					// c) Prefetching metadata
+					// b) Prefetching metadata
 					if !covers && atomic.LoadInt32(&w.isPrefetching) == 1 && sb >= wCurrent {
 						covers = true
 					}
