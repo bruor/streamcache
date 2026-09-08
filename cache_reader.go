@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,12 +18,13 @@ import (
 var globalClientIDSeq uint64
 
 type CacheReader struct {
-	state    *FileCacheState
-	offset   int64
-	clientID string
-	ctx      context.Context
-	file     *os.File
-	fileMu   sync.Mutex
+	state             *FileCacheState
+	offset            int64
+	clientID          string
+	ctx               context.Context
+	file              *os.File
+	fileMu            sync.Mutex
+	lastEvictedOffset int64
 }
 
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
@@ -74,9 +76,10 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 	GlobalRegistry.RegisterConnection(clientID, conn)
 
 	r := &CacheReader{
-		state:    state,
-		clientID: clientID,
-		ctx:      ctx,
+		state:             state,
+		clientID:          clientID,
+		ctx:               ctx,
+		lastEvictedOffset: startOffset,
 	}
 
 	log.Printf("[Reader] Registered client %s (%s, UA: %s) for media %s", clientID, remoteAddr, userAgent, key)
@@ -103,6 +106,7 @@ func (r *CacheReader) getFile() (*os.File, error) {
 func (r *CacheReader) Close() error {
 	r.fileMu.Lock()
 	if r.file != nil {
+		FadviseDontNeed(r.file.Fd(), 0, 0)
 		_ = r.file.Close()
 		r.file = nil
 	}
@@ -132,6 +136,7 @@ func (r *CacheReader) Close() error {
 		pipelineToClose = r.state.Pipeline
 		r.state.Pipeline = nil
 	}
+	remainingClients := len(r.state.Clients)
 	r.state.Lock.Unlock()
 
 	GlobalRegistry.UnregisterConnection(r.clientID)
@@ -143,6 +148,7 @@ func (r *CacheReader) Close() error {
 			_ = pipelineToClose.FlushAndClose()
 		}
 		if fileToClose != nil {
+			FadviseDontNeed(fileToClose.Fd(), 0, 0)
 			_ = fileToClose.Close()
 		}
 		if shouldCleanUpIncomplete {
@@ -157,6 +163,10 @@ func (r *CacheReader) Close() error {
 		}
 	}
 
+	if remainingClients == 0 {
+		debug.FreeOSMemory()
+	}
+
 	return nil
 }
 
@@ -167,12 +177,17 @@ func (r *CacheReader) finalizeCache() {
 	r.state.File = nil
 	pipeline := r.state.Pipeline
 	r.state.Pipeline = nil
+	if r.state.LiveBuffer != nil {
+		r.state.LiveBuffer.Clear()
+		r.state.LiveBuffer = nil
+	}
 	r.state.Lock.Unlock()
 
 	if pipeline != nil {
 		_ = pipeline.FlushAndClose()
 	}
 	if fileToClose != nil {
+		FadviseDontNeed(fileToClose.Fd(), 0, 0)
 		_ = fileToClose.Close()
 	}
 
@@ -181,6 +196,11 @@ func (r *CacheReader) finalizeCache() {
 	if err != nil {
 		log.Printf("[Reader] Error renaming cache file on final client exit: %v", err)
 		return
+	}
+
+	if cf, ferr := os.Open(r.state.Path); ferr == nil {
+		FadviseDontNeed(cf.Fd(), 0, 0)
+		_ = cf.Close()
 	}
 
 	// Save final metadata JSON confirming completion
@@ -202,6 +222,8 @@ func (r *CacheReader) finalizeCache() {
 	GlobalRegistry.Lock.Lock()
 	delete(GlobalRegistry.Files, r.state.Key)
 	GlobalRegistry.Lock.Unlock()
+
+	debug.FreeOSMemory()
 
 	log.Printf("[Reader] Cache file finalized on last client exit: %s", r.state.Key)
 }
@@ -314,6 +336,15 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	if n > 0 {
 		GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
 
+		curReadEnd := off + int64(n)
+		if curReadEnd-r.lastEvictedOffset >= 16*1024*1024 {
+			evictLen := curReadEnd - r.lastEvictedOffset - 8*1024*1024
+			if evictLen > 0 {
+				FadviseDontNeed(file.Fd(), r.lastEvictedOffset, evictLen)
+				r.lastEvictedOffset += evictLen
+			}
+		}
+
 		if r.state.RangeSet.IsComplete(r.state.TotalSize) {
 			GlobalRegistry.SetConnectionInCache(r.clientID, true)
 		}
@@ -343,6 +374,7 @@ func (r *CacheReader) Seek(offset int64, whence int) (int64, error) {
 		return 0, errors.New("negative position")
 	}
 	r.offset = next
+	r.lastEvictedOffset = next
 	return next, nil
 }
 

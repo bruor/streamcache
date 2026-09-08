@@ -29,6 +29,7 @@ type pooledChunk struct {
 	length   int
 	bufPtr   *[]byte
 	refCount int32
+	seq      uint64
 }
 
 func newPooledChunk(offset int64, data []byte, refCount int32) *pooledChunk {
@@ -61,6 +62,7 @@ type LiveBuffer struct {
 	chunks   []*pooledChunk
 	maxBytes int64
 	curBytes int64
+	seqGen   uint64
 }
 
 // NewLiveBuffer creates a LiveBuffer capped at maxBytes
@@ -83,6 +85,9 @@ func (lb *LiveBuffer) Put(chunk *pooledChunk) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
+	lb.seqGen++
+	chunk.seq = lb.seqGen
+
 	// Find insertion point by offset (binary search)
 	idx := sort.Search(len(lb.chunks), func(i int) bool {
 		return lb.chunks[i].offset >= chunk.offset
@@ -102,10 +107,22 @@ func (lb *LiveBuffer) Put(chunk *pooledChunk) {
 	}
 	lb.curBytes += int64(chunk.length)
 
-	// Evict oldest chunks if exceeding maxBytes
+	// Evict least recently used/added chunks if exceeding maxBytes
 	for lb.curBytes > lb.maxBytes && len(lb.chunks) > 0 {
-		evicted := lb.chunks[0]
-		lb.chunks = lb.chunks[1:]
+		minIdx := 0
+		minSeq := atomic.LoadUint64(&lb.chunks[0].seq)
+		for i := 1; i < len(lb.chunks); i++ {
+			s := atomic.LoadUint64(&lb.chunks[i].seq)
+			if s < minSeq {
+				minSeq = s
+				minIdx = i
+			}
+		}
+
+		evicted := lb.chunks[minIdx]
+		copy(lb.chunks[minIdx:], lb.chunks[minIdx+1:])
+		lb.chunks[len(lb.chunks)-1] = nil
+		lb.chunks = lb.chunks[:len(lb.chunks)-1]
 		lb.curBytes -= int64(evicted.length)
 		evicted.release()
 	}
@@ -152,6 +169,9 @@ func (lb *LiveBuffer) ReadAt(p []byte, off int64) (int, bool) {
 		if toCopy > availInChunk {
 			toCopy = availInChunk
 		}
+
+		// Refresh sequence number on read so active player locations are not evicted
+		atomic.StoreUint64(&c.seq, atomic.AddUint64(&lb.seqGen, 1))
 
 		copy(dest[:toCopy], (*c.bufPtr)[chunkStart:chunkStart+toCopy])
 		dest = dest[toCopy:]

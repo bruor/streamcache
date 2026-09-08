@@ -3442,6 +3442,37 @@ func TestLiveBufferFastPath(t *testing.T) {
 	}
 }
 
+func TestLiveBufferLRUOrderOnSeek(t *testing.T) {
+	// Capacity for 2 chunks of 64KB = 128KB
+	lb := NewLiveBuffer(128 * 1024)
+
+	c10M := newPooledChunk(10*1024*1024, make([]byte, 64*1024), 1)
+	lb.Put(c10M)
+
+	c20M := newPooledChunk(20*1024*1024, make([]byte, 64*1024), 1)
+	lb.Put(c20M)
+
+	// Buffer is now at capacity (128KB).
+	// User seeks backwards to offset 0.
+	c0 := newPooledChunk(0, make([]byte, 64*1024), 1)
+	lb.Put(c0)
+
+	// c10M (oldest seq) should be evicted.
+	// c0 (offset 0) and c20M should still be present!
+	buf := make([]byte, 1024)
+	if _, ok := lb.ReadAt(buf, 0); !ok {
+		t.Fatalf("Expected chunk at offset 0 to be present in LiveBuffer, but was prematurely evicted")
+	}
+	if _, ok := lb.ReadAt(buf, 20*1024*1024); !ok {
+		t.Fatalf("Expected chunk at offset 20MB to be present in LiveBuffer")
+	}
+	if _, ok := lb.ReadAt(buf, 10*1024*1024); ok {
+		t.Fatalf("Expected chunk at offset 10MB to be evicted by LRU")
+	}
+
+	lb.Clear()
+}
+
 func TestWritebackPipelineDrainAndFlush(t *testing.T) {
 	tmpFile, err := os.CreateTemp(t.TempDir(), "writeback_test_*.part")
 	if err != nil {

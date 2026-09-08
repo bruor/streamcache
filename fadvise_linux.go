@@ -18,5 +18,8 @@ func SyncFileRangeWaitAndEvict(fd uintptr, offset int64, length int64) {
 
 // FadviseDontNeed evicts clean pages from OS page cache
 func FadviseDontNeed(fd uintptr, offset int64, length int64) {
+	if fd == 0 || fd == ^uintptr(0) {
+		return
+	}
 	_ = unix.Fadvise(int(fd), offset, length, unix.FADV_DONTNEED)
 }

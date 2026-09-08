@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -53,6 +55,10 @@ func CancelCoordinator(state *FileCacheState) {
 	partPath := state.PartPath
 	metaPath := state.MetaPath
 	key := state.Key
+	if state.LiveBuffer != nil {
+		state.LiveBuffer.Clear()
+		state.LiveBuffer = nil
+	}
 	state.Lock.Unlock()
 
 	if GlobalLogBroker != nil {
@@ -68,6 +74,7 @@ func CancelCoordinator(state *FileCacheState) {
 	}
 
 	if fileToClose != nil {
+		FadviseDontNeed(fileToClose.Fd(), 0, 0)
 		_ = fileToClose.Close()
 	}
 
@@ -96,6 +103,8 @@ func CancelCoordinator(state *FileCacheState) {
 	if GlobalLogBroker != nil {
 		GlobalLogBroker.BroadcastStateUpdate()
 	}
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 
 type Worker struct {
@@ -1254,14 +1263,28 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 	}
 
 	if fileToClose != nil {
+		FadviseDontNeed(fileToClose.Fd(), 0, 0)
 		if err := fileToClose.Close(); err != nil {
 			log.Printf("[Coord] Error closing part file during commit: %v", err)
 		}
 	}
 
+	state.Lock.Lock()
+	if state.LiveBuffer != nil {
+		state.LiveBuffer.Clear()
+		state.LiveBuffer = nil
+	}
+	state.Lock.Unlock()
+
 	if !FileExists(state.Path) {
 		err := os.Rename(state.PartPath, state.Path)
 		if err == nil {
+			// Evict the committed file from OS page cache
+			if cf, ferr := os.Open(state.Path); ferr == nil {
+				FadviseDontNeed(cf.Fd(), 0, 0)
+				_ = cf.Close()
+			}
+
 			// Save final metadata JSON confirming completion
 			metaPath := state.Path + ".json"
 			meta := FileMeta{
@@ -1294,6 +1317,11 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 			state.SetUpstreamStatus("Completed")
 		}
 	} else {
+		// Evict existing file from OS page cache
+		if cf, ferr := os.Open(state.Path); ferr == nil {
+			FadviseDontNeed(cf.Fd(), 0, 0)
+			_ = cf.Close()
+		}
 		GlobalRegistry.MarkConnectionsAsInCache(state.Key)
 		state.SetUpstreamStatus("Completed")
 		GlobalRegistry.Lock.Lock()
@@ -1303,5 +1331,8 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 			GlobalLogBroker.BroadcastStateUpdate()
 		}
 	}
+
+	runtime.GC()
+	debug.FreeOSMemory()
 }
 

@@ -121,7 +121,10 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		if err == nil && valid {
 			file, err := os.Open(cacheFilePath)
 			if err == nil {
-				defer file.Close()
+				defer func() {
+					FadviseDontNeed(file.Fd(), 0, 0)
+					_ = file.Close()
+				}()
 
 				// Generate unique client ID using atomic counter
 				connID := fmt.Sprintf("client-%d", atomic.AddUint64(&globalClientIDSeq, 1))
@@ -160,7 +163,8 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 				// Wrap file in a tracking reader to monitor read offsets
 				tracker := &trackingReader{
-					file: file,
+					file:              file,
+					lastEvictedOffset: startOffset,
 					onRead: func(off int64, n int) {
 						GlobalRegistry.UpdateConnectionOffset(connID, off+int64(n))
 					},
@@ -407,15 +411,25 @@ func base64DecodeSafe(str string) ([]byte, error) {
 }
 
 type trackingReader struct {
-	file       *os.File
-	onRead     func(off int64, n int)
-	currOffset int64
+	file              *os.File
+	onRead            func(off int64, n int)
+	currOffset        int64
+	lastEvictedOffset int64
 }
 
 func (tr *trackingReader) ReadAt(p []byte, off int64) (n int, err error) {
 	n, err = tr.file.ReadAt(p, off)
 	if n > 0 {
 		tr.onRead(off, n)
+		curEnd := off + int64(n)
+		lastEvict := atomic.LoadInt64(&tr.lastEvictedOffset)
+		if curEnd-lastEvict >= 16*1024*1024 {
+			evictLen := curEnd - lastEvict - 8*1024*1024
+			if evictLen > 0 {
+				FadviseDontNeed(tr.file.Fd(), lastEvict, evictLen)
+				atomic.AddInt64(&tr.lastEvictedOffset, evictLen)
+			}
+		}
 	}
 	return n, err
 }
@@ -424,6 +438,7 @@ func (tr *trackingReader) Seek(offset int64, whence int) (int64, error) {
 	newPos, err := tr.file.Seek(offset, whence)
 	if err == nil {
 		atomic.StoreInt64(&tr.currOffset, newPos)
+		atomic.StoreInt64(&tr.lastEvictedOffset, newPos)
 	}
 	return newPos, err
 }
@@ -434,6 +449,15 @@ func (tr *trackingReader) Read(p []byte) (n int, err error) {
 	if n > 0 {
 		atomic.AddInt64(&tr.currOffset, int64(n))
 		tr.onRead(startOff, n)
+		curEnd := startOff + int64(n)
+		lastEvict := atomic.LoadInt64(&tr.lastEvictedOffset)
+		if curEnd-lastEvict >= 16*1024*1024 {
+			evictLen := curEnd - lastEvict - 8*1024*1024
+			if evictLen > 0 {
+				FadviseDontNeed(tr.file.Fd(), lastEvict, evictLen)
+				atomic.AddInt64(&tr.lastEvictedOffset, evictLen)
+			}
+		}
 	}
 	return n, err
 }
