@@ -2992,16 +2992,12 @@ func TestActiveReaderDuringCommitAndRename(t *testing.T) {
 }
 
 func TestStarvationStallTimeoutBreakout(t *testing.T) {
+	GlobalConfig.Lock()
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	tmpDir := t.TempDir()
 	GlobalConfig.CacheDir = tmpDir
 	GlobalConfig.TmpDir = tmpDir
-	defer func() {
-		GlobalConfig.CacheDir = oldCacheDir
-		GlobalConfig.TmpDir = oldTmpDir
-	}()
-
 	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
 	oldWait := GlobalConfig.ClientHydrationWait
 	oldMinTime := GlobalConfig.SchedulerMinTime
@@ -3011,12 +3007,17 @@ func TestStarvationStallTimeoutBreakout(t *testing.T) {
 	GlobalConfig.ClientHydrationWait = 2 * time.Second
 	GlobalConfig.SchedulerMinTime = 50 * time.Millisecond
 	GlobalConfig.StarvationStallTimeout = 100 * time.Millisecond
+	GlobalConfig.Unlock()
 
 	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
 		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
 		GlobalConfig.ClientHydrationWait = oldWait
 		GlobalConfig.SchedulerMinTime = oldMinTime
 		GlobalConfig.StarvationStallTimeout = oldStallTimeout
+		GlobalConfig.Unlock()
 	}()
 
 	var lock sync.Mutex
@@ -3111,16 +3112,12 @@ func TestStarvationStallTimeoutBreakout(t *testing.T) {
 }
 
 func TestStarvationStallTimeoutMultiWorker(t *testing.T) {
+	GlobalConfig.Lock()
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	tmpDir := t.TempDir()
 	GlobalConfig.CacheDir = tmpDir
 	GlobalConfig.TmpDir = tmpDir
-	defer func() {
-		GlobalConfig.CacheDir = oldCacheDir
-		GlobalConfig.TmpDir = oldTmpDir
-	}()
-
 	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
 	oldWait := GlobalConfig.ClientHydrationWait
 	oldMinTime := GlobalConfig.SchedulerMinTime
@@ -3130,12 +3127,17 @@ func TestStarvationStallTimeoutMultiWorker(t *testing.T) {
 	GlobalConfig.ClientHydrationWait = 2 * time.Second
 	GlobalConfig.SchedulerMinTime = 50 * time.Millisecond
 	GlobalConfig.StarvationStallTimeout = 100 * time.Millisecond
+	GlobalConfig.Unlock()
 
 	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
 		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
 		GlobalConfig.ClientHydrationWait = oldWait
 		GlobalConfig.SchedulerMinTime = oldMinTime
 		GlobalConfig.StarvationStallTimeout = oldStallTimeout
+		GlobalConfig.Unlock()
 	}()
 
 	var lock sync.Mutex
@@ -3373,4 +3375,312 @@ func TestDynamicSSEActivityInterval(t *testing.T) {
 		t.Errorf("Expected HasActiveActivity() = true when active session exists")
 	}
 }
+
+func TestLiveBufferFastPath(t *testing.T) {
+	lb := NewLiveBuffer(256 * 1024) // 256KB capacity
+
+	data1 := make([]byte, 64*1024)
+	for i := range data1 {
+		data1[i] = byte(i % 256)
+	}
+	data2 := make([]byte, 64*1024)
+	for i := range data2 {
+		data2[i] = byte((i + 1) % 256)
+	}
+
+	c1 := newPooledChunk(0, data1, 1)
+	lb.Put(c1)
+	c2 := newPooledChunk(64*1024, data2, 1)
+	lb.Put(c2)
+
+	// Single chunk read hit
+	buf := make([]byte, 1024)
+	n, ok := lb.ReadAt(buf, 0)
+	if !ok || n != 1024 {
+		t.Fatalf("Expected ReadAt(0) hit, got n=%d, ok=%v", n, ok)
+	}
+	if !bytes.Equal(buf, data1[:1024]) {
+		t.Fatalf("Data mismatch on ReadAt(0)")
+	}
+
+	// Cross-chunk boundary read hit
+	boundaryBuf := make([]byte, 2048)
+	crossOffset := int64(64*1024 - 1024)
+	nCross, okCross := lb.ReadAt(boundaryBuf, crossOffset)
+	if !okCross || nCross != 2048 {
+		t.Fatalf("Expected cross-chunk boundary hit, got n=%d, ok=%v", nCross, okCross)
+	}
+	expectedCross := append(data1[64*1024-1024:], data2[:1024]...)
+	if !bytes.Equal(boundaryBuf, expectedCross) {
+		t.Fatalf("Data mismatch across chunk boundary")
+	}
+
+	// Miss outside buffered range
+	missBuf := make([]byte, 512)
+	_, okMiss := lb.ReadAt(missBuf, 500*1024)
+	if okMiss {
+		t.Fatalf("Expected miss for out-of-range offset, got ok=true")
+	}
+
+	// Test eviction when capacity exceeded
+	for i := 2; i < 6; i++ {
+		extra := make([]byte, 64*1024)
+		cExtra := newPooledChunk(int64(i*64*1024), extra, 1)
+		lb.Put(cExtra)
+	}
+
+	// Offset 0 should now be evicted
+	_, okEvicted := lb.ReadAt(buf, 0)
+	if okEvicted {
+		t.Fatalf("Expected offset 0 to be evicted from LiveBuffer, but was still present")
+	}
+
+	// Clean up
+	lb.Clear()
+	if lb.curBytes != 0 {
+		t.Fatalf("Expected curBytes=0 after Clear, got %d", lb.curBytes)
+	}
+}
+
+func TestWritebackPipelineDrainAndFlush(t *testing.T) {
+	tmpFile, err := os.CreateTemp(t.TempDir(), "writeback_test_*.part")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer tmpFile.Close()
+
+	wp := NewWritebackPipeline(tmpFile, nil, 1024*1024)
+
+	payload1 := []byte("Hello Writeback Pipeline!")
+	payload2 := []byte("Streaming Live Edge Content")
+	payload3 := []byte("Non-contiguous chunk at high offset")
+
+	if err := wp.WriteChunk(0, payload1); err != nil {
+		t.Fatalf("WriteChunk(0) failed: %v", err)
+	}
+	if err := wp.WriteChunk(100, payload2); err != nil {
+		t.Fatalf("WriteChunk(100) failed: %v", err)
+	}
+	if err := wp.WriteChunk(10*1024*1024, payload3); err != nil {
+		t.Fatalf("WriteChunk(10MB) failed: %v", err)
+	}
+
+	if err := wp.FlushAndClose(); err != nil {
+		t.Fatalf("FlushAndClose failed: %v", err)
+	}
+
+	// Subsequent write after close should fail
+	if err := wp.WriteChunk(200, []byte("late")); err == nil {
+		t.Fatalf("Expected write after close to error, got nil")
+	}
+
+	// Verify data was written to disk
+	r1 := make([]byte, len(payload1))
+	if _, err := tmpFile.ReadAt(r1, 0); err != nil || !bytes.Equal(r1, payload1) {
+		t.Fatalf("Payload 1 mismatch or read error: %v", err)
+	}
+
+	r2 := make([]byte, len(payload2))
+	if _, err := tmpFile.ReadAt(r2, 100); err != nil || !bytes.Equal(r2, payload2) {
+		t.Fatalf("Payload 2 mismatch or read error: %v", err)
+	}
+
+	r3 := make([]byte, len(payload3))
+	if _, err := tmpFile.ReadAt(r3, 10*1024*1024); err != nil || !bytes.Equal(r3, payload3) {
+		t.Fatalf("Payload 3 mismatch or read error: %v", err)
+	}
+}
+
+func TestAsynchronousCommitHandoff(t *testing.T) {
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.Unlock()
+	}()
+
+	testPayload := make([]byte, 2048)
+	for i := range testPayload {
+		testPayload[i] = byte((i * 7) % 256)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "async_commit_test.mkv", time.Time{}, bytes.NewReader(testPayload))
+	}))
+	defer server.Close()
+
+	key := "async_commit_test.mkv"
+	state := NewFileCacheState(
+		key,
+		server.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.CacheDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		int64(len(testPayload)),
+	)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	defer cleanupAfterTest(t, state)
+
+	StartCoordinator(state, nil)
+
+	// Poll until commit is complete and file is finalized on disk
+	deadline := time.Now().Add(5 * time.Second)
+	committed := false
+	for time.Now().Before(deadline) {
+		state.Lock.Lock()
+		active := state.WriterActive
+		state.Lock.Unlock()
+
+		if !active && FileExists(state.Path) {
+			committed = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !committed {
+		t.Fatalf("Expected asynchronous commit to finalize %s within timeout", state.Path)
+	}
+
+	// Verify committed file contents match payload exactly
+	data, err := os.ReadFile(state.Path)
+	if err != nil {
+		t.Fatalf("Failed reading finalized cache file: %v", err)
+	}
+	if !bytes.Equal(data, testPayload) {
+		t.Fatalf("Finalized cache file content does not match test payload")
+	}
+
+	// Verify metadata file was generated
+	metaFile := state.Path + ".json"
+	if !FileExists(metaFile) {
+		t.Fatalf("Expected metadata JSON file %s to exist", metaFile)
+	}
+}
+
+func TestConcurrentHydrationDuringCommit(t *testing.T) {
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	GlobalConfig.CacheDir = t.TempDir()
+	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.Unlock()
+	}()
+
+	payloadA := make([]byte, 1024)
+	payloadB := make([]byte, 8192)
+	for i := range payloadA {
+		payloadA[i] = byte(i % 256)
+	}
+	for i := range payloadB {
+		payloadB[i] = byte((i * 3) % 256)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "fileA") {
+			http.ServeContent(w, r, "fileA.mkv", time.Time{}, bytes.NewReader(payloadA))
+		} else {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payloadB)))
+			w.Header().Set("Content-Type", "video/x-matroska")
+			w.WriteHeader(http.StatusOK)
+			chunkSize := 1024
+			for i := 0; i < len(payloadB); i += chunkSize {
+				end := i + chunkSize
+				if end > len(payloadB) {
+					end = len(payloadB)
+				}
+				_, _ = w.Write(payloadB[i:end])
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}))
+	defer server.Close()
+
+	keyA := "fileA.mkv"
+	stateA := NewFileCacheState(
+		keyA,
+		server.URL+"/fileA.mkv",
+		filepath.Join(GlobalConfig.CacheDir, keyA),
+		filepath.Join(GlobalConfig.TmpDir, keyA+".part"),
+		filepath.Join(GlobalConfig.CacheDir, keyA+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		int64(len(payloadA)),
+	)
+
+	keyB := "fileB.mkv"
+	stateB := NewFileCacheState(
+		keyB,
+		server.URL+"/fileB.mkv",
+		filepath.Join(GlobalConfig.CacheDir, keyB),
+		filepath.Join(GlobalConfig.TmpDir, keyB+".part"),
+		filepath.Join(GlobalConfig.CacheDir, keyB+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		int64(len(payloadB)),
+	)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[keyA] = stateA
+	GlobalRegistry.Files[keyB] = stateB
+	GlobalRegistry.Lock.Unlock()
+
+	defer cleanupAfterTest(t, stateA)
+	defer cleanupAfterTest(t, stateB)
+
+	// Start File B first so it is actively downloading
+	StartCoordinator(stateB, nil)
+	time.Sleep(20 * time.Millisecond)
+
+	// Start File A which will quickly finish and enter Committing asynchronously
+	StartCoordinator(stateA, nil)
+
+	// Wait for both to complete
+	deadline := time.Now().Add(5 * time.Second)
+	bothDone := false
+	for time.Now().Before(deadline) {
+		if FileExists(stateA.Path) && FileExists(stateB.Path) {
+			bothDone = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !bothDone {
+		t.Fatalf("Expected both concurrent hydrations to complete successfully")
+	}
+
+	// Verify file B contents
+	dataB, err := os.ReadFile(stateB.Path)
+	if err != nil || !bytes.Equal(dataB, payloadB) {
+		t.Fatalf("File B content corrupted or mismatched: %v", err)
+	}
+}
+
+
 

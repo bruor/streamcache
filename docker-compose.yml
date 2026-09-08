@@ -16,10 +16,8 @@ services:
       
       # Block & Buffer Configs
       - BLOCK_SIZE=4MB
-      # Worker in-memory buffer in blocks (defaults to SCHEDULER_MIN_BLOCKS / 4 blocks = 16MB)
-      # - WORKER_BUFFER_BLOCKS=4
-      # Set to true to disable Fadvise page cache purging (allows OS to buffer writes in RAM, speeding up slow NAS writes)
-      # - DISABLE_FADVISE=true
+      # Asynchronous writeback & LiveBuffer sliding window size (defaults to 64MB; min 16MB, max 256MB)
+      # - WRITEBACK_BUFFER_SIZE=64MB
       
       # Cache eviction bounds (e.g. 50GB, 1TB, or 0/none/off/disabled to rely solely on disk free space)
       - CACHE_MAX_BYTES=50GB

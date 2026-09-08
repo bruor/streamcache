@@ -125,9 +125,12 @@ func (r *CacheReader) Close() error {
 	shouldCleanUpIncomplete := len(r.state.Clients) == 0 && !isCompleted && !r.state.WriterActive
 
 	var fileToClose *os.File
-	if len(r.state.Clients) == 0 && !r.state.WriterActive && r.state.File != nil && !shouldFinalize {
+	var pipelineToClose StorageSink
+	if len(r.state.Clients) == 0 && !r.state.WriterActive && !shouldFinalize {
 		fileToClose = r.state.File
 		r.state.File = nil
+		pipelineToClose = r.state.Pipeline
+		r.state.Pipeline = nil
 	}
 	r.state.Lock.Unlock()
 
@@ -136,6 +139,9 @@ func (r *CacheReader) Close() error {
 	if shouldFinalize {
 		r.finalizeCache()
 	} else {
+		if pipelineToClose != nil {
+			_ = pipelineToClose.FlushAndClose()
+		}
 		if fileToClose != nil {
 			_ = fileToClose.Close()
 		}
@@ -159,8 +165,13 @@ func (r *CacheReader) finalizeCache() {
 	r.state.Lock.Lock()
 	fileToClose := r.state.File
 	r.state.File = nil
+	pipeline := r.state.Pipeline
+	r.state.Pipeline = nil
 	r.state.Lock.Unlock()
 
+	if pipeline != nil {
+		_ = pipeline.FlushAndClose()
+	}
 	if fileToClose != nil {
 		_ = fileToClose.Close()
 	}
@@ -270,16 +281,33 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 
-	// Read directly from reader's independent file handle
-	file, err := r.getFile()
-	if err != nil {
-		return 0, err
-	}
-
 	avail := r.state.RangeSet.AvailableFrom(off)
 	toRead := int64(len(p))
 	if avail > 0 && toRead > avail {
 		toRead = avail
+	}
+
+	// 1. LiveBuffer Fast-Path: check in-memory buffer first for zero-copy playback
+	if r.state.LiveBuffer != nil {
+		if memN, ok := r.state.LiveBuffer.ReadAt(p[:toRead], off); ok && memN > 0 {
+			if memN < int(toRead) {
+				if f, ferr := r.getFile(); ferr == nil {
+					diskN, _ := f.ReadAt(p[memN:toRead], off+int64(memN))
+					memN += diskN
+				}
+			}
+			GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(memN))
+			if r.state.RangeSet.IsComplete(r.state.TotalSize) {
+				GlobalRegistry.SetConnectionInCache(r.clientID, true)
+			}
+			return memN, nil
+		}
+	}
+
+	// 2. Fall back to reading from disk
+	file, err := r.getFile()
+	if err != nil {
+		return 0, err
 	}
 
 	n, err = file.ReadAt(p[:toRead], off)

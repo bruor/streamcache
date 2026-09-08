@@ -29,6 +29,7 @@ type Config struct {
 	MaxUpstreamRetries      int
 	StarvationStallTimeout  time.Duration
 	LogVerbose              bool
+	WritebackBufferSize     int64
 }
 
 func (c *Config) Lock() {
@@ -250,6 +251,27 @@ func (c *Config) SetLogVerbose(val bool) {
 	c.LogVerbose = val
 }
 
+func (c *Config) GetWritebackBufferSize() int64 {
+	if c == nil {
+		return 64 * 1024 * 1024
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.WritebackBufferSize <= 0 {
+		return 64 * 1024 * 1024
+	}
+	return c.WritebackBufferSize
+}
+
+func (c *Config) SetWritebackBufferSize(val int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.WritebackBufferSize = val
+}
+
 var GlobalConfig *Config
 
 func LoadConfig() {
@@ -271,6 +293,7 @@ func LoadConfig() {
 		MaxUpstreamRetries:      getEnvInt("MAX_UPSTREAM_RETRIES", 0),
 		StarvationStallTimeout:  getEnvDuration("STARVATION_STALL_TIMEOUT", 30*time.Second),
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
+		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
 	}
 
 	// Format port if missing colon

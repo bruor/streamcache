@@ -97,9 +97,16 @@ type FileCacheState struct {
 	WorkersLock          sync.Mutex
 	PendingTailPrefetchOffset int64 // -1 if none
 	Sniffed              bool
+	LiveBuffer           *LiveBuffer
+	Pipeline             StorageSink
 }
 
 func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod string, totalSize int64) *FileCacheState {
+	bufSize := int64(64 * 1024 * 1024)
+	if GlobalConfig != nil {
+		bufSize = GlobalConfig.GetWritebackBufferSize()
+	}
+
 	s := &FileCacheState{
 		Key:                       key,
 		URL:                       targetURL,
@@ -118,6 +125,7 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		NotifyChan:                make(chan struct{}, 20),
 		UpstreamStatus:            "Idle",
 		PendingTailPrefetchOffset: -1,
+		LiveBuffer:                NewLiveBuffer(bufSize),
 	}
 	s.Cond = sync.NewCond(&s.Lock)
 	return s

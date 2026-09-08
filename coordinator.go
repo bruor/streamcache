@@ -47,6 +47,8 @@ func CancelCoordinator(state *FileCacheState) {
 	clientsCount := len(state.Clients)
 	fileToClose := state.File
 	state.File = nil
+	pipelineToClose := state.Pipeline
+	state.Pipeline = nil
 	state.WriterActive = false
 	partPath := state.PartPath
 	metaPath := state.MetaPath
@@ -59,6 +61,10 @@ func CancelCoordinator(state *FileCacheState) {
 
 	if cancel != nil {
 		cancel()
+	}
+
+	if pipelineToClose != nil {
+		_ = pipelineToClose.FlushAndClose()
 	}
 
 	if fileToClose != nil {
@@ -128,11 +134,14 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	}
 	_ = file.Truncate(state.TotalSize)
 
+	pipeline := NewWritebackPipeline(file, state, GlobalConfig.GetWritebackBufferSize())
+
 	state.Lock.Lock()
 	if state.File != nil && state.File != file {
 		_ = state.File.Close()
 	}
 	state.File = file
+	state.Pipeline = pipeline
 	if state.HydrationStartTime == 0 {
 		state.HydrationStartTime = time.Now().Unix()
 	}
@@ -158,72 +167,32 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		isCompleted := state.RangeSet.IsComplete(state.TotalSize)
 
 		if isCompleted {
+			fileToClose := state.File
+			state.File = nil
+			pipelineToClose := state.Pipeline
+			state.Pipeline = nil
 			state.Lock.Unlock()
+
 			state.SetUpstreamStatus("Committing")
 			log.Printf("[Coord] Committing completed cache file to disk: %s", state.Key)
 
-			state.Lock.Lock()
-			fileToClose := state.File
-			state.File = nil
-			state.Lock.Unlock()
-
-			if fileToClose != nil {
-				_ = fileToClose.Close()
-			}
-
-			if !FileExists(state.Path) {
-				err := os.Rename(state.PartPath, state.Path)
-				if err == nil {
-					// Save final metadata JSON confirming completion
-					metaPath := state.Path + ".json"
-					meta := FileMeta{
-						URL:           state.URL,
-						TotalSize:     state.TotalSize,
-						ContentType:   state.ContentType,
-						ETag:          state.ETag,
-						LastModified:  state.LastModified,
-						LastValidated: time.Now().Unix(),
-						Completed:     true,
-					}
-					newBytes, err := json.Marshal(meta)
-					if err == nil {
-						_ = os.WriteFile(metaPath, newBytes, 0644)
-					}
-					GlobalRegistry.MarkConnectionsAsInCache(state.Key)
-					state.SetUpstreamStatus("Completed")
-
-					GlobalRegistry.Lock.Lock()
-					delete(GlobalRegistry.Files, state.Key)
-					GlobalRegistry.Lock.Unlock()
-
-					if GlobalLogBroker != nil {
-						GlobalLogBroker.BroadcastStateUpdate()
-					}
-					log.Printf("[Coord] Cached file finalized and committed to disk: %s", state.Key)
-				} else {
-					log.Printf("[Coord] Commit rename failed (likely Windows lock, deferring to reader exit): %v", err)
-					GlobalRegistry.MarkConnectionsAsInCache(state.Key)
-					state.SetUpstreamStatus("Completed")
-				}
-			} else {
-				GlobalRegistry.MarkConnectionsAsInCache(state.Key)
-				state.SetUpstreamStatus("Completed")
-				GlobalRegistry.Lock.Lock()
-				delete(GlobalRegistry.Files, state.Key)
-				GlobalRegistry.Lock.Unlock()
-				if GlobalLogBroker != nil {
-					GlobalLogBroker.BroadcastStateUpdate()
-				}
-			}
+			go finalizeAndCommitCache(state, fileToClose, pipelineToClose)
 		} else {
 			var fileToClose *os.File
+			var pipelineToClose StorageSink
 			shouldCleanUpIncomplete := len(state.Clients) == 0
 			if shouldCleanUpIncomplete {
 				fileToClose = state.File
 				state.File = nil
+				pipelineToClose = state.Pipeline
+				state.Pipeline = nil
 			}
+			state.WriterActive = false
 			state.Lock.Unlock()
 
+			if pipelineToClose != nil {
+				_ = pipelineToClose.FlushAndClose()
+			}
 			if fileToClose != nil {
 				_ = fileToClose.Close()
 			}
@@ -231,7 +200,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			if shouldCleanUpIncomplete {
 				GlobalRegistry.Lock.Lock()
 				existingState, exists := GlobalRegistry.Files[state.Key]
-				if exists && existingState == state {
+				if exists && (existingState == state || existingState == nil) {
 					delete(GlobalRegistry.Files, state.Key)
 					GlobalRegistry.Lock.Unlock()
 					_ = os.Remove(state.PartPath)
@@ -242,10 +211,6 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				}
 			}
 		}
-
-		state.Lock.Lock()
-		state.WriterActive = false
-		state.Lock.Unlock()
 
 		log.Printf("[Coord] Exiting background coordinator for cache: %s", state.Key)
 	}()
@@ -308,7 +273,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		}
 
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
-		go runDownloadWorker(wCtx, w, state, initialHeader, file, removeWorker, parentCancel)
+		go runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
 	}
 
 	spawnPrefetchWorker := func(startOffset int64) {
@@ -341,7 +306,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		}
 
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
-		go runDownloadWorker(wCtx, w, state, initialHeader, file, removeWorker, parentCancel)
+		go runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
 	}
 
 	// Initial scan to start worker(s)
@@ -654,6 +619,7 @@ func runDownloadWorker(
 	state *FileCacheState,
 	initialHeader http.Header,
 	file *os.File,
+	pipeline StorageSink,
 	onExit func(*Worker),
 	parentCancel context.CancelFunc,
 ) {
@@ -783,7 +749,7 @@ func runDownloadWorker(
 
 		if pendingTail > 0 {
 			closeConnection()
-			runInlineTailPrefetch(ctx, w, state, initialHeader, file, pendingTail)
+			runInlineTailPrefetch(ctx, w, state, initialHeader, file, pipeline, pendingTail)
 			continue
 		}
 
@@ -908,7 +874,12 @@ func runDownloadWorker(
 		readStartTime := time.Now()
 		n, err := activeRespBody.Read(buf)
 		if n > 0 {
-			_, werr := file.WriteAt(buf[:n], currentOffset)
+			var werr error
+			if pipeline != nil {
+				werr = pipeline.WriteChunk(currentOffset, buf[:n])
+			} else if file != nil {
+				_, werr = file.WriteAt(buf[:n], currentOffset)
+			}
 			if werr != nil {
 				log.Printf("[Worker-%d] File write error at %d: %v", w.id, currentOffset, werr)
 				closeConnection()
@@ -1113,6 +1084,7 @@ func runInlineTailPrefetch(
 	state *FileCacheState,
 	initialHeader http.Header,
 	file *os.File,
+	pipeline StorageSink,
 	tailStartOffset int64,
 ) {
 	prefetchLength := state.TotalSize - tailStartOffset
@@ -1161,7 +1133,12 @@ func runInlineTailPrefetch(
 
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			_, werr := file.WriteAt(buf[:n], currentOffset)
+			var werr error
+			if pipeline != nil {
+				werr = pipeline.WriteChunk(currentOffset, buf[:n])
+			} else if file != nil {
+				_, werr = file.WriteAt(buf[:n], currentOffset)
+			}
 			if werr != nil {
 				log.Printf("[Worker-%d] Inline tail pre-fetch write error at %d: %v", w.id, currentOffset, werr)
 				break
@@ -1208,8 +1185,14 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 
 	log.Printf("[Coord] Initial header bytes available. Sniffing media container...")
 	buf := make([]byte, 128*1024)
-	n, err := file.ReadAt(buf, 0)
-	if (err == nil || err == io.EOF) && n > 0 {
+	n := 0
+	if state.LiveBuffer != nil {
+		n, _ = state.LiveBuffer.ReadAt(buf, 0)
+	}
+	if n == 0 && file != nil {
+		n, _ = file.ReadAt(buf, 0)
+	}
+	if n > 0 {
 		data := buf[:n]
 		isFastStart := false
 		moovOffset := int64(0)
@@ -1261,3 +1244,69 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 		}
 	}
 }
+
+func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipeline StorageSink) {
+	defer func() {
+		state.Lock.Lock()
+		state.WriterActive = false
+		state.Lock.Unlock()
+	}()
+
+	if pipeline != nil {
+		if err := pipeline.FlushAndClose(); err != nil {
+			log.Printf("[Coord] Error flushing writeback pipeline during commit: %v", err)
+		}
+	}
+
+	if fileToClose != nil {
+		if err := fileToClose.Close(); err != nil {
+			log.Printf("[Coord] Error closing part file during commit: %v", err)
+		}
+	}
+
+	if !FileExists(state.Path) {
+		err := os.Rename(state.PartPath, state.Path)
+		if err == nil {
+			// Save final metadata JSON confirming completion
+			metaPath := state.Path + ".json"
+			meta := FileMeta{
+				URL:           state.URL,
+				TotalSize:     state.TotalSize,
+				ContentType:   state.ContentType,
+				ETag:          state.ETag,
+				LastModified:  state.LastModified,
+				LastValidated: time.Now().Unix(),
+				Completed:     true,
+			}
+			newBytes, err := json.Marshal(meta)
+			if err == nil {
+				_ = os.WriteFile(metaPath, newBytes, 0644)
+			}
+			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+			state.SetUpstreamStatus("Completed")
+
+			GlobalRegistry.Lock.Lock()
+			delete(GlobalRegistry.Files, state.Key)
+			GlobalRegistry.Lock.Unlock()
+
+			if GlobalLogBroker != nil {
+				GlobalLogBroker.BroadcastStateUpdate()
+			}
+			log.Printf("[Coord] Cached file finalized and committed to disk: %s", state.Key)
+		} else {
+			log.Printf("[Coord] Commit rename failed (likely Windows lock, deferring to reader exit): %v", err)
+			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+			state.SetUpstreamStatus("Completed")
+		}
+	} else {
+		GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+		state.SetUpstreamStatus("Completed")
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, state.Key)
+		GlobalRegistry.Lock.Unlock()
+		if GlobalLogBroker != nil {
+			GlobalLogBroker.BroadcastStateUpdate()
+		}
+	}
+}
+
