@@ -25,36 +25,48 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	filePath := filepath.Join(GlobalConfig.GetCacheDir(), key)
 	metaPath := filePath + ".json"
 
-	// If cached file doesn't exist, we consider it valid (we'll start a fresh download)
-	if !FileExists(filePath) {
-		return true, nil
-	}
-
-	// Read metadata
-	metaBytes, err := os.ReadFile(metaPath)
-	if err != nil {
-		// Video file exists but metadata is missing. Recreate it dynamically based on the file's ModTime.
-		log.Printf("[Revalidate] Metadata missing for cached file %s. Recreating from disk stat...", key)
-		err = recreateMetadata(filePath, metaPath, url)
-		if err != nil {
-			log.Printf("[Revalidate] Failed to recreate metadata for %s: %v. Evicting.", key, err)
-			evictCachedFile(filePath, metaPath)
-			return false, nil
-		}
-		// Read it back to continue validation
-		metaBytes, err = os.ReadFile(metaPath)
-		if err != nil {
-			evictCachedFile(filePath, metaPath)
-			return false, nil
-		}
-	}
-
 	var meta FileMeta
-	err = json.Unmarshal(metaBytes, &meta)
-	if err != nil {
-		log.Printf("[Revalidate] Metadata corrupted for cached file %s. Evicting.", key)
-		evictCachedFile(filePath, metaPath)
-		return false, nil
+	var found bool
+
+	if GlobalStorage != nil {
+		sm, exists, err := GlobalStorage.Stat(context.Background(), key)
+		if err == nil && exists && sm != nil {
+			meta = *sm
+			found = true
+		}
+	}
+
+	if !found {
+		// If cached file doesn't exist, we consider it valid (we'll start a fresh download)
+		if !FileExists(filePath) {
+			return true, nil
+		}
+
+		// Read metadata
+		metaBytes, err := os.ReadFile(metaPath)
+		if err != nil {
+			// Video file exists but metadata is missing. Recreate it dynamically based on the file's ModTime.
+			log.Printf("[Revalidate] Metadata missing for cached file %s. Recreating from disk stat...", key)
+			err = recreateMetadata(filePath, metaPath, url)
+			if err != nil {
+				log.Printf("[Revalidate] Failed to recreate metadata for %s: %v. Evicting.", key, err)
+				evictCachedFile(filePath, metaPath)
+				return false, nil
+			}
+			// Read it back to continue validation
+			metaBytes, err = os.ReadFile(metaPath)
+			if err != nil {
+				evictCachedFile(filePath, metaPath)
+				return false, nil
+			}
+		}
+
+		err = json.Unmarshal(metaBytes, &meta)
+		if err != nil {
+			log.Printf("[Revalidate] Metadata corrupted for cached file %s. Evicting.", key)
+			evictCachedFile(filePath, metaPath)
+			return false, nil
+		}
 	}
 
 	// Check if the validation time has expired
@@ -109,6 +121,9 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 			meta.LastModified = upstreamLastModified
 		}
 	}
+	if GlobalStorage != nil {
+		_ = GlobalStorage.UpdateMetadata(context.Background(), key, meta)
+	}
 	newMetaBytes, err := json.Marshal(meta)
 	if err == nil {
 		_ = os.WriteFile(metaPath, newMetaBytes, 0644)
@@ -119,6 +134,11 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 }
 
 func evictCachedFile(path, metaPath string) {
+	key := filepath.Base(path)
+	if GlobalStorage != nil {
+		_ = GlobalStorage.Delete(context.Background(), key)
+	}
+
 	info, err := os.Stat(path)
 	var size int64
 	if err == nil {

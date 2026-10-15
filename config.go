@@ -30,6 +30,8 @@ type Config struct {
 	StarvationStallTimeout  time.Duration
 	LogVerbose              bool
 	WritebackBufferSize     int64
+	StorageBackend         string
+	S3Config               S3Config
 }
 
 func (c *Config) Lock() {
@@ -272,6 +274,58 @@ func (c *Config) SetWritebackBufferSize(val int64) {
 	c.WritebackBufferSize = val
 }
 
+type S3Config struct {
+	Endpoint        string
+	Bucket          string
+	Region          string
+	AccessKey       string
+	SecretKey       string
+	UsePathStyle    bool
+	DisableSSL      bool
+	ChunkSize       int64
+	ScratchMaxBytes int64
+}
+
+func (c *Config) GetStorageBackend() string {
+	if c == nil {
+		return "local"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.StorageBackend == "" {
+		return "local"
+	}
+	return c.StorageBackend
+}
+
+func (c *Config) SetStorageBackend(b string) {
+	if c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.StorageBackend = b
+	}
+}
+
+func (c *Config) GetS3Config() S3Config {
+	if c == nil {
+		return S3Config{
+			ChunkSize:       64 * 1024 * 1024,
+			ScratchMaxBytes: 4 * 1024 * 1024 * 1024,
+		}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.S3Config
+}
+
+func (c *Config) SetS3Config(s3Cfg S3Config) {
+	if c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.S3Config = s3Cfg
+	}
+}
+
 var GlobalConfig *Config
 
 func LoadConfig() {
@@ -294,6 +348,18 @@ func LoadConfig() {
 		StarvationStallTimeout:  getEnvDuration("STARVATION_STALL_TIMEOUT", 30*time.Second),
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
+		StorageBackend:         getEnv("STORAGE_BACKEND", "local"),
+		S3Config: S3Config{
+			Endpoint:        getEnv("S3_ENDPOINT", ""),
+			Bucket:          getEnv("S3_BUCKET", ""),
+			Region:          getEnv("S3_REGION", "us-east-1"),
+			AccessKey:       getEnv("S3_ACCESS_KEY", ""),
+			SecretKey:       getEnv("S3_SECRET_KEY", ""),
+			UsePathStyle:    getEnvBool("S3_USE_PATH_STYLE", true),
+			DisableSSL:      getEnvBool("S3_DISABLE_SSL", false),
+			ChunkSize:       getEnvSize("S3_CHUNK_SIZE", 64*1024*1024),
+			ScratchMaxBytes: getEnvSize("S3_SCRATCH_MAX_BYTES", 4*1024*1024*1024),
+		},
 	}
 
 	// Format port if missing colon
@@ -314,9 +380,10 @@ func LoadConfig() {
 	}
 
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, StorageBackend=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
 		cfg.Port,
 		cfg.CacheDir,
+		cfg.StorageBackend,
 		cfg.CacheMaxBytes/(1024*1024*1024),
 		cfg.MinDiskFreeBytes/(1024*1024*1024),
 		cfg.UpstreamReadTimeout,

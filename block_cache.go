@@ -99,6 +99,7 @@ type FileCacheState struct {
 	Sniffed              bool
 	LiveBuffer           *LiveBuffer
 	Pipeline             StorageSink
+	ChunkManager         *S3ChunkManager
 }
 
 func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod string, totalSize int64) *FileCacheState {
@@ -126,6 +127,13 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		UpstreamStatus:            "Idle",
 		PendingTailPrefetchOffset: -1,
 		LiveBuffer:                NewLiveBuffer(bufSize),
+	}
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		chunkSize := int64(64 * 1024 * 1024)
+		if GlobalConfig != nil {
+			chunkSize = GlobalConfig.GetS3Config().ChunkSize
+		}
+		s.ChunkManager = NewS3ChunkManager(s, GlobalStorage, chunkSize)
 	}
 	s.Cond = sync.NewCond(&s.Lock)
 	return s
@@ -206,6 +214,10 @@ var GlobalRegistry *CacheRegistry
 var GlobalDiskFreeBytes uint64
 
 func InitRegistry() {
+	if GlobalStorage == nil {
+		_ = InitStorage()
+	}
+
 	GlobalRegistry = &CacheRegistry{
 		Files:        make(map[string]*FileCacheState),
 		Connections:  make(map[string]*ClientConnection),

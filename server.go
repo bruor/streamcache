@@ -116,15 +116,35 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Cache HIT Path with Revalidation
-	if FileExists(cacheFilePath) {
+	var cacheHit bool
+	var cacheMeta *FileMeta
+	if GlobalStorage != nil {
+		if meta, exists, err := GlobalStorage.Stat(r.Context(), cacheFileName); err == nil && exists {
+			cacheHit = true
+			cacheMeta = meta
+		}
+	} else if FileExists(cacheFilePath) {
+		cacheHit = true
+	}
+
+	if cacheHit {
 		valid, err := Revalidate(cacheFileName, targetURL, r.Header)
 		if err == nil && valid {
-			file, err := os.Open(cacheFilePath)
+			var reader StorageReadSeeker
+			if GlobalStorage != nil {
+				reader, err = GlobalStorage.Open(r.Context(), cacheFileName)
+			} else {
+				f, ferr := os.Open(cacheFilePath)
+				if ferr == nil {
+					stat, _ := f.Stat()
+					reader = &localFileReadSeeker{file: f, size: stat.Size()}
+				} else {
+					err = ferr
+				}
+			}
+
 			if err == nil {
-				defer func() {
-					FadviseDontNeed(file.Fd(), 0, 0)
-					_ = file.Close()
-				}()
+				defer reader.Close()
 
 				// Generate unique client ID using atomic counter
 				connID := fmt.Sprintf("client-%d", atomic.AddUint64(&globalClientIDSeq, 1))
@@ -134,12 +154,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					userAgent = "Unknown"
 				}
 
-				// Fetch total size of completed file
-				var totalSize int64
-				if stat, err := file.Stat(); err == nil {
-					totalSize = stat.Size()
-				}
-
+				totalSize := reader.Size()
 				var startOffset int64
 				if r != nil {
 					startOffset = parseRangeStart(r.Header.Get("Range"))
@@ -163,7 +178,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 				// Wrap file in a tracking reader to monitor read offsets
 				tracker := &trackingReader{
-					file:              file,
+					reader:            reader,
 					lastEvictedOffset: startOffset,
 					onRead: func(off int64, n int) {
 						GlobalRegistry.UpdateConnectionOffset(connID, off+int64(n))
@@ -173,12 +188,15 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("X-Cache", "HIT")
 				w.Header().Set("Accept-Ranges", "bytes")
 
-				// Set Content-Type from metadata if available, otherwise extension fallback
-				metaPath := cacheFilePath + ".json"
-				if metaBytes, err := os.ReadFile(metaPath); err == nil {
-					var meta FileMeta
-					if json.Unmarshal(metaBytes, &meta) == nil && meta.ContentType != "" {
-						w.Header().Set("Content-Type", meta.ContentType)
+				if cacheMeta != nil && cacheMeta.ContentType != "" {
+					w.Header().Set("Content-Type", cacheMeta.ContentType)
+				} else {
+					metaPath := cacheFilePath + ".json"
+					if metaBytes, err := os.ReadFile(metaPath); err == nil {
+						var meta FileMeta
+						if json.Unmarshal(metaBytes, &meta) == nil && meta.ContentType != "" {
+							w.Header().Set("Content-Type", meta.ContentType)
+						}
 					}
 				}
 				http.ServeContent(w, r, cacheFileName, time.Now(), tracker)
@@ -411,31 +429,22 @@ func base64DecodeSafe(str string) ([]byte, error) {
 }
 
 type trackingReader struct {
-	file              *os.File
+	reader            StorageReadSeeker
 	onRead            func(off int64, n int)
 	currOffset        int64
 	lastEvictedOffset int64
 }
 
 func (tr *trackingReader) ReadAt(p []byte, off int64) (n int, err error) {
-	n, err = tr.file.ReadAt(p, off)
+	n, err = tr.reader.ReadAt(p, off)
 	if n > 0 {
 		tr.onRead(off, n)
-		curEnd := off + int64(n)
-		lastEvict := atomic.LoadInt64(&tr.lastEvictedOffset)
-		if curEnd-lastEvict >= 16*1024*1024 {
-			evictLen := curEnd - lastEvict - 8*1024*1024
-			if evictLen > 0 {
-				FadviseDontNeed(tr.file.Fd(), lastEvict, evictLen)
-				atomic.AddInt64(&tr.lastEvictedOffset, evictLen)
-			}
-		}
 	}
 	return n, err
 }
 
 func (tr *trackingReader) Seek(offset int64, whence int) (int64, error) {
-	newPos, err := tr.file.Seek(offset, whence)
+	newPos, err := tr.reader.Seek(offset, whence)
 	if err == nil {
 		atomic.StoreInt64(&tr.currOffset, newPos)
 		atomic.StoreInt64(&tr.lastEvictedOffset, newPos)
@@ -445,19 +454,10 @@ func (tr *trackingReader) Seek(offset int64, whence int) (int64, error) {
 
 func (tr *trackingReader) Read(p []byte) (n int, err error) {
 	startOff := atomic.LoadInt64(&tr.currOffset)
-	n, err = tr.file.Read(p)
+	n, err = tr.reader.Read(p)
 	if n > 0 {
 		atomic.AddInt64(&tr.currOffset, int64(n))
 		tr.onRead(startOff, n)
-		curEnd := startOff + int64(n)
-		lastEvict := atomic.LoadInt64(&tr.lastEvictedOffset)
-		if curEnd-lastEvict >= 16*1024*1024 {
-			evictLen := curEnd - lastEvict - 8*1024*1024
-			if evictLen > 0 {
-				FadviseDontNeed(tr.file.Fd(), lastEvict, evictLen)
-				atomic.AddInt64(&tr.lastEvictedOffset, evictLen)
-			}
-		}
 	}
 	return n, err
 }

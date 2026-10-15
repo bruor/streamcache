@@ -59,6 +59,8 @@ func CancelCoordinator(state *FileCacheState) {
 		state.LiveBuffer.Clear()
 		state.LiveBuffer = nil
 	}
+	chunkManager := state.ChunkManager
+	state.ChunkManager = nil
 	state.Lock.Unlock()
 
 	if GlobalLogBroker != nil {
@@ -71,6 +73,10 @@ func CancelCoordinator(state *FileCacheState) {
 
 	if pipelineToClose != nil {
 		_ = pipelineToClose.FlushAndClose()
+	}
+
+	if chunkManager != nil {
+		chunkManager.Close()
 	}
 
 	if fileToClose != nil {
@@ -896,6 +902,9 @@ func runDownloadWorker(
 
 			// Add to RangeSet and wake waiting readers immediately!
 			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
+			if state.ChunkManager != nil {
+				state.ChunkManager.CheckAndTriggerUploads()
+			}
 
 			state.Lock.Lock()
 			for _, ch := range state.Clients {
@@ -1149,6 +1158,9 @@ func runInlineTailPrefetch(
 			}
 
 			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
+			if state.ChunkManager != nil {
+				state.ChunkManager.CheckAndTriggerUploads()
+			}
 			state.Lock.Lock()
 			for _, ch := range state.Clients {
 				safeSignal(ch)
@@ -1275,6 +1287,40 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 		state.LiveBuffer = nil
 	}
 	state.Lock.Unlock()
+
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		meta := FileMeta{
+			URL:           state.URL,
+			TotalSize:     state.TotalSize,
+			ContentType:   state.ContentType,
+			ETag:          state.ETag,
+			LastModified:  state.LastModified,
+			LastValidated: time.Now().Unix(),
+			Completed:     true,
+		}
+
+		if state.ChunkManager != nil {
+			state.ChunkManager.AttemptRecompose()
+		} else {
+			_ = GlobalStorage.CommitLocalFile(context.Background(), state.Key, state.PartPath, meta)
+		}
+
+		_ = os.Remove(state.PartPath)
+		_ = os.Remove(state.MetaPath)
+
+		GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+		state.SetUpstreamStatus("Completed")
+
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, state.Key)
+		GlobalRegistry.Lock.Unlock()
+
+		if GlobalLogBroker != nil {
+			GlobalLogBroker.BroadcastStateUpdate()
+		}
+		log.Printf("[Coord] Cached file finalized and committed to S3: %s", state.Key)
+		return
+	}
 
 	if !FileExists(state.Path) {
 		err := os.Rename(state.PartPath, state.Path)

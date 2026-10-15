@@ -16,9 +16,14 @@ func main() {
 	// 3. Initialize Log Broker (redirects standard logs to console and SSE listeners)
 	InitLogBroker()
 
-	// 4. Initialize Cache Registry (scans directory, calculates cache size, sets bounds)
+	// 4. Initialize Storage Backend (Local filesystem or S3)
+	if err := InitStorage(); err != nil {
+		log.Fatalf("[Main] Failed to initialize storage backend: %v", err)
+	}
+
+	// 5. Initialize Cache Registry (scans directory, calculates cache size, sets bounds)
 	InitRegistry()
 
-	// 5. Start HTTP Servers (Media streams and Dashboard UI)
+	// 6. Start HTTP Servers (Media streams and Dashboard UI)
 	StartServer()
 }

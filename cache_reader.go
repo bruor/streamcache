@@ -191,6 +191,34 @@ func (r *CacheReader) finalizeCache() {
 		_ = fileToClose.Close()
 	}
 
+	meta := FileMeta{
+		URL:           r.state.URL,
+		TotalSize:     r.state.TotalSize,
+		ContentType:   r.state.ContentType,
+		ETag:          r.state.ETag,
+		LastModified:  r.state.LastModified,
+		LastValidated: time.Now().Unix(),
+		Completed:     true,
+	}
+
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		if r.state.ChunkManager != nil {
+			r.state.ChunkManager.AttemptRecompose()
+		} else {
+			_ = GlobalStorage.CommitLocalFile(context.Background(), r.state.Key, r.state.PartPath, meta)
+		}
+		_ = os.Remove(r.state.PartPath)
+		_ = os.Remove(r.state.MetaPath)
+
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, r.state.Key)
+		GlobalRegistry.Lock.Unlock()
+
+		debug.FreeOSMemory()
+		log.Printf("[Reader] Cache file finalized and committed to S3 on last client exit: %s", r.state.Key)
+		return
+	}
+
 	// Rename temporary file to final cache path
 	err := os.Rename(r.state.PartPath, r.state.Path)
 	if err != nil {
@@ -205,7 +233,7 @@ func (r *CacheReader) finalizeCache() {
 
 	// Save final metadata JSON confirming completion
 	metaPath := r.state.Path + ".json"
-	meta := FileMeta{
+	meta = FileMeta{
 		URL:           r.state.URL,
 		TotalSize:     r.state.TotalSize,
 		ETag:          r.state.ETag,
@@ -326,7 +354,37 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 
-	// 2. Fall back to reading from disk
+	// 2. S3 Storage Tier: if the chunk has already been uploaded to S3, read directly from S3!
+	if r.state.ChunkManager != nil && GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		chunkSize := r.state.ChunkManager.ChunkSize()
+		chunkIdx := int(off / chunkSize)
+		if r.state.ChunkManager.IsChunkUploaded(chunkIdx) {
+			chunkStart := int64(chunkIdx) * chunkSize
+			offsetInChunk := off - chunkStart
+			chunkRemaining := chunkSize - offsetInChunk
+			readLen := toRead
+			if readLen > chunkRemaining {
+				readLen = chunkRemaining
+			}
+			s3Reader, err := GlobalStorage.OpenChunkRange(r.ctx, r.state.Key, chunkIdx, offsetInChunk, readLen)
+			if err == nil {
+				s3N, rerr := io.ReadFull(s3Reader, p[:readLen])
+				_ = s3Reader.Close()
+				if s3N > 0 {
+					GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
+					if r.state.RangeSet.IsComplete(r.state.TotalSize) {
+						GlobalRegistry.SetConnectionInCache(r.clientID, true)
+					}
+					return s3N, nil
+				}
+				if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+					log.Printf("[Reader] S3 chunk read fallback to disk for %s at offset %d: %v", r.state.Key, off, rerr)
+				}
+			}
+		}
+	}
+
+	// 3. Fall back to reading from disk
 	file, err := r.getFile()
 	if err != nil {
 		return 0, err
