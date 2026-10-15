@@ -58,6 +58,14 @@ func (m *MockS3Server) Close() {
 	}
 }
 
+func (m *MockS3Server) HasObject(bucket, key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fullKey := bucket + "/" + key
+	_, ok := m.objects[fullKey]
+	return ok
+}
+
 func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

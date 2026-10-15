@@ -287,16 +287,29 @@ func (r *s3ReadSeeker) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	r.mu.Lock()
-	bufEnd := r.bufOffset + int64(len(r.buf))
-	if r.buf != nil && off >= r.bufOffset && (off+toRead) <= bufEnd {
-		relStart := off - r.bufOffset
-		copy(p[:toRead], r.buf[relStart:relStart+toRead])
-		r.mu.Unlock()
-		return int(toRead), nil
-	}
-	r.mu.Unlock()
+	defer r.mu.Unlock()
 
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", off, off+toRead-1)
+	bufEnd := r.bufOffset + int64(len(r.buf))
+	if r.buf != nil && off >= r.bufOffset && off < bufEnd {
+		relStart := off - r.bufOffset
+		avail := int64(len(r.buf)) - relStart
+		n := toRead
+		if n > avail {
+			n = avail
+		}
+		copy(p[:n], r.buf[relStart:relStart+n])
+		return int(n), nil
+	}
+
+	fetchSize := int64(defaultS3ReadAheadSize)
+	if toRead > fetchSize {
+		fetchSize = toRead
+	}
+	if off+fetchSize > r.totalSize {
+		fetchSize = r.totalSize - off
+	}
+
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", off, off+fetchSize-1)
 	resp, err := r.client.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String(r.bucket),
 		Key:    aws.String(r.key),
@@ -307,11 +320,20 @@ func (r *s3ReadSeeker) ReadAt(p []byte, off int64) (int, error) {
 	}
 	defer resp.Body.Close()
 
-	n, err := io.ReadFull(resp.Body, p[:toRead])
-	if err == io.ErrUnexpectedEOF {
-		err = nil
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil && err != io.EOF {
+		return 0, err
 	}
-	return n, err
+
+	r.buf = buf
+	r.bufOffset = off
+
+	n := toRead
+	if n > int64(len(r.buf)) {
+		n = int64(len(r.buf))
+	}
+	copy(p[:n], r.buf[:n])
+	return int(n), nil
 }
 
 func (b *S3StorageBackend) Open(ctx context.Context, key string) (StorageReadSeeker, error) {

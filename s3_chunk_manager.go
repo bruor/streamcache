@@ -18,10 +18,11 @@ type S3ChunkManager struct {
 	totalSize  int64
 	totalParts int
 
-	mu        sync.RWMutex
-	uploaded  map[int]bool
-	uploading map[int]bool
-	reposed   bool
+	mu          sync.RWMutex
+	uploaded    map[int]bool
+	uploading   map[int]bool
+	recomposing bool
+	recomposed  bool
 
 	activeUploads int32
 	ctx           context.Context
@@ -84,7 +85,7 @@ func (m *S3ChunkManager) CheckAndTriggerUploads() {
 	}
 
 	m.mu.Lock()
-	if m.reposed {
+	if m.recomposed {
 		m.mu.Unlock()
 		return
 	}
@@ -166,14 +167,24 @@ func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
 	}
 }
 
+// IsRecomposed returns true if the monolithic S3 object has been sealed
+func (m *S3ChunkManager) IsRecomposed() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.recomposed
+}
+
 // AttemptRecompose stitches uploaded chunks into the monolithic S3 object
 func (m *S3ChunkManager) AttemptRecompose() {
 	m.mu.Lock()
-	if m.reposed || len(m.uploaded) < m.totalParts {
+	if m.recomposing || m.recomposed || len(m.uploaded) < m.totalParts {
 		m.mu.Unlock()
 		return
 	}
-	m.reposed = true
+	m.recomposing = true
 	m.mu.Unlock()
 
 	m.wg.Add(1)
@@ -196,10 +207,15 @@ func (m *S3ChunkManager) AttemptRecompose() {
 		if err != nil {
 			log.Printf("[S3ChunkManager] Server-side recomposition failed for %s: %v", m.key, err)
 			m.mu.Lock()
-			m.reposed = false
+			m.recomposing = false
 			m.mu.Unlock()
 			return
 		}
+
+		m.mu.Lock()
+		m.recomposed = true
+		m.recomposing = false
+		m.mu.Unlock()
 
 		log.Printf("[S3ChunkManager] Server-side recomposition SUCCESS for %s. Monolithic object sealed.", m.key)
 

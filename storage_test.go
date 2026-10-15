@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -531,4 +532,172 @@ func TestS3RevalidationWithOrigin(t *testing.T) {
 		t.Errorf("Expected S3 object to be deleted upon revalidation eviction")
 	}
 }
+
+func TestS3ViewerTransitionAcrossRecomposition(t *testing.T) {
+	mockS3 := NewMockS3Server("transition-bucket")
+	defer mockS3.Close()
+
+	chunkSize := int64(32 * 1024) // 32 KB chunks
+	s3Config := S3Config{
+		Endpoint:     mockS3.URL(),
+		Bucket:       "transition-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    chunkSize,
+	}
+
+	backend, err := NewS3StorageBackend(s3Config)
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	oldStorage := GlobalStorage
+	GlobalStorage = backend
+	defer func() { GlobalStorage = oldStorage }()
+
+	InitRegistry()
+
+	key := "4k_transition_movie.mkv"
+	totalSize := int64(128 * 1024) // 128 KB -> 4 chunks
+	fullData := make([]byte, totalSize)
+	for i := range fullData {
+		fullData[i] = byte((i * 17) % 256)
+	}
+
+	tempDir, err := os.MkdirTemp("", "sc2_transition_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	partPath := filepath.Join(tempDir, key+".part")
+	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile error: %v", err)
+	}
+	_ = f.Truncate(totalSize)
+
+	// Write first 2 chunks (64 KB) to scratch file
+	_, _ = f.WriteAt(fullData[:64*1024], 0)
+	_ = f.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	state := &FileCacheState{
+		Key:         key,
+		Path:        filepath.Join(tempDir, key),
+		PartPath:    partPath,
+		MetaPath:    filepath.Join(tempDir, key+".meta"),
+		TotalSize:   totalSize,
+		RangeSet:    NewRangeSet(),
+		Clients:     make(map[string]chan struct{}),
+		Starving:    make(map[string]int64),
+		NotifyChan:  make(chan struct{}, 10),
+		ContentType: "video/x-matroska",
+	}
+	state.RangeSet.Add(0, 64*1024)
+
+	chunkMgr := NewS3ChunkManager(state, backend, chunkSize)
+	state.ChunkManager = chunkMgr
+
+	// 1. Upload first 2 chunks
+	chunkMgr.CheckAndTriggerUploads()
+	chunkMgr.wg.Wait()
+
+	if !chunkMgr.IsChunkUploaded(0) || !chunkMgr.IsChunkUploaded(1) {
+		t.Fatalf("Expected chunks 0 and 1 to be uploaded to S3")
+	}
+
+	// 2. Viewer 3 arrives while stream is partially uploaded (trailing viewer)
+	reader3 := NewCacheReader(ctx, state, nil)
+	defer reader3.Close()
+
+	// Viewer 3 reads 16 KB from chunk 0
+	readBuf1 := make([]byte, 16*1024)
+	n, err := reader3.ReadAt(readBuf1, 0)
+	if err != nil {
+		t.Fatalf("Viewer 3 initial ReadAt error: %v", err)
+	}
+	if n != len(readBuf1) || !bytes.Equal(readBuf1, fullData[:16*1024]) {
+		t.Fatalf("Viewer 3 data mismatch while reading Chunk 0 from S3")
+	}
+
+	// Verify reader3 has chunkBuf populated
+	reader3.chunkBufMu.Lock()
+	if reader3.chunkBuf == nil || reader3.chunkBufIdx != 0 {
+		reader3.chunkBufMu.Unlock()
+		t.Fatalf("Expected reader3 to have chunkBuf populated for chunk 0")
+	}
+	reader3.chunkBufMu.Unlock()
+
+	// 3. Coordinator downloads remaining 2 chunks (chunks 2 and 3)
+	f2, err := os.OpenFile(partPath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile error: %v", err)
+	}
+	_, _ = f2.WriteAt(fullData[64*1024:], 64*1024)
+	_ = f2.Close()
+	state.RangeSet.Add(64*1024, 128*1024)
+
+	// Trigger uploads for remaining chunks and server-side recomposition
+	chunkMgr.CheckAndTriggerUploads()
+	chunkMgr.wg.Wait()
+
+	// Wait for recomposition to seal
+	deadline := time.Now().Add(5 * time.Second)
+	for !chunkMgr.IsRecomposed() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !chunkMgr.IsRecomposed() {
+		t.Fatalf("Expected chunk manager to be recomposed")
+	}
+
+	// Simulate cache finalization: scratch file removed, chunk objects removed
+	_ = os.Remove(partPath)
+
+	// Verify temporary chunks in mock S3 are deleted
+	chunk0Key := fmt.Sprintf("chunks/%s/chunk_%05d.bin", key, 0)
+	if mockS3.HasObject("transition-bucket", chunk0Key) {
+		t.Fatalf("Expected chunk 0 to be deleted from S3 after recomposition")
+	}
+
+	// Verify monolithic object exists in S3
+	if !mockS3.HasObject("transition-bucket", "vod/"+key) {
+		t.Fatalf("Expected monolithic object vod/%s to exist in S3", key)
+	}
+
+	// 4. Viewer 3 continues streaming across the transition:
+	// A. Read remaining part of chunk 0 (offset 16384 to 32768)
+	readBuf2 := make([]byte, 16*1024)
+	n2, err := reader3.ReadAt(readBuf2, 16*1024)
+	if err != nil {
+		t.Fatalf("Viewer 3 ReadAt after recomposition error: %v", err)
+	}
+	if n2 != len(readBuf2) || !bytes.Equal(readBuf2, fullData[16*1024:32*1024]) {
+		t.Fatalf("Viewer 3 data mismatch after recomposition transition")
+	}
+
+	// B. Read from chunk 3 (offset 96000, 32 KB)
+	readBuf3 := make([]byte, 32*1024)
+	n3, err := reader3.ReadAt(readBuf3, 96000)
+	if err != nil {
+		t.Fatalf("Viewer 3 ReadAt late offset error: %v", err)
+	}
+	if n3 != len(readBuf3) || !bytes.Equal(readBuf3, fullData[96000:96000+32*1024]) {
+		t.Fatalf("Viewer 3 data mismatch at offset 96000")
+	}
+
+	// C. Verify reader3 transitioned to using s3Reader (s3ReadSeeker)
+	reader3.s3ReaderMu.Lock()
+	if reader3.s3Reader == nil {
+		reader3.s3ReaderMu.Unlock()
+		t.Fatalf("Expected reader3 to have transitioned to s3Reader!")
+	}
+	reader3.s3ReaderMu.Unlock()
+}
+
 

@@ -25,6 +25,14 @@ type CacheReader struct {
 	file              *os.File
 	fileMu            sync.Mutex
 	lastEvictedOffset int64
+
+	s3Reader   StorageReadSeeker
+	s3ReaderMu sync.Mutex
+
+	chunkBuf    []byte
+	chunkBufIdx int
+	chunkBufOff int64
+	chunkBufMu  sync.Mutex
 }
 
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
@@ -103,6 +111,23 @@ func (r *CacheReader) getFile() (*os.File, error) {
 	return r.file, nil
 }
 
+func (r *CacheReader) getS3Reader() (StorageReadSeeker, error) {
+	r.s3ReaderMu.Lock()
+	defer r.s3ReaderMu.Unlock()
+	if r.s3Reader != nil {
+		return r.s3Reader, nil
+	}
+	if GlobalStorage == nil {
+		return nil, errors.New("storage backend not initialized")
+	}
+	s3r, err := GlobalStorage.Open(r.ctx, r.state.Key)
+	if err != nil {
+		return nil, err
+	}
+	r.s3Reader = s3r
+	return r.s3Reader, nil
+}
+
 func (r *CacheReader) Close() error {
 	r.fileMu.Lock()
 	if r.file != nil {
@@ -111,6 +136,13 @@ func (r *CacheReader) Close() error {
 		r.file = nil
 	}
 	r.fileMu.Unlock()
+
+	r.s3ReaderMu.Lock()
+	if r.s3Reader != nil {
+		_ = r.s3Reader.Close()
+		r.s3Reader = nil
+	}
+	r.s3ReaderMu.Unlock()
 
 	r.state.Lock.Lock()
 
@@ -354,31 +386,104 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 
-	// 2. S3 Storage Tier: if the chunk has already been uploaded to S3, read directly from S3!
-	if r.state.ChunkManager != nil && GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-		chunkSize := r.state.ChunkManager.ChunkSize()
-		chunkIdx := int(off / chunkSize)
-		if r.state.ChunkManager.IsChunkUploaded(chunkIdx) {
-			chunkStart := int64(chunkIdx) * chunkSize
-			offsetInChunk := off - chunkStart
-			chunkRemaining := chunkSize - offsetInChunk
-			readLen := toRead
-			if readLen > chunkRemaining {
-				readLen = chunkRemaining
-			}
-			s3Reader, err := GlobalStorage.OpenChunkRange(r.ctx, r.state.Key, chunkIdx, offsetInChunk, readLen)
+	// 2. S3 Storage Tier
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		// A. Recomposed Monolithic Object: If all parts have been stitched and sealed, read via s3ReadSeeker
+		isRecomposed := false
+		if r.state.ChunkManager != nil && r.state.ChunkManager.IsRecomposed() {
+			isRecomposed = true
+		} else if !FileExists(r.state.PartPath) {
+			isRecomposed = true
+		}
+
+		if isRecomposed {
+			s3Reader, err := r.getS3Reader()
 			if err == nil {
-				s3N, rerr := io.ReadFull(s3Reader, p[:readLen])
-				_ = s3Reader.Close()
+				s3N, rerr := s3Reader.ReadAt(p[:toRead], off)
 				if s3N > 0 {
 					GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
-					if r.state.RangeSet.IsComplete(r.state.TotalSize) {
-						GlobalRegistry.SetConnectionInCache(r.clientID, true)
-					}
+					GlobalRegistry.SetConnectionInCache(r.clientID, true)
 					return s3N, nil
 				}
-				if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
-					log.Printf("[Reader] S3 chunk read fallback to disk for %s at offset %d: %v", r.state.Key, off, rerr)
+				if rerr != nil {
+					return 0, rerr
+				}
+			}
+		}
+
+		// B. In-flight Chunks: If chunk is in S3 prior to recomposition, read using sliding chunk buffer
+		if r.state.ChunkManager != nil {
+			chunkSize := r.state.ChunkManager.ChunkSize()
+			chunkIdx := int(off / chunkSize)
+			if r.state.ChunkManager.IsChunkUploaded(chunkIdx) {
+				chunkStart := int64(chunkIdx) * chunkSize
+				offsetInChunk := off - chunkStart
+				chunkRemaining := chunkSize - offsetInChunk
+				readLen := toRead
+				if readLen > chunkRemaining {
+					readLen = chunkRemaining
+				}
+
+				// Check chunk sliding buffer
+				r.chunkBufMu.Lock()
+				bufEnd := r.chunkBufOff + int64(len(r.chunkBuf))
+				if r.chunkBuf != nil && r.chunkBufIdx == chunkIdx && offsetInChunk >= r.chunkBufOff && offsetInChunk < bufEnd {
+					relStart := offsetInChunk - r.chunkBufOff
+					avail := int64(len(r.chunkBuf)) - relStart
+					n := readLen
+					if n > avail {
+						n = avail
+					}
+					copy(p[:n], r.chunkBuf[relStart:relStart+n])
+					r.chunkBufMu.Unlock()
+					GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
+					return int(n), nil
+				}
+
+				// Buffer miss: fetch sliding read-ahead window (2MB) from chunk
+				fetchSize := int64(2 * 1024 * 1024)
+				if readLen > fetchSize {
+					fetchSize = readLen
+				}
+				if offsetInChunk+fetchSize > chunkSize {
+					fetchSize = chunkSize - offsetInChunk
+				}
+
+				s3ChunkReader, err := GlobalStorage.OpenChunkRange(r.ctx, r.state.Key, chunkIdx, offsetInChunk, fetchSize)
+				if err == nil {
+					buf, rerr := io.ReadAll(s3ChunkReader)
+					_ = s3ChunkReader.Close()
+					if (rerr == nil || rerr == io.EOF) && len(buf) > 0 {
+						r.chunkBuf = buf
+						r.chunkBufIdx = chunkIdx
+						r.chunkBufOff = offsetInChunk
+
+						n := readLen
+						if n > int64(len(buf)) {
+							n = int64(len(buf))
+						}
+						copy(p[:n], buf[:n])
+						r.chunkBufMu.Unlock()
+						GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
+						return int(n), nil
+					}
+				}
+				r.chunkBufMu.Unlock()
+
+				// If chunk read failed (e.g. chunks deleted during recomposition race), transition to monolithic reader
+				if r.state.ChunkManager.IsRecomposed() {
+					s3Reader, err := r.getS3Reader()
+					if err == nil {
+						s3N, rerr := s3Reader.ReadAt(p[:toRead], off)
+						if s3N > 0 {
+							GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
+							GlobalRegistry.SetConnectionInCache(r.clientID, true)
+							return s3N, nil
+						}
+						if rerr != nil {
+							return 0, rerr
+						}
+					}
 				}
 			}
 		}
