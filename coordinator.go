@@ -880,6 +880,14 @@ func runDownloadWorker(
 			}
 		}
 
+		// Wait if scratch disk budget is exceeded or disk free space is low (TCP socket backpressure)
+		if state.ChunkManager != nil {
+			if berr := state.ChunkManager.WaitScratchBudget(ctx); berr != nil {
+				closeConnection()
+				return
+			}
+		}
+
 		// Read streaming chunk from upstream HTTP body
 		readStartTime := time.Now()
 		n, err := activeRespBody.Read(buf)
@@ -903,6 +911,7 @@ func runDownloadWorker(
 			// Add to RangeSet and wake waiting readers immediately!
 			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
 			if state.ChunkManager != nil {
+				state.ChunkManager.AddInFlightBytes(int64(n))
 				state.ChunkManager.CheckAndTriggerUploads()
 			}
 

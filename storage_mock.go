@@ -66,6 +66,12 @@ func (m *MockS3Server) HasObject(bucket, key string) bool {
 	return ok
 }
 
+func (m *MockS3Server) ActiveUploads() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.uploads)
+}
+
 func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -375,6 +381,14 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case http.MethodDelete:
+		uploadID := query.Get("uploadId")
+		if uploadID != "" {
+			delete(m.uploads, uploadID)
+			delete(m.uploadKeys, uploadID)
+			delete(m.uploadMetas, uploadID)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		delete(m.objects, fullKey)
 		delete(m.metadata, fullKey)
 		w.WriteHeader(http.StatusNoContent)

@@ -24,11 +24,12 @@ const (
 
 // S3StorageBackend implements StorageBackend using any S3-compatible service
 type S3StorageBackend struct {
-	client          *s3.Client
-	bucket          string
-	chunkSize       int64
-	scratchMaxBytes int64
-	mu              sync.RWMutex
+	client              *s3.Client
+	bucket              string
+	chunkSize           int64
+	scratchMaxBytes     int64
+	scratchMinFreeBytes int64
+	mu                  sync.RWMutex
 }
 
 // NewS3StorageBackend initializes an S3StorageBackend from S3Config
@@ -65,15 +66,33 @@ func NewS3StorageBackend(cfg S3Config) (*S3StorageBackend, error) {
 
 	scratchMax := cfg.ScratchMaxBytes
 	if scratchMax <= 0 {
-		scratchMax = 4 * 1024 * 1024 * 1024
+		scratchMax = 2 * 1024 * 1024 * 1024
+	}
+
+	scratchMinFree := cfg.ScratchMinFreeBytes
+	if scratchMinFree <= 0 {
+		scratchMinFree = 1 * 1024 * 1024 * 1024
 	}
 
 	return &S3StorageBackend{
-		client:          client,
-		bucket:          cfg.Bucket,
-		chunkSize:       chunkSize,
-		scratchMaxBytes: scratchMax,
+		client:              client,
+		bucket:              cfg.Bucket,
+		chunkSize:           chunkSize,
+		scratchMaxBytes:     scratchMax,
+		scratchMinFreeBytes: scratchMinFree,
 	}, nil
+}
+
+func (b *S3StorageBackend) ChunkSize() int64 {
+	return b.chunkSize
+}
+
+func (b *S3StorageBackend) ScratchMaxBytes() int64 {
+	return b.scratchMaxBytes
+}
+
+func (b *S3StorageBackend) ScratchMinFreeBytes() int64 {
+	return b.scratchMinFreeBytes
 }
 
 func (b *S3StorageBackend) Type() string {
@@ -454,6 +473,17 @@ func (b *S3StorageBackend) Recompose(ctx context.Context, key string, totalParts
 	}
 
 	uploadID := createResp.UploadId
+	var completedSuccessfully bool
+	defer func() {
+		if !completedSuccessfully && uploadID != nil && *uploadID != "" {
+			_, _ = b.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(b.bucket),
+				Key:      aws.String(targetKey),
+				UploadId: uploadID,
+			})
+		}
+	}()
+
 	completedParts := make([]types.CompletedPart, 0, totalParts)
 	chunkKeys := make([]types.ObjectIdentifier, 0, totalParts)
 
@@ -472,11 +502,6 @@ func (b *S3StorageBackend) Recompose(ctx context.Context, key string, totalParts
 			CopySource: aws.String(copySource),
 		})
 		if err != nil {
-			_, _ = b.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-				Bucket:   aws.String(b.bucket),
-				Key:      aws.String(targetKey),
-				UploadId: uploadID,
-			})
 			return fmt.Errorf("UploadPartCopy failed for part %d: %w", partNumber, err)
 		}
 
@@ -498,6 +523,8 @@ func (b *S3StorageBackend) Recompose(ctx context.Context, key string, totalParts
 	if err != nil {
 		return fmt.Errorf("CompleteMultipartUpload failed: %w", err)
 	}
+
+	completedSuccessfully = true
 
 	// 4. Clean up temporary chunk objects
 	if len(chunkKeys) > 0 {

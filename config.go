@@ -275,15 +275,16 @@ func (c *Config) SetWritebackBufferSize(val int64) {
 }
 
 type S3Config struct {
-	Endpoint        string
-	Bucket          string
-	Region          string
-	AccessKey       string
-	SecretKey       string
-	UsePathStyle    bool
-	DisableSSL      bool
-	ChunkSize       int64
-	ScratchMaxBytes int64
+	Endpoint            string
+	Bucket              string
+	Region              string
+	AccessKey           string
+	SecretKey           string
+	UsePathStyle        bool
+	DisableSSL          bool
+	ChunkSize           int64
+	ScratchMaxBytes     int64
+	ScratchMinFreeBytes int64
 }
 
 func (c *Config) GetStorageBackend() string {
@@ -309,8 +310,9 @@ func (c *Config) SetStorageBackend(b string) {
 func (c *Config) GetS3Config() S3Config {
 	if c == nil {
 		return S3Config{
-			ChunkSize:       64 * 1024 * 1024,
-			ScratchMaxBytes: 4 * 1024 * 1024 * 1024,
+			ChunkSize:           64 * 1024 * 1024,
+			ScratchMaxBytes:     2 * 1024 * 1024 * 1024,
+			ScratchMinFreeBytes: 1 * 1024 * 1024 * 1024,
 		}
 	}
 	c.mu.RLock()
@@ -350,15 +352,16 @@ func LoadConfig() {
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
 		StorageBackend:         getEnv("STORAGE_BACKEND", "local"),
 		S3Config: S3Config{
-			Endpoint:        getEnv("S3_ENDPOINT", ""),
-			Bucket:          getEnv("S3_BUCKET", ""),
-			Region:          getEnv("S3_REGION", "us-east-1"),
-			AccessKey:       getEnv("S3_ACCESS_KEY", ""),
-			SecretKey:       getEnv("S3_SECRET_KEY", ""),
-			UsePathStyle:    getEnvBool("S3_USE_PATH_STYLE", true),
-			DisableSSL:      getEnvBool("S3_DISABLE_SSL", false),
-			ChunkSize:       getEnvSize("S3_CHUNK_SIZE", 64*1024*1024),
-			ScratchMaxBytes: getEnvSize("S3_SCRATCH_MAX_BYTES", 4*1024*1024*1024),
+			Endpoint:            getEnv("S3_ENDPOINT", ""),
+			Bucket:              getEnv("S3_BUCKET", ""),
+			Region:              getEnv("S3_REGION", "us-east-1"),
+			AccessKey:           getEnv("S3_ACCESS_KEY", ""),
+			SecretKey:           getEnv("S3_SECRET_KEY", ""),
+			UsePathStyle:        getEnvBool("S3_USE_PATH_STYLE", true),
+			DisableSSL:          getEnvBool("S3_DISABLE_SSL", false),
+			ChunkSize:           getEnvSize("S3_CHUNK_SIZE", 64*1024*1024),
+			ScratchMaxBytes:     getEnvSize("S3_SCRATCH_MAX_BYTES", 2*1024*1024*1024),
+			ScratchMinFreeBytes: getEnvSize("S3_SCRATCH_MIN_FREE_BYTES", 1*1024*1024*1024),
 		},
 	}
 

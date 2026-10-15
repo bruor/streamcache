@@ -700,4 +700,322 @@ func TestS3ViewerTransitionAcrossRecomposition(t *testing.T) {
 	reader3.s3ReaderMu.Unlock()
 }
 
+func TestS3DynamicChunkSizer(t *testing.T) {
+	// 1. Small file (2 MB) with default 64 MB config -> single PutObject bypass
+	sz, isMulti := CalculateDynamicChunkConfig(2*1024*1024, 64*1024*1024)
+	if isMulti {
+		t.Errorf("Expected 2MB file to bypass multipart, got isMultipart=true")
+	}
+	if sz != 2*1024*1024 {
+		t.Errorf("Expected chunk size 2MB, got %d", sz)
+	}
+
+	// 2. 60 GB movie with default 64 MB config -> ~938 parts
+	sz, isMulti = CalculateDynamicChunkConfig(60*1024*1024*1024, 64*1024*1024)
+	if !isMulti {
+		t.Errorf("Expected 60GB file to use multipart")
+	}
+	if sz != 64*1024*1024 {
+		t.Errorf("Expected chunk size 64MB, got %d", sz)
+	}
+	parts := (60*1024*1024*1024 + sz - 1) / sz
+	if parts > 10000 {
+		t.Errorf("Parts count %d exceeds S3 10,000 limit", parts)
+	}
+
+	// 3. 1 TB massive media file with default 64 MB config -> must scale up chunk size so parts <= 10000
+	oneTB := int64(1024) * 1024 * 1024 * 1024
+	sz, isMulti = CalculateDynamicChunkConfig(oneTB, 64*1024*1024)
+	if !isMulti {
+		t.Errorf("Expected 1TB file to use multipart")
+	}
+	parts = (oneTB + sz - 1) / sz
+	if parts > 10000 {
+		t.Errorf("Scaled parts count %d exceeds S3 10,000 limit for 1TB file (chunkSize: %d)", parts, sz)
+	}
+	if sz < 100*1024*1024 {
+		t.Errorf("Expected chunk size to scale up to >=100MB for 1TB file, got %d", sz)
+	}
+
+	// 4. Explicit test chunk size (e.g. 32 KB) -> should honor test configuration
+	sz, isMulti = CalculateDynamicChunkConfig(128*1024, 32*1024)
+	if !isMulti {
+		t.Errorf("Expected explicit small test chunk size to allow multipart testing")
+	}
+	if sz != 32*1024 {
+		t.Errorf("Expected 32KB test chunk size, got %d", sz)
+	}
+}
+
+func TestS3SmallFileSinglePutObject(t *testing.T) {
+	mockS3 := NewMockS3Server("smallfile-bucket")
+	defer mockS3.Close()
+
+	s3Config := S3Config{
+		Endpoint:     mockS3.URL(),
+		Bucket:       "smallfile-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    64 * 1024 * 1024, // 64 MB default
+	}
+
+	backend, err := NewS3StorageBackend(s3Config)
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	oldStorage := GlobalStorage
+	GlobalStorage = backend
+	defer func() { GlobalStorage = oldStorage }()
+
+	InitRegistry()
+
+	key := "small_sample.mp4"
+	totalSize := int64(2 * 1024 * 1024) // 2 MB (< 5 MB)
+	data := make([]byte, totalSize)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	tempDir, err := os.MkdirTemp("", "sc2_small_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	partPath := filepath.Join(tempDir, key+".part")
+	if err := os.WriteFile(partPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile error: %v", err)
+	}
+
+	state := &FileCacheState{
+		Key:         key,
+		Path:        filepath.Join(tempDir, key),
+		PartPath:    partPath,
+		MetaPath:    filepath.Join(tempDir, key+".meta"),
+		TotalSize:   totalSize,
+		RangeSet:    NewRangeSet(),
+		Clients:     make(map[string]chan struct{}),
+		Starving:    make(map[string]int64),
+		NotifyChan:  make(chan struct{}, 10),
+		ContentType: "video/mp4",
+	}
+
+	chunkMgr := NewS3ChunkManager(state, backend, s3Config.ChunkSize)
+	state.ChunkManager = chunkMgr
+
+	if chunkMgr.IsMultipart() {
+		t.Fatalf("Expected 2MB file to be non-multipart")
+	}
+
+	// Add entire 2MB to range set and trigger check
+	state.RangeSet.Add(0, totalSize)
+	chunkMgr.CheckAndTriggerUploads()
+	chunkMgr.wg.Wait()
+
+	// Wait for recompose/commit
+	deadline := time.Now().Add(3 * time.Second)
+	for !chunkMgr.IsRecomposed() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !chunkMgr.IsRecomposed() {
+		t.Fatalf("Expected small file to be committed to S3")
+	}
+
+	// Verify monolithic object exists in S3 (vod/small_sample.mp4)
+	if !mockS3.HasObject("smallfile-bucket", "vod/"+key) {
+		t.Fatalf("Expected vod/%s to exist in S3 via single PutObject", key)
+	}
+
+	// Verify no multipart uploads or temporary chunks leaked
+	if mockS3.ActiveUploads() != 0 {
+		t.Errorf("Expected 0 active multipart uploads, got %d", mockS3.ActiveUploads())
+	}
+}
+
+func TestS3HolePunchingAndBlockDeallocation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "sc2_punch_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	filePath := filepath.Join(tempDir, "sparse_test.bin")
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile error: %v", err)
+	}
+	defer f.Close()
+
+	// Write 1 MB of non-zero data
+	data := make([]byte, 1024*1024)
+	for i := range data {
+		data[i] = 0xAA
+	}
+	if _, err := f.WriteAt(data, 0); err != nil {
+		t.Fatalf("WriteAt error: %v", err)
+	}
+	_ = f.Sync()
+
+	// Punch hole for the first 512 KB
+	err = PunchHole(f.Fd(), 0, 512*1024)
+	if err != nil {
+		t.Fatalf("PunchHole error: %v", err)
+	}
+
+	// Read back punched range: hole must read as all zeros!
+	verifyBuf := make([]byte, 512*1024)
+	n, err := f.ReadAt(verifyBuf, 0)
+	if err != nil || n != len(verifyBuf) {
+		t.Fatalf("ReadAt punched range error: %v", err)
+	}
+	for i, b := range verifyBuf {
+		if b != 0 {
+			t.Fatalf("Expected zero byte in punched hole at offset %d, got %x", i, b)
+		}
+	}
+
+	// Remaining 512 KB should still have original data
+	verifyBuf2 := make([]byte, 512*1024)
+	n2, err := f.ReadAt(verifyBuf2, 512*1024)
+	if err != nil || n2 != len(verifyBuf2) {
+		t.Fatalf("ReadAt unpunched range error: %v", err)
+	}
+	if !bytes.Equal(verifyBuf2, data[512*1024:]) {
+		t.Fatalf("Unpunched range data corrupted!")
+	}
+}
+
+func TestS3BackpressureScratchBudget(t *testing.T) {
+	mockS3 := NewMockS3Server("backpressure-bucket")
+	defer mockS3.Close()
+
+	s3Config := S3Config{
+		Endpoint:            mockS3.URL(),
+		Bucket:              "backpressure-bucket",
+		Region:              "us-east-1",
+		AccessKey:           "test-access",
+		SecretKey:           "test-secret",
+		UsePathStyle:        true,
+		DisableSSL:          true,
+		ChunkSize:           32 * 1024,
+		ScratchMaxBytes:     64 * 1024, // 64 KB max budget = 2 chunks
+		ScratchMinFreeBytes: 1024,
+	}
+
+	backend, err := NewS3StorageBackend(s3Config)
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	tempDir, err := os.MkdirTemp("", "sc2_bp_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	state := &FileCacheState{
+		Key:       "bp_test.mkv",
+		PartPath:  filepath.Join(tempDir, "bp_test.mkv.part"),
+		TotalSize: 128 * 1024,
+		RangeSet:  NewRangeSet(),
+		Clients:   make(map[string]chan struct{}),
+	}
+
+	chunkMgr := NewS3ChunkManager(state, backend, s3Config.ChunkSize)
+	chunkMgr.maxInFlightBytes = 64 * 1024 // 64 KB cap
+	chunkMgr.minFreeDiskBytes = 1024
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 1. Initial budget should pass immediately
+	if err := chunkMgr.WaitScratchBudget(ctx); err != nil {
+		t.Fatalf("Initial budget wait failed: %v", err)
+	}
+
+	// 2. Add 64 KB in-flight (hitting the cap)
+	chunkMgr.AddInFlightBytes(64 * 1024)
+
+	// 3. Trying to wait now should block!
+	blockedChan := make(chan struct{})
+	go func() {
+		// WaitScratchBudget should block until space is released
+		_ = chunkMgr.WaitScratchBudget(ctx)
+		close(blockedChan)
+	}()
+
+	// Verify it is blocked
+	select {
+	case <-blockedChan:
+		t.Fatalf("WaitScratchBudget should have blocked when in-flight bytes hit ceiling!")
+	case <-time.After(50 * time.Millisecond):
+		// Expected to be blocked
+	}
+
+	// 4. Simulate S3 chunk upload completing and releasing 32 KB
+	chunkMgr.SubInFlightBytes(32 * 1024)
+
+	// 5. Worker should now unblock!
+	select {
+	case <-blockedChan:
+		// Successfully unblocked!
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("WaitScratchBudget failed to unblock after SubInFlightBytes released space!")
+	}
+}
+
+func TestS3RecompositionAbortOnFailure(t *testing.T) {
+	mockS3 := NewMockS3Server("abort-bucket")
+	defer mockS3.Close()
+
+	s3Config := S3Config{
+		Endpoint:     mockS3.URL(),
+		Bucket:       "abort-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    32 * 1024,
+	}
+
+	backend, err := NewS3StorageBackend(s3Config)
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	ctx := context.Background()
+	key := "abort_test.mp4"
+	chunkData := make([]byte, 32*1024)
+
+	// Upload 2 chunks
+	_ = backend.UploadChunk(ctx, key, 0, bytes.NewReader(chunkData), int64(len(chunkData)))
+	_ = backend.UploadChunk(ctx, key, 1, bytes.NewReader(chunkData), int64(len(chunkData)))
+
+	// Inject error on part 2 UploadPartCopy: simulate S3 500 error
+	// The path in mock S3 for UploadPartCopy is "/abort-bucket/vod/abort_test.mp4"
+	mockS3.FailureCodes["/abort-bucket/vod/"+key] = http.StatusInternalServerError
+
+	meta := FileMeta{
+		URL:         "http://example.com/test.mp4",
+		TotalSize:   64 * 1024,
+		ContentType: "video/mp4",
+	}
+
+	err = backend.Recompose(ctx, key, 2, meta)
+	if err == nil {
+		t.Fatalf("Expected Recompose to fail due to injected error")
+	}
+
+	// Verify that the multipart upload was cleanly aborted and did NOT leak!
+	if mockS3.ActiveUploads() != 0 {
+		t.Errorf("Expected 0 active multipart uploads after recomposition failure, got %d", mockS3.ActiveUploads())
+	}
+}
+
+
 
