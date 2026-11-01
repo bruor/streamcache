@@ -156,7 +156,7 @@ func runStorageContractTest(t *testing.T, backend StorageBackend, prepareLocalFi
 }
 
 func TestLocalStorageBackend_Contract(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "sc2_local_storage_test_*")
+	tempDir, err := os.MkdirTemp("", "streamcache_local_storage_test_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestS3StorageBackend_Contract(t *testing.T) {
 	mockS3 := NewMockS3Server("test-bucket")
 	defer mockS3.Close()
 
-	tempDir, err := os.MkdirTemp("", "sc2_s3_storage_test_*")
+	tempDir, err := os.MkdirTemp("", "streamcache_s3_storage_test_*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestS3MultiViewerDisparateOffsets(t *testing.T) {
 
 	InitRegistry()
 
-	tempDir, err := os.MkdirTemp("", "sc2_multiviewer_*")
+	tempDir, err := os.MkdirTemp("", "streamcache_multiviewer_*")
 	if err != nil {
 		t.Fatalf("MkdirTemp error: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestS3RevalidationWithOrigin(t *testing.T) {
 		Completed:     true,
 	}
 
-	tempDir, err := os.MkdirTemp("", "sc2_reval_*")
+	tempDir, err := os.MkdirTemp("", "streamcache_reval_*")
 	if err != nil {
 		t.Fatalf("MkdirTemp error: %v", err)
 	}
@@ -567,7 +567,7 @@ func TestS3ViewerTransitionAcrossRecomposition(t *testing.T) {
 		fullData[i] = byte((i * 17) % 256)
 	}
 
-	tempDir, err := os.MkdirTemp("", "sc2_transition_*")
+	tempDir, err := os.MkdirTemp("", "streamcache_transition_*")
 	if err != nil {
 		t.Fatalf("MkdirTemp error: %v", err)
 	}
@@ -780,7 +780,7 @@ func TestS3SmallFileSinglePutObject(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	tempDir, err := os.MkdirTemp("", "sc2_small_*")
+	tempDir, err := os.MkdirTemp("", "streamcache_small_*")
 	if err != nil {
 		t.Fatalf("MkdirTemp error: %v", err)
 	}
@@ -837,7 +837,7 @@ func TestS3SmallFileSinglePutObject(t *testing.T) {
 }
 
 func TestS3HolePunchingAndBlockDeallocation(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "sc2_punch_*")
+	tempDir, err := os.MkdirTemp("", "streamcache_punch_*")
 	if err != nil {
 		t.Fatalf("MkdirTemp error: %v", err)
 	}
@@ -911,7 +911,7 @@ func TestS3BackpressureScratchBudget(t *testing.T) {
 		t.Fatalf("NewS3StorageBackend error: %v", err)
 	}
 
-	tempDir, err := os.MkdirTemp("", "sc2_bp_*")
+	tempDir, err := os.MkdirTemp("", "streamcache_bp_*")
 	if err != nil {
 		t.Fatalf("MkdirTemp error: %v", err)
 	}

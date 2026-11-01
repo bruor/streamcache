@@ -1,7 +1,7 @@
 services:
   streamcache:
     build:
-      context: https://${GITHUB_TOKEN}@github.com/bruor/GoStreamCache.git#main
+      context: https://${GITHUB_TOKEN}@github.com/bruor/streamcache.git#main
     container_name: streamcache
     restart: unless-stopped
     ports:
@@ -57,7 +57,7 @@ services:
       - UPSTREAM_USER_AGENT=VLC/3.0.20 LibVLC/3.0.20
       
       # Option to restrict domains allowed through the proxy (comma-separated list)
-      # - ALLOWED_HOSTS=infinity.gives
+      # - ALLOWED_HOSTS=cdn.example.com
       
       # Enable verbose per-packet scheduler trace logging for debugging (default: false)
       # - LOG_VERBOSE=true

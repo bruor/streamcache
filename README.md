@@ -1,6 +1,6 @@
-# Streamcache (SC2) - VOD Caching Proxy
+# streamcache - VOD Caching Proxy
 
-Streamcache is a high-performance HTTP proxy written in Go, specifically designed to optimize Video On Demand (VOD) streaming (such as IPTV streams, large video assets, and static media files). 
+streamcache is a high-performance HTTP proxy written in Go, specifically designed to optimize Video On Demand (VOD) streaming (such as IPTV streams, large video assets, and static media files). 
 
 It dynamically proxies video requests, downloads and caches content on-demand using a high-precision **blockless continuous byte-range engine**, handles byte-range seeking requests with sub-20ms TTFB, and implements automated cache eviction, container metadata prefetching, and upstream revalidation.
 
@@ -9,7 +9,7 @@ It dynamically proxies video requests, downloads and caches content on-demand us
 ## 🚀 Key Features
 
 - **On-Demand Caching & Non-Blocking Commits**: Media files are cached on-demand when requested by a client. Once triggered, the proxy downloads the media in parallel to guarantee a complete local copy. Upon completion, file finalization (`.part` to final cache filename) occurs instantly via non-blocking atomic rename (<1ms) without hardware storage barriers (`fsync`), ensuring concurrent downloads run smoothly with zero freezes. Upstream CDN bandwidth is saved by deduplicating concurrent and subsequent requests for the same media file.
-- **Continuous Byte-Range Streaming & Sub-20ms TTFB**: Unlike legacy chunked proxies that force players to wait seconds for full 4MB blocks to buffer, Streamcache streams upstream data to disk in 128KB network slices with instant client wakeups. Clients begin playing within milliseconds of the first byte arriving.
+- **Continuous Byte-Range Streaming & Sub-20ms TTFB**: Unlike legacy chunked proxies that force players to wait seconds for full 4MB blocks to buffer, streamcache streams upstream data to disk in 128KB network slices with instant client wakeups. Clients begin playing within milliseconds of the first byte arriving.
 - **Multi-Worker State Synchronization & Starvation Scheduling**: The proxy coordinates media downloads across multiple parallel workers (configured via `MAX_UPSTREAM_WORKERS`). If a player seeks to a different part of the video, the coordinator instantly shifts priority by spawning or pre-empting download workers to satisfy the starved offset first:
   - *Collision Leapfrogging & Gap Backfill*: Worker threads that reach already-cached data automatically leapfrog over completed intervals to the next un-downloaded gap. When downstream ranges finish, workers automatically backfill earlier skipped gaps until the media file is 100% complete.
   - *Client Hydration Wait*: If an active worker is already streaming toward a starved offset and its estimated time of arrival (ETA) is under `CLIENT_HYDRATION_WAIT` (default `2s`), the proxy suppresses spawning new connections, conserving valuable upstream network sessions.
@@ -43,7 +43,7 @@ It dynamically proxies video requests, downloads and caches content on-demand us
 
 ## ⚙️ Configuration Guide
 
-Streamcache is configured using environment variables. Default fallback values are designed for local development.
+streamcache is configured using environment variables. Default fallback values are designed for local development.
 
 | Environment Variable | Default | Description |
 |---|---|---|
@@ -124,7 +124,7 @@ If you configure Docker Compose to pull the codebase directly from the remote pr
 
 ## 📺 How to Use the Proxy
 
-Once Streamcache is running, you can stream media by pointing your video players (e.g. VLC, MPV, Kodi, TiviMate, or HTML5 player) to the proxy using either of the routing methods:
+Once streamcache is running, you can stream media by pointing your video players (e.g. VLC, MPV, Kodi, TiviMate, or HTML5 player) to the proxy using either of the routing methods:
 
 ### Method A: Query Parameter Routing
 Append the full, URL-encoded video URL to the `/stream` endpoint:
