@@ -1,7 +1,7 @@
 services:
   streamcache:
     build:
-      context: https://${GITHUB_TOKEN}@github.com/bruor/streamcache.git#main
+      context: https://github.com/bruor/streamcache.git#main
     container_name: streamcache
     restart: unless-stopped
     ports:
