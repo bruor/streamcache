@@ -32,6 +32,7 @@ func StartServer() {
 	mux.HandleFunc("/dashboard/sse", handleSSE)
 	mux.HandleFunc("/api/version", handleAPIVersion)
 	mux.HandleFunc("/api/hydration/cancel", handleCancelHydration)
+	mux.HandleFunc("/api/sessions", handleAPISessions)
 
 	// Live Diagnostics Suite
 	mux.HandleFunc("/debug/state", handleDebugState)
@@ -51,6 +52,11 @@ func StartServer() {
 var globalConnIDSeq uint64
 
 func handleMediaStream(w http.ResponseWriter, r *http.Request) {
+	username := r.URL.Query().Get("user")
+	if username == "" {
+		username = r.URL.Query().Get("username")
+	}
+
 	var targetURL string
 
 	// 1. Resolve target VOD URL
@@ -166,6 +172,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					URL:            targetURL,
 					RemoteAddr:     remoteAddr,
 					UserAgent:      userAgent,
+					Username:       username,
 					Offset:         startOffset,
 					StartOffset:    startOffset,
 					TotalSize:      totalSize,
@@ -391,6 +398,32 @@ func handleAPIVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Expires", "0")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"version": ServerInstanceID,
+	})
+}
+
+func handleAPISessions(w http.ResponseWriter, r *http.Request) {
+	userFilter := r.URL.Query().Get("user")
+	if userFilter == "" {
+		userFilter = r.URL.Query().Get("username")
+	}
+
+	activeSessions := GlobalRegistry.GetActiveSessions()
+	filtered := make([]ClientSession, 0)
+	for _, session := range activeSessions {
+		if userFilter != "" {
+			if strings.EqualFold(session.Username, userFilter) {
+				filtered = append(filtered, session)
+			}
+		} else {
+			filtered = append(filtered, session)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"count":    len(filtered),
+		"user":     userFilter,
+		"sessions": filtered,
 	})
 }
 

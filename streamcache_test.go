@@ -3972,6 +3972,177 @@ func TestSeekForward_SingleWorker(t *testing.T) {
 	}
 }
 
+func TestUserAttributionAndAPISessions(t *testing.T) {
+	GlobalRegistry.Lock.Lock()
+	oldConnections := GlobalRegistry.Connections
+	oldSessions := GlobalRegistry.Sessions
+	GlobalRegistry.Connections = make(map[string]*ClientConnection)
+	GlobalRegistry.Sessions = make(map[string]*ClientSession)
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Connections = oldConnections
+		GlobalRegistry.Sessions = oldSessions
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	key := "test_user_video.mp4"
+	url := "http://example.com/test_user_video.mp4"
+	ip := "192.168.1.50:11111"
+	ua := "VLC/3.0.18"
+
+	// 1. Connection with username creates session with username
+	conn1 := &ClientConnection{
+		ID:          "conn-user-1",
+		Key:         key,
+		URL:         url,
+		RemoteAddr:  ip,
+		UserAgent:   ua,
+		Username:    "alice",
+		Offset:      1000,
+		StartOffset: 1000,
+		TotalSize:   50000000,
+		StartTime:   time.Now().Unix(),
+		InCache:     true,
+	}
+	GlobalRegistry.RegisterConnection("conn-user-1", conn1)
+
+	sessions := GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("Expected 1 session, got %d", len(sessions))
+	}
+	if sessions[0].Username != "alice" {
+		t.Errorf("Expected session username 'alice', got %q", sessions[0].Username)
+	}
+
+	// 2. Matching existing session updates/sets username
+	conn2 := &ClientConnection{
+		ID:          "conn-user-2",
+		Key:         key,
+		URL:         url,
+		RemoteAddr:  "192.168.1.50:22222",
+		UserAgent:   ua,
+		Username:    "alice_updated",
+		Offset:      2000,
+		StartOffset: 2000,
+		TotalSize:   50000000,
+		StartTime:   time.Now().Unix(),
+		InCache:     true,
+	}
+	GlobalRegistry.RegisterConnection("conn-user-2", conn2)
+
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("Expected 1 grouped session, got %d", len(sessions))
+	}
+	if sessions[0].Username != "alice_updated" {
+		t.Errorf("Expected updated session username 'alice_updated', got %q", sessions[0].Username)
+	}
+
+	// 3. 120-second sliding idle lease
+	GlobalRegistry.UnregisterConnection("conn-user-1")
+	GlobalRegistry.UnregisterConnection("conn-user-2")
+
+	// Set LastActive to 90 seconds ago (should remain active because < 120s and MaxOffset > 0)
+	GlobalRegistry.Lock.Lock()
+	sess := GlobalRegistry.Sessions["conn-user-1"]
+	sess.LastActive = time.Now().Add(-90 * time.Second)
+	GlobalRegistry.Lock.Unlock()
+
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("Expected session to remain active at 90s idle (< 120s), got %d sessions", len(sessions))
+	}
+
+	// Set LastActive to 125 seconds ago (should be purged after 120s)
+	GlobalRegistry.Lock.Lock()
+	sess.LastActive = time.Now().Add(-125 * time.Second)
+	GlobalRegistry.Lock.Unlock()
+
+	sessions = GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 0 {
+		t.Fatalf("Expected session to be purged at 125s idle (> 120s), got %d sessions", len(sessions))
+	}
+
+	// 4. Test /api/sessions endpoint handler
+	connBob := &ClientConnection{
+		ID:          "conn-bob",
+		Key:         key,
+		URL:         url,
+		RemoteAddr:  "192.168.1.60:33333",
+		UserAgent:   ua,
+		Username:    "bob",
+		Offset:      5000,
+		StartOffset: 5000,
+		TotalSize:   50000000,
+		StartTime:   time.Now().Unix(),
+		InCache:     true,
+	}
+	connCharlie := &ClientConnection{
+		ID:          "conn-charlie",
+		Key:         "other_video.mp4",
+		URL:         "http://example.com/other_video.mp4",
+		RemoteAddr:  "192.168.1.70:44444",
+		UserAgent:   ua,
+		Username:    "charlie",
+		Offset:      5000,
+		StartOffset: 5000,
+		TotalSize:   50000000,
+		StartTime:   time.Now().Unix(),
+		InCache:     true,
+	}
+	GlobalRegistry.RegisterConnection("conn-bob", connBob)
+	GlobalRegistry.RegisterConnection("conn-charlie", connCharlie)
+
+	// Test all sessions
+	reqAll, _ := http.NewRequest("GET", "/api/sessions", nil)
+	rrAll := httptest.NewRecorder()
+	handleAPISessions(rrAll, reqAll)
+
+	if rrAll.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK from /api/sessions, got %d", rrAll.Code)
+	}
+	if ct := rrAll.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Expected Content-Type application/json, got %q", ct)
+	}
+
+	var respAll struct {
+		Count    int             `json:"count"`
+		User     string          `json:"user"`
+		Sessions []ClientSession `json:"sessions"`
+	}
+	if err := json.Unmarshal(rrAll.Body.Bytes(), &respAll); err != nil {
+		t.Fatalf("Failed to parse /api/sessions response: %v", err)
+	}
+	if respAll.Count != 2 || len(respAll.Sessions) != 2 {
+		t.Errorf("Expected 2 sessions in /api/sessions, got count=%d, len=%d", respAll.Count, len(respAll.Sessions))
+	}
+
+	// Test filter by user case-insensitive
+	reqFilter, _ := http.NewRequest("GET", "/api/sessions?user=BOB", nil)
+	rrFilter := httptest.NewRecorder()
+	handleAPISessions(rrFilter, reqFilter)
+
+	var respFilter struct {
+		Count    int             `json:"count"`
+		User     string          `json:"user"`
+		Sessions []ClientSession `json:"sessions"`
+	}
+	if err := json.Unmarshal(rrFilter.Body.Bytes(), &respFilter); err != nil {
+		t.Fatalf("Failed to parse filtered response: %v", err)
+	}
+	if respFilter.Count != 1 || len(respFilter.Sessions) != 1 {
+		t.Fatalf("Expected 1 filtered session for BOB, got %d", respFilter.Count)
+	}
+	if respFilter.Sessions[0].Username != "bob" {
+		t.Errorf("Expected session username 'bob', got %q", respFilter.Sessions[0].Username)
+	}
+	if respFilter.User != "BOB" {
+		t.Errorf("Expected response user 'BOB', got %q", respFilter.User)
+	}
+}
+
 
 
 

@@ -42,10 +42,14 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 	clientID := fmt.Sprintf("client-%d", atomic.AddUint64(&globalClientIDSeq, 1))
 	state.Clients[clientID] = make(chan struct{}, 1)
 
-	var remoteAddr, userAgent string
+	var remoteAddr, userAgent, username string
 	if req != nil {
 		remoteAddr = req.RemoteAddr
 		userAgent = req.Header.Get("User-Agent")
+		username = req.URL.Query().Get("user")
+		if username == "" {
+			username = req.URL.Query().Get("username")
+		}
 	}
 	if userAgent == "" {
 		userAgent = "Unknown"
@@ -74,6 +78,7 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		URL:            url,
 		RemoteAddr:     remoteAddr,
 		UserAgent:      userAgent,
+		Username:       username,
 		Offset:         startOffset,
 		StartOffset:    startOffset,
 		TotalSize:      totalSize,

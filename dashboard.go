@@ -174,6 +174,7 @@ func buildStatePayload() ([]byte, error) {
 		Offset     int64  `json:"offset"`
 		RemoteAddr string `json:"remote_addr"`
 		UserAgent  string `json:"user_agent"`
+		Username   string `json:"username,omitempty"`
 		IsStarving bool   `json:"is_starving"`
 	}
 
@@ -232,6 +233,7 @@ func buildStatePayload() ([]byte, error) {
 					Offset:     sess.Offset,
 					RemoteAddr: sess.RemoteAddr,
 					UserAgent:  sess.UserAgent,
+					Username:   sess.Username,
 					IsStarving: sess.StarvingOffset != -1,
 				})
 			}

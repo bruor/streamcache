@@ -31,6 +31,7 @@ type ClientConnection struct {
 	URL            string `json:"url"`
 	RemoteAddr     string `json:"remote_addr"`
 	UserAgent      string `json:"user_agent"`
+	Username       string `json:"username,omitempty"`
 	Offset         int64  `json:"offset"`
 	StartOffset    int64  `json:"start_offset"`
 	TotalSize      int64  `json:"total_size"`
@@ -45,6 +46,7 @@ type ClientSession struct {
 	URL            string                      `json:"url"`
 	RemoteAddr     string                      `json:"remote_addr"`
 	UserAgent      string                      `json:"user_agent"`
+	Username       string                      `json:"username,omitempty"`
 	Offset         int64                       `json:"offset"`
 	MaxOffset      int64                       `json:"max_offset"`
 	TotalSize      int64                       `json:"total_size"`
@@ -505,6 +507,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		}
 		matchedSession.ActiveConns = len(matchedSession.Conns)
 		matchedSession.LastActive = time.Now()
+		matchedSession.Username = conn.Username
 
 		isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-10*1024*1024
 		wasNotPreceded := matchedSession.MaxOffset < conn.TotalSize-15*1024*1024
@@ -540,6 +543,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 			URL:            conn.URL,
 			RemoteAddr:     conn.RemoteAddr,
 			UserAgent:      conn.UserAgent,
+			Username:       conn.Username,
 			Offset:         conn.Offset,
 			MaxOffset:      initialMaxOffset,
 			TotalSize:      conn.TotalSize,
@@ -681,6 +685,7 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 								URL:            cc.URL,
 								RemoteAddr:     cc.RemoteAddr,
 								UserAgent:      cc.UserAgent,
+								Username:       cc.Username,
 								Offset:         cc.Offset,
 								MaxOffset:      initialMaxOffset,
 								TotalSize:      cc.TotalSize,
@@ -736,7 +741,7 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 		}
 
 		for id, session := range r.Sessions {
-			if session.ActiveConns == 0 && now.Sub(session.LastActive) > 60*time.Second {
+			if session.ActiveConns == 0 && now.Sub(session.LastActive) > 120*time.Second {
 				delete(r.Sessions, id)
 			}
 		}
@@ -745,11 +750,9 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 	var list []ClientSession
 	if r.Sessions != nil {
 		for _, session := range r.Sessions {
-			// Filter out pure probes: sessions with no non-probe connections and no play history
-			if session.MaxOffset == 0 && session.ActiveConns == 0 {
-				continue
+			if session.ActiveConns > 0 || (now.Sub(session.LastActive) < 120*time.Second && session.MaxOffset > 0) {
+				list = append(list, *session)
 			}
-			list = append(list, *session)
 		}
 	}
 	return list
