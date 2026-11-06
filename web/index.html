@@ -1233,7 +1233,7 @@
                         const cp = fileData.client_positions[i];
                         const cpX = (cp.offset / total) * rect.width;
                         if (Math.abs(cpX - x) <= 8) {
-                            text += ` | Playback: ${cp.id} (${cp.remote_addr})${cp.is_starving ? ' [STARVING]' : ''}`;
+                            text += ` | Playback: ${cp.id} (${cp.remote_addr})${cp.username ? ` [${cp.username}]` : ''}${cp.is_starving ? ' [STARVING]' : ''}`;
                             break;
                         }
                     }
@@ -1549,7 +1549,7 @@
                     <div class="connection-grid">
                         <div class="connection-metric-card">
                             <span class="connection-metric-label">IP Address</span>
-                            <span class="connection-metric-value">${conn.remote_addr}</span>
+                            <span class="connection-metric-value">${conn.remote_addr} ${conn.username ? `<span class="user-badge" style="color: #60a5fa; font-weight: 600;">(${conn.username})</span>` : ''}</span>
                         </div>
                         <div class="connection-metric-card">
                             <span class="connection-metric-label">User Agent</span>
