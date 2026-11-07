@@ -1678,20 +1678,26 @@
                 const minDiskText = minDiskFree > 0 ? ` (${formatBytes(minDiskFree)} Reserved)` : '';
                 topbarDiskText.innerText = `Disk Free: ${formatBytes(diskFree)}${minDiskText}`;
 
-                if (data.provider_capacity && data.provider_capacity.status === 'ok') {
+                if (data.provider_capacity) {
                     const cap = data.provider_capacity;
                     const provPill = document.getElementById('provider-capacity-pill');
                     const provText = document.getElementById('topbar-provider-text');
                     const provAvail = document.getElementById('topbar-provider-avail-text');
                     if (provPill && provText && provAvail) {
                         provPill.style.display = 'flex';
-                        const maxStr = cap.total_max_streams >= 999 ? 'Unlimited' : cap.total_max_streams;
-                        provText.innerText = `Providers: ${cap.total_active_streams} / ${maxStr} slots`;
-                        provAvail.innerText = `Available: ${cap.total_available_streams}`;
-                        if (cap.total_available_streams <= 1) {
-                            provAvail.style.color = 'var(--accent-orange)';
+                        if (cap.status === 'ok') {
+                            const maxStr = cap.total_max_streams >= 999 ? 'Unlimited' : cap.total_max_streams;
+                            provText.innerText = `Providers: ${cap.total_active_streams} / ${maxStr} slots`;
+                            provAvail.innerText = `Available: ${cap.total_available_streams}`;
+                            if (cap.total_available_streams <= 1) {
+                                provAvail.style.color = 'var(--accent-orange)';
+                            } else {
+                                provAvail.style.color = 'var(--accent-green)';
+                            }
                         } else {
-                            provAvail.style.color = 'var(--accent-green)';
+                            provText.innerText = 'Providers: Offline';
+                            provAvail.innerText = cap.error || 'Unavailable';
+                            provAvail.style.color = 'var(--accent-orange)';
                         }
                     }
                 }
