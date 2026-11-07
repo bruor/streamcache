@@ -200,6 +200,8 @@ func buildStatePayload() ([]byte, error) {
 		UpstreamUserAgent  string         `json:"upstream_user_agent"`
 		IsPrehydrating     bool           `json:"is_prehydrating"`
 		IsYielding         bool           `json:"is_yielding"`
+		QueuedPrehydrations int           `json:"queued_prehydrations"`
+		NextURLs           []string       `json:"next_urls,omitempty"`
 	}
 
 	var activeFiles []sseFile
@@ -289,6 +291,8 @@ func buildStatePayload() ([]byte, error) {
 			UpstreamUserAgent:  effectiveUA,
 			IsPrehydrating:     fileState.IsPrehydrating,
 			IsYielding:         fileState.IsYielding,
+			QueuedPrehydrations: len(fileState.NextURLs),
+			NextURLs:           append([]string(nil), fileState.NextURLs...),
 		})
 		fileState.Lock.Unlock()
 	}

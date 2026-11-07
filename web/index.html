@@ -1339,6 +1339,12 @@
                             <span class="download-meta-label">Downloaded</span>
                             <span class="download-meta-value">${formatBytes(downloaded)}</span>
                         </div>
+                        ${(fileData.queued_prehydrations && fileData.queued_prehydrations > 0) ? `
+                        <div class="download-meta-card" title="${(fileData.next_urls || []).join('\n')}">
+                            <span class="download-meta-label">Prehydrations Queued</span>
+                            <span class="download-meta-value" style="color: var(--accent-secondary); font-weight: 600;">${fileData.queued_prehydrations}</span>
+                        </div>
+                        ` : ''}
                         <div class="download-meta-card">
                             <span class="download-meta-label">Upstream Workers</span>
                             <span class="download-meta-value" style="color: var(--accent-cyan); font-weight: 600;">${fileData.active_workers || 1} / ${fileData.max_workers || 2}</span>
@@ -1409,7 +1415,9 @@
                         observed_cooldown: file.observed_cooldown,
                         upstream_user_agent: file.upstream_user_agent,
                         is_prehydrating: file.is_prehydrating,
-                        is_yielding: file.is_yielding
+                        is_yielding: file.is_yielding,
+                        queued_prehydrations: file.queued_prehydrations || 0,
+                        next_urls: file.next_urls || []
                     };
                     fileStore[file.key] = fileData;
                 } else {
@@ -1430,6 +1438,8 @@
                     fileData.upstream_user_agent = file.upstream_user_agent;
                     fileData.is_prehydrating = file.is_prehydrating;
                     fileData.is_yielding = file.is_yielding;
+                    fileData.queued_prehydrations = file.queued_prehydrations || 0;
+                    fileData.next_urls = file.next_urls || [];
                 }
                 
                 let card = document.getElementById(`download-card-${file.key}`);
