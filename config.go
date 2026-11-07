@@ -30,12 +30,12 @@ type Config struct {
 	StarvationStallTimeout  time.Duration
 	LogVerbose              bool
 	WritebackBufferSize     int64
-	DispatcharrURL              string
-	PrefetchCapacityReservation int
-	DispatcharrPollInterval     time.Duration
-	PrefetchYieldBackoff        time.Duration
-	EvictYieldedParts           bool
-	EnableEpisodePrefetch       bool
+	DispatcharrURL                string
+	PrehydrateCapacityReservation int
+	DispatcharrPollInterval       time.Duration
+	PrehydrateYieldBackoff        time.Duration
+	EvictYieldedParts             bool
+	EnableEpisodePrehydration     bool
 }
 
 func (c *Config) Lock() {
@@ -296,25 +296,33 @@ func (c *Config) SetDispatcharrURL(val string) {
 	c.DispatcharrURL = val
 }
 
-func (c *Config) GetPrefetchCapacityReservation() int {
+func (c *Config) GetPrehydrateCapacityReservation() int {
 	if c == nil {
 		return 1
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.PrefetchCapacityReservation <= 0 {
+	if c.PrehydrateCapacityReservation <= 0 {
 		return 1
 	}
-	return c.PrefetchCapacityReservation
+	return c.PrehydrateCapacityReservation
 }
 
-func (c *Config) SetPrefetchCapacityReservation(val int) {
+func (c *Config) GetPrefetchCapacityReservation() int {
+	return c.GetPrehydrateCapacityReservation()
+}
+
+func (c *Config) SetPrehydrateCapacityReservation(val int) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.PrefetchCapacityReservation = val
+	c.PrehydrateCapacityReservation = val
+}
+
+func (c *Config) SetPrefetchCapacityReservation(val int) {
+	c.SetPrehydrateCapacityReservation(val)
 }
 
 func (c *Config) GetDispatcharrPollInterval() time.Duration {
@@ -329,16 +337,20 @@ func (c *Config) GetDispatcharrPollInterval() time.Duration {
 	return c.DispatcharrPollInterval
 }
 
-func (c *Config) GetPrefetchYieldBackoff() time.Duration {
+func (c *Config) GetPrehydrateYieldBackoff() time.Duration {
 	if c == nil {
 		return 30 * time.Second
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.PrefetchYieldBackoff <= 0 {
+	if c.PrehydrateYieldBackoff <= 0 {
 		return 30 * time.Second
 	}
-	return c.PrefetchYieldBackoff
+	return c.PrehydrateYieldBackoff
+}
+
+func (c *Config) GetPrefetchYieldBackoff() time.Duration {
+	return c.GetPrehydrateYieldBackoff()
 }
 
 func (c *Config) GetEvictYieldedParts() bool {
@@ -359,27 +371,35 @@ func (c *Config) SetEvictYieldedParts(val bool) {
 	c.EvictYieldedParts = val
 }
 
-func (c *Config) GetEnableEpisodePrefetch() bool {
+func (c *Config) GetEnableEpisodePrehydration() bool {
 	if c == nil {
 		return true
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.EnableEpisodePrefetch
+	return c.EnableEpisodePrehydration
 }
 
-func (c *Config) SetEnableEpisodePrefetch(val bool) {
+func (c *Config) GetEnableEpisodePrefetch() bool {
+	return c.GetEnableEpisodePrehydration()
+}
+
+func (c *Config) SetEnableEpisodePrehydration(val bool) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.EnableEpisodePrefetch = val
+	c.EnableEpisodePrehydration = val
+}
+
+func (c *Config) SetEnableEpisodePrefetch(val bool) {
+	c.SetEnableEpisodePrehydration(val)
 }
 
 var GlobalConfig *Config
 
-func LoadConfig() {
+func parseConfigFromEnv() *Config {
 	cfg := &Config{
 		Port:                    getEnv("PORT", ":8080"),
 		CacheDir:                getEnv("CACHE_DIR", "./cache/files"),
@@ -399,12 +419,12 @@ func LoadConfig() {
 		StarvationStallTimeout:  getEnvDuration("STARVATION_STALL_TIMEOUT", 30*time.Second),
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
-		DispatcharrURL:              getEnv("DISPATCHARR_URL", ""),
-		PrefetchCapacityReservation: getEnvInt("PREFETCH_CAPACITY_RESERVATION", 1),
-		DispatcharrPollInterval:     getEnvDuration("DISPATCHARR_POLL_INTERVAL", 5*time.Second),
-		PrefetchYieldBackoff:        getEnvDuration("PREFETCH_YIELD_BACKOFF", 30*time.Second),
-		EvictYieldedParts:           getEnvBool("EVICT_YIELDED_PARTS", false),
-		EnableEpisodePrefetch:       getEnvBool("ENABLE_EPISODE_PREFETCH", true),
+		DispatcharrURL:                getEnv("DISPATCHARR_URL", ""),
+		PrehydrateCapacityReservation: getEnvInt("PREHYDRATE_CAPACITY_RESERVATION", getEnvInt("PREFETCH_CAPACITY_RESERVATION", 1)),
+		DispatcharrPollInterval:       getEnvDuration("DISPATCHARR_POLL_INTERVAL", 5*time.Second),
+		PrehydrateYieldBackoff:        getEnvDuration("PREHYDRATE_YIELD_BACKOFF", getEnvDuration("PREFETCH_YIELD_BACKOFF", 30*time.Second)),
+		EvictYieldedParts:             getEnvBool("EVICT_YIELDED_PARTS", false),
+		EnableEpisodePrehydration:     getEnvBool("ENABLE_EPISODE_PREHYDRATION", getEnvBool("ENABLE_EPISODE_PREFETCH", true)),
 	}
 
 	// Format port if missing colon
@@ -423,7 +443,11 @@ func LoadConfig() {
 			}
 		}
 	}
+	return cfg
+}
 
+func LoadConfig() {
+	cfg := parseConfigFromEnv()
 	GlobalConfig = cfg
 	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
 		cfg.Port,

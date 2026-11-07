@@ -208,16 +208,16 @@ func (pm *PrehydrationManager) pollLoop() {
 }
 
 // CanStartPrehydration determines if spare capacity exists to launch a new prehydration worker.
-// Requires available_streams >= PREFETCH_CAPACITY_RESERVATION + 1 so that after claiming 1 slot,
-// at least PREFETCH_CAPACITY_RESERVATION slots remain free for live viewers.
+// Requires available_streams >= PREHYDRATE_CAPACITY_RESERVATION + 1 so that after claiming 1 slot,
+// at least PREHYDRATE_CAPACITY_RESERVATION slots remain free for live viewers.
 func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
-	if GlobalConfig != nil && !GlobalConfig.GetEnableEpisodePrefetch() {
+	if GlobalConfig != nil && !GlobalConfig.GetEnableEpisodePrehydration() {
 		return false
 	}
 
 	reservation := 1
 	if GlobalConfig != nil {
-		reservation = GlobalConfig.GetPrefetchCapacityReservation()
+		reservation = GlobalConfig.GetPrehydrateCapacityReservation()
 	}
 
 	pm.mu.RLock()
@@ -249,7 +249,7 @@ func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
 func (pm *PrehydrationManager) ShouldYieldPrehydration(targetURL string) bool {
 	reservation := 1
 	if GlobalConfig != nil {
-		reservation = GlobalConfig.GetPrefetchCapacityReservation()
+		reservation = GlobalConfig.GetPrehydrateCapacityReservation()
 	}
 
 	pm.mu.RLock()
@@ -272,7 +272,7 @@ func (pm *PrehydrationManager) ShouldYieldPrehydration(targetURL string) bool {
 func (pm *PrehydrationManager) checkYieldConditions() {
 	reservation := 1
 	if GlobalConfig != nil {
-		reservation = GlobalConfig.GetPrefetchCapacityReservation()
+		reservation = GlobalConfig.GetPrehydrateCapacityReservation()
 	}
 
 	pm.mu.RLock()
@@ -319,7 +319,7 @@ func (pm *PrehydrationManager) YieldState(state *FileCacheState, reason string) 
 	state.IsYielding = true
 	backoff := 30 * time.Second
 	if GlobalConfig != nil {
-		backoff = GlobalConfig.GetPrefetchYieldBackoff()
+		backoff = GlobalConfig.GetPrehydrateYieldBackoff()
 	}
 	state.YieldCooldownUntil = time.Now().Add(backoff)
 	state.WriterActive = false
@@ -571,7 +571,7 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 		metaPath := cacheFilePath + ".json"
 		backoff := 30 * time.Second
 		if GlobalConfig != nil {
-			backoff = GlobalConfig.GetPrefetchYieldBackoff()
+			backoff = GlobalConfig.GetPrehydrateYieldBackoff()
 		}
 
 		GlobalRegistry.Lock.Lock()

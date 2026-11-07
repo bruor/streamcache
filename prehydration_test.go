@@ -12,13 +12,13 @@ import (
 )
 
 func TestPrehydrationCapacityThresholds(t *testing.T) {
-	oldRes := GlobalConfig.GetPrefetchCapacityReservation()
-	oldPrefetch := GlobalConfig.GetEnableEpisodePrefetch()
-	GlobalConfig.SetPrefetchCapacityReservation(1)
-	GlobalConfig.SetEnableEpisodePrefetch(true)
+	oldRes := GlobalConfig.GetPrehydrateCapacityReservation()
+	oldPrefetch := GlobalConfig.GetEnableEpisodePrehydration()
+	GlobalConfig.SetPrehydrateCapacityReservation(1)
+	GlobalConfig.SetEnableEpisodePrehydration(true)
 	defer func() {
-		GlobalConfig.SetPrefetchCapacityReservation(oldRes)
-		GlobalConfig.SetEnableEpisodePrefetch(oldPrefetch)
+		GlobalConfig.SetPrehydrateCapacityReservation(oldRes)
+		GlobalConfig.SetEnableEpisodePrehydration(oldPrefetch)
 	}()
 
 	pm := &PrehydrationManager{
@@ -302,4 +302,46 @@ func TestStasharrCapacityPollIntegration(t *testing.T) {
 	if rep.TotalMaxStreams != 4 || rep.TotalActiveStreams != 1 || rep.TotalAvailableStreams != 3 {
 		t.Fatalf("Unexpected capacity numbers: %+v", rep)
 	}
+}
+
+func TestPrehydrationConfigEnvFallbacks(t *testing.T) {
+	// Test fallback from legacy PREFETCH_* to PREHYDRATE_*
+	os.Setenv("PREFETCH_CAPACITY_RESERVATION", "3")
+	os.Setenv("PREFETCH_YIELD_BACKOFF", "45s")
+	os.Setenv("ENABLE_EPISODE_PREFETCH", "false")
+	cfgFallback := parseConfigFromEnv()
+
+	if cfgFallback.GetPrehydrateCapacityReservation() != 3 {
+		t.Fatalf("Expected fallback capacity reservation 3, got %d", cfgFallback.GetPrehydrateCapacityReservation())
+	}
+	if cfgFallback.GetPrehydrateYieldBackoff() != 45*time.Second {
+		t.Fatalf("Expected fallback yield backoff 45s, got %v", cfgFallback.GetPrehydrateYieldBackoff())
+	}
+	if cfgFallback.GetEnableEpisodePrehydration() != false {
+		t.Fatalf("Expected fallback enable prehydration false, got %v", cfgFallback.GetEnableEpisodePrehydration())
+	}
+
+	// Test primary PREHYDRATE_* overrides PREFETCH_*
+	os.Setenv("PREHYDRATE_CAPACITY_RESERVATION", "2")
+	os.Setenv("PREHYDRATE_YIELD_BACKOFF", "15s")
+	os.Setenv("ENABLE_EPISODE_PREHYDRATION", "true")
+	cfgPrimary := parseConfigFromEnv()
+
+	if cfgPrimary.GetPrehydrateCapacityReservation() != 2 {
+		t.Fatalf("Expected primary capacity reservation 2, got %d", cfgPrimary.GetPrehydrateCapacityReservation())
+	}
+	if cfgPrimary.GetPrehydrateYieldBackoff() != 15*time.Second {
+		t.Fatalf("Expected primary yield backoff 15s, got %v", cfgPrimary.GetPrehydrateYieldBackoff())
+	}
+	if cfgPrimary.GetEnableEpisodePrehydration() != true {
+		t.Fatalf("Expected primary enable prehydration true, got %v", cfgPrimary.GetEnableEpisodePrehydration())
+	}
+
+	// Clean up
+	os.Unsetenv("PREFETCH_CAPACITY_RESERVATION")
+	os.Unsetenv("PREFETCH_YIELD_BACKOFF")
+	os.Unsetenv("ENABLE_EPISODE_PREFETCH")
+	os.Unsetenv("PREHYDRATE_CAPACITY_RESERVATION")
+	os.Unsetenv("PREHYDRATE_YIELD_BACKOFF")
+	os.Unsetenv("ENABLE_EPISODE_PREHYDRATION")
 }

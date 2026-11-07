@@ -59,6 +59,13 @@ services:
       # Option to restrict domains allowed through the proxy (comma-separated list)
       # - ALLOWED_HOSTS=cdn.example.com
       
+      # Capacity-Aware Episode Prehydration Configs
+      # - DISPATCHARR_URL=http://dispatcharr:9191
+      # - PREHYDRATE_CAPACITY_RESERVATION=1
+      # - PREHYDRATE_YIELD_BACKOFF=30s
+      # - EVICT_YIELDED_PARTS=false
+      # - ENABLE_EPISODE_PREHYDRATION=true
+
       # Enable verbose per-packet scheduler trace logging for debugging (default: false)
       # - LOG_VERBOSE=true
 

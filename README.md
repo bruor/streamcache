@@ -66,6 +66,11 @@ streamcache is configured using environment variables. Default fallback values a
 | `UPSTREAM_USER_AGENT` | `VLC/3.0.20 LibVLC/3.0.20` | Upstream User-Agent string sent to CDNs when spoofing or fallback is applied. |
 | `WRITEBACK_BUFFER_SIZE` | `64MB` | Size of the in-memory writeback ring buffer and LiveBuffer sliding window (bounds: `16MB` to `256MB`). Decouples upstream network ingestion from storage I/O, speeds up live-edge playback directly from RAM, and paces asynchronous kernel writebacks without stalling concurrent downloads. |
 | `LOG_VERBOSE` | `false` | Enable verbose per-packet scheduler trace logging for debugging. When `false`, suppresses routine in-flight check noise. |
+| `DISPATCHARR_URL` | *(empty)* | Base URL of Dispatcharr (e.g. `http://dispatcharr:9191`). Enables real-time capacity polling via Stasharr (`/plugins/stasharr/provider-capacity`). |
+| `PREHYDRATE_CAPACITY_RESERVATION` | `1` | Number of free provider stream slots to reserve strictly for live human viewers. Background prehydration will not start unless `available >= reservation + 1`, and will yield if `available < reservation`. *(Alias: `PREFETCH_CAPACITY_RESERVATION`)* |
+| `PREHYDRATE_YIELD_BACKOFF` | `30s` | Stabilization cooldown duration applied when prehydration yields to protect providers from rapid socket churn. *(Alias: `PREFETCH_YIELD_BACKOFF`)* |
+| `EVICT_YIELDED_PARTS` | `false` | Whether to delete `.part` files when a prehydration task yields. When `false` (default), partial downloads are preserved so prehydration resumes right where it left off. |
+| `ENABLE_EPISODE_PREHYDRATION` | `true` | Master toggle for background sequential episode prehydration via `&next_url=`. *(Alias: `ENABLE_EPISODE_PREFETCH`)* |
 
 ---
 

@@ -30,8 +30,8 @@ func TestMain(m *testing.M) {
 		SchedulerMinTime:        20 * time.Millisecond,
 		MaxUpstreamRetries:      8, // Cap retries in unit test harness to prevent infinite background retry loops on closed mock servers
 		MaxUpstreamWorkers:          2,
-		EnableEpisodePrefetch:       true,
-		PrefetchCapacityReservation: 1,
+		EnableEpisodePrehydration:     true,
+		PrehydrateCapacityReservation: 1,
 	}
 
 	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
