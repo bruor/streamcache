@@ -418,3 +418,62 @@ func TestServerMediaStreamNextURL(t *testing.T) {
 	}
 }
 
+func TestPrehydrationSpawnWorkerNoDeadlock(t *testing.T) {
+	// Create mock upstream HTTP server
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	defer mockUpstream.Close()
+
+	tmpDir := t.TempDir()
+	partPath := filepath.Join(tmpDir, "prehydrate_deadlock_test.mkv.part")
+	metaPath := filepath.Join(tmpDir, "prehydrate_deadlock_test.mkv.json")
+	cachePath := filepath.Join(tmpDir, "prehydrate_deadlock_test.mkv")
+
+	state := NewFileCacheState(
+		"prehydrate_deadlock_test.mkv",
+		mockUpstream.URL+"/test.mkv",
+		cachePath,
+		partPath,
+		metaPath,
+		"video/mp4",
+		"",
+		"",
+		1024,
+	)
+	state.IsPrehydrating = true
+
+	doneCh := make(chan struct{})
+	go func() {
+		StartCoordinator(state, make(http.Header))
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			state.Lock.Lock()
+			hasWriter := state.WriterActive
+			state.Lock.Unlock()
+			state.WorkersLock.Lock()
+			workerCount := len(state.ActiveWorkers)
+			state.WorkersLock.Unlock()
+			if hasWriter && workerCount >= 1 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		close(doneCh)
+	}()
+
+	select {
+	case <-doneCh:
+		// Success: StartCoordinator did not deadlock on state.WorkersLock
+	case <-time.After(3 * time.Second):
+		t.Fatal("StartCoordinator deadlocked when state.IsPrehydrating == true!")
+	}
+
+	CancelCoordinator(state)
+}
+
+
