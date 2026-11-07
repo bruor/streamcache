@@ -27,11 +27,17 @@ type Config struct {
 	UpstreamUserAgent       string
 	UpstreamUserAgentMode   string
 	MaxUpstreamRetries      int
-	StarvationStallTimeout  time.Duration
-	LogVerbose              bool
-	WritebackBufferSize     int64
-	StorageBackend         string
-	S3Config               S3Config
+	StarvationStallTimeout        time.Duration
+	LogVerbose                    bool
+	WritebackBufferSize           int64
+	StorageBackend                string
+	S3Config                      S3Config
+	DispatcharrURL                string
+	PrehydrateCapacityReservation int
+	DispatcharrPollInterval       time.Duration
+	PrehydrateYieldBackoff        time.Duration
+	EvictYieldedParts             bool
+	EnableEpisodePrehydration     bool
 }
 
 func (c *Config) Lock() {
@@ -328,9 +334,108 @@ func (c *Config) SetS3Config(s3Cfg S3Config) {
 	}
 }
 
+func (c *Config) GetDispatcharrURL() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.DispatcharrURL
+}
+
+func (c *Config) SetDispatcharrURL(val string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.DispatcharrURL = val
+}
+
+func (c *Config) GetPrehydrateCapacityReservation() int {
+	if c == nil {
+		return 1
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.PrehydrateCapacityReservation <= 0 {
+		return 1
+	}
+	return c.PrehydrateCapacityReservation
+}
+
+func (c *Config) SetPrehydrateCapacityReservation(val int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.PrehydrateCapacityReservation = val
+}
+
+func (c *Config) GetDispatcharrPollInterval() time.Duration {
+	if c == nil {
+		return 5 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.DispatcharrPollInterval <= 0 {
+		return 5 * time.Second
+	}
+	return c.DispatcharrPollInterval
+}
+
+func (c *Config) GetPrehydrateYieldBackoff() time.Duration {
+	if c == nil {
+		return 30 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.PrehydrateYieldBackoff <= 0 {
+		return 30 * time.Second
+	}
+	return c.PrehydrateYieldBackoff
+}
+
+func (c *Config) GetEvictYieldedParts() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.EvictYieldedParts
+}
+
+func (c *Config) SetEvictYieldedParts(val bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.EvictYieldedParts = val
+}
+
+func (c *Config) GetEnableEpisodePrehydration() bool {
+	if c == nil {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.EnableEpisodePrehydration
+}
+
+func (c *Config) SetEnableEpisodePrehydration(val bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.EnableEpisodePrehydration = val
+}
+
 var GlobalConfig *Config
 
-func LoadConfig() {
+func parseConfigFromEnv() *Config {
 	cfg := &Config{
 		Port:                    getEnv("PORT", ":8080"),
 		CacheDir:                getEnv("CACHE_DIR", "./cache/files"),
@@ -363,6 +468,12 @@ func LoadConfig() {
 			ScratchMaxBytes:     getEnvSize("S3_SCRATCH_MAX_BYTES", 2*1024*1024*1024),
 			ScratchMinFreeBytes: getEnvSize("S3_SCRATCH_MIN_FREE_BYTES", 1*1024*1024*1024),
 		},
+		DispatcharrURL:                getEnv("DISPATCHARR_URL", ""),
+		PrehydrateCapacityReservation: getEnvInt("PREHYDRATE_CAPACITY_RESERVATION", 1),
+		DispatcharrPollInterval:       getEnvDuration("DISPATCHARR_POLL_INTERVAL", 5*time.Second),
+		PrehydrateYieldBackoff:        getEnvDuration("PREHYDRATE_YIELD_BACKOFF", 30*time.Second),
+		EvictYieldedParts:             getEnvBool("EVICT_YIELDED_PARTS", false),
+		EnableEpisodePrehydration:     getEnvBool("ENABLE_EPISODE_PREHYDRATION", true),
 	}
 
 	// Format port if missing colon
@@ -381,7 +492,11 @@ func LoadConfig() {
 			}
 		}
 	}
+	return cfg
+}
 
+func LoadConfig() {
+	cfg := parseConfigFromEnv()
 	GlobalConfig = cfg
 	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, StorageBackend=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
 		cfg.Port,

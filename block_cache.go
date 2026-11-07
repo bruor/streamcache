@@ -102,6 +102,10 @@ type FileCacheState struct {
 	LiveBuffer           *LiveBuffer
 	Pipeline             StorageSink
 	ChunkManager         *S3ChunkManager
+	IsPrehydrating       bool
+	IsYielding           bool
+	YieldCooldownUntil   time.Time
+	NextURLs             []string
 }
 
 func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod string, totalSize int64) *FileCacheState {
@@ -172,6 +176,12 @@ func (s *FileCacheState) SetUpstreamStatus(status string) {
 			}
 		}
 		return
+	}
+
+	if s.IsYielding && status != "Committing" && status != "Completed" && status != "Cancelled" {
+		targetStatus = "Yielding"
+	} else if s.IsPrehydrating && targetStatus == "Downloading" && len(s.Clients) == 0 {
+		targetStatus = "Prehydrating"
 	}
 
 	if s.UpstreamStatus != targetStatus {

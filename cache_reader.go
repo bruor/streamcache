@@ -163,11 +163,12 @@ func (r *CacheReader) Close() error {
 
 	isCompleted := r.state.RangeSet.IsComplete(r.state.TotalSize)
 	shouldFinalize := len(r.state.Clients) == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
-	shouldCleanUpIncomplete := len(r.state.Clients) == 0 && !isCompleted && !r.state.WriterActive
+	isPrehydrating := r.state.IsPrehydrating || r.state.IsYielding
+	shouldCleanUpIncomplete := len(r.state.Clients) == 0 && !isCompleted && !r.state.WriterActive && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
 
 	var fileToClose *os.File
 	var pipelineToClose StorageSink
-	if len(r.state.Clients) == 0 && !r.state.WriterActive && !shouldFinalize {
+	if len(r.state.Clients) == 0 && !r.state.WriterActive && !shouldFinalize && shouldCleanUpIncomplete {
 		fileToClose = r.state.File
 		r.state.File = nil
 		pipelineToClose = r.state.Pipeline
@@ -197,6 +198,11 @@ func (r *CacheReader) Close() error {
 			}
 			GlobalRegistry.Lock.Unlock()
 			log.Printf("[Reader] Removed incomplete cache file on last client exit: %s", r.state.Key)
+		} else if remainingClients == 0 && !isCompleted {
+			// Downshift incomplete hydration to prehydration mode
+			if GlobalPrehydrationManager != nil {
+				GlobalPrehydrationManager.OnDownshift(r.state)
+			}
 		}
 	}
 

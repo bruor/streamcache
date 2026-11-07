@@ -198,6 +198,8 @@ func buildStatePayload() ([]byte, error) {
 		ConnectionsLast30s int            `json:"connections_last_30s"`
 		ObservedCooldown   float64        `json:"observed_cooldown"`
 		UpstreamUserAgent  string         `json:"upstream_user_agent"`
+		IsPrehydrating     bool           `json:"is_prehydrating"`
+		IsYielding         bool           `json:"is_yielding"`
 	}
 
 	var activeFiles []sseFile
@@ -285,6 +287,8 @@ func buildStatePayload() ([]byte, error) {
 			ConnectionsLast30s: activeCount + closedInLast30sCount,
 			ObservedCooldown:   fileState.ObservedCooldown,
 			UpstreamUserAgent:  effectiveUA,
+			IsPrehydrating:     fileState.IsPrehydrating,
+			IsYielding:         fileState.IsYielding,
 		})
 		fileState.Lock.Unlock()
 	}
@@ -321,6 +325,12 @@ func buildStatePayload() ([]byte, error) {
 		"min_disk_free_bytes":    GlobalConfig.GetMinDiskFreeBytes(),
 		"active_downloads":       activeFiles,
 		"active_connections":     activeSessions,
+	}
+
+	if GlobalPrehydrationManager != nil {
+		if capReport := GlobalPrehydrationManager.GetLatestCapacity(); capReport != nil {
+			data["provider_capacity"] = capReport
+		}
 	}
 
 	return json.Marshal(data)

@@ -227,6 +227,18 @@
             border: 1px solid rgba(0, 240, 255, 0.3);
         }
 
+        .download-badge.yielding {
+            background: rgba(255, 75, 75, 0.15);
+            color: #ff5555;
+            border: 1px solid rgba(255, 75, 75, 0.4);
+        }
+
+        .download-badge.prehydrating {
+            background: rgba(0, 180, 255, 0.15);
+            color: #00c3ff;
+            border: 1px solid rgba(0, 180, 255, 0.4);
+        }
+
         .session-origin-badge {
             font-family: var(--font-mono);
             font-size: 0.72rem;
@@ -874,6 +886,13 @@
     <header>
         <h1><span class="logo-dot"></span> Streamcache VOD Proxy</h1>
         <div class="system-status">
+            <div class="status-pill cache-status-pill" id="provider-capacity-pill" style="display: none;">
+                <span style="font-size: 1.2rem;">📡</span>
+                <div class="cache-status-info">
+                    <div id="topbar-provider-text">Providers: -- / -- slots</div>
+                    <div id="topbar-provider-avail-text" style="color: var(--accent-green); font-size: 0.78rem;">Available: --</div>
+                </div>
+            </div>
             <div class="status-pill cache-status-pill">
                 <span style="font-size: 1.2rem;">💾</span>
                 <div class="cache-status-info">
@@ -1259,7 +1278,11 @@
             let rawStatus = fileData.upstream_status || 'Downloading';
             
             // Refine status label for intuitive clarity
-            if (rawStatus === 'Connecting' && downloaded > 0) {
+            if (fileData.is_yielding || rawStatus === 'Yielding') {
+                rawStatus = 'Yielding';
+            } else if (fileData.is_prehydrating || rawStatus === 'Prehydrating') {
+                rawStatus = 'Prehydrating';
+            } else if (rawStatus === 'Connecting' && downloaded > 0) {
                 rawStatus = 'Reconnecting';
             } else if (rawStatus === 'Downloading' && fileData.is_stalled) {
                 rawStatus = 'Stalled';
@@ -1384,7 +1407,9 @@
                         stalled_seconds: file.stalled_seconds,
                         connections_last_30s: file.connections_last_30s,
                         observed_cooldown: file.observed_cooldown,
-                        upstream_user_agent: file.upstream_user_agent
+                        upstream_user_agent: file.upstream_user_agent,
+                        is_prehydrating: file.is_prehydrating,
+                        is_yielding: file.is_yielding
                     };
                     fileStore[file.key] = fileData;
                 } else {
@@ -1403,6 +1428,8 @@
                     fileData.connections_last_30s = file.connections_last_30s;
                     fileData.observed_cooldown = file.observed_cooldown;
                     fileData.upstream_user_agent = file.upstream_user_agent;
+                    fileData.is_prehydrating = file.is_prehydrating;
+                    fileData.is_yielding = file.is_yielding;
                 }
                 
                 let card = document.getElementById(`download-card-${file.key}`);
@@ -1650,6 +1677,24 @@
                 
                 const minDiskText = minDiskFree > 0 ? ` (${formatBytes(minDiskFree)} Reserved)` : '';
                 topbarDiskText.innerText = `Disk Free: ${formatBytes(diskFree)}${minDiskText}`;
+
+                if (data.provider_capacity && data.provider_capacity.status === 'ok') {
+                    const cap = data.provider_capacity;
+                    const provPill = document.getElementById('provider-capacity-pill');
+                    const provText = document.getElementById('topbar-provider-text');
+                    const provAvail = document.getElementById('topbar-provider-avail-text');
+                    if (provPill && provText && provAvail) {
+                        provPill.style.display = 'flex';
+                        const maxStr = cap.total_max_streams >= 999 ? 'Unlimited' : cap.total_max_streams;
+                        provText.innerText = `Providers: ${cap.total_active_streams} / ${maxStr} slots`;
+                        provAvail.innerText = `Available: ${cap.total_available_streams}`;
+                        if (cap.total_available_streams <= 1) {
+                            provAvail.style.color = 'var(--accent-orange)';
+                        } else {
+                            provAvail.style.color = 'var(--accent-green)';
+                        }
+                    }
+                }
 
                 updateActiveDownloadsDOM(data.active_downloads || []);
                 updateActiveConnectionsDOM(data.active_connections || []);

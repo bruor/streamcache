@@ -79,6 +79,22 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var nextURLs []string
+	if rawNext := r.URL.Query()["next_url"]; len(rawNext) > 0 {
+		for _, nu := range rawNext {
+			for _, part := range strings.Split(nu, ",") {
+				trimmed := strings.TrimSpace(part)
+				if trimmed != "" {
+					nextURLs = append(nextURLs, trimmed)
+				}
+			}
+		}
+	}
+
+	if GlobalPrehydrationManager != nil {
+		GlobalPrehydrationManager.AutoDiscoverDispatcharrURL(targetURL)
+	}
+
 	// 2. Validate Allowed Hosts
 	allowedHosts := GlobalConfig.GetAllowedHosts()
 	if len(allowedHosts) > 0 {
@@ -206,6 +222,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 				}
+				if GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
+					GlobalPrehydrationManager.OnCacheHit(targetURL, nextURLs)
+				}
 				http.ServeContent(w, r, cacheFileName, time.Now(), tracker)
 				return
 			}
@@ -261,6 +280,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			GlobalRegistry.Lock.Unlock()
 		} else {
 			state = NewFileCacheState(cacheFileName, targetURL, cacheFilePath, partPath, metaPath, probeContentType, etag, lastMod, totalSize)
+			state.NextURLs = nextURLs
 
 			// Save initial sparse metadata
 			meta := FileMeta{
@@ -279,6 +299,24 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			GlobalRegistry.Lock.Unlock()
 		}
 	} else {
+		// Priority Upgrade: if file was prehydrating or yielding, immediately upgrade to live playback!
+		state.Lock.Lock()
+		wasPrehydrating := state.IsPrehydrating || state.IsYielding
+		state.IsPrehydrating = false
+		state.IsYielding = false
+		if len(nextURLs) > 0 {
+			state.NextURLs = nextURLs
+		}
+		isWriterActive := state.WriterActive
+		state.Lock.Unlock()
+
+		if wasPrehydrating {
+			log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", cacheFileName)
+			state.SetUpstreamStatus("Connecting")
+			if !isWriterActive && !state.RangeSet.IsComplete(state.TotalSize) {
+				StartCoordinator(state, r.Header)
+			}
+		}
 		GlobalRegistry.Lock.Unlock()
 	}
 
