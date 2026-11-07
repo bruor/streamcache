@@ -308,10 +308,6 @@ func (c *Config) GetPrehydrateCapacityReservation() int {
 	return c.PrehydrateCapacityReservation
 }
 
-func (c *Config) GetPrefetchCapacityReservation() int {
-	return c.GetPrehydrateCapacityReservation()
-}
-
 func (c *Config) SetPrehydrateCapacityReservation(val int) {
 	if c == nil {
 		return
@@ -319,10 +315,6 @@ func (c *Config) SetPrehydrateCapacityReservation(val int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.PrehydrateCapacityReservation = val
-}
-
-func (c *Config) SetPrefetchCapacityReservation(val int) {
-	c.SetPrehydrateCapacityReservation(val)
 }
 
 func (c *Config) GetDispatcharrPollInterval() time.Duration {
@@ -347,10 +339,6 @@ func (c *Config) GetPrehydrateYieldBackoff() time.Duration {
 		return 30 * time.Second
 	}
 	return c.PrehydrateYieldBackoff
-}
-
-func (c *Config) GetPrefetchYieldBackoff() time.Duration {
-	return c.GetPrehydrateYieldBackoff()
 }
 
 func (c *Config) GetEvictYieldedParts() bool {
@@ -380,10 +368,6 @@ func (c *Config) GetEnableEpisodePrehydration() bool {
 	return c.EnableEpisodePrehydration
 }
 
-func (c *Config) GetEnableEpisodePrefetch() bool {
-	return c.GetEnableEpisodePrehydration()
-}
-
 func (c *Config) SetEnableEpisodePrehydration(val bool) {
 	if c == nil {
 		return
@@ -391,10 +375,6 @@ func (c *Config) SetEnableEpisodePrehydration(val bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.EnableEpisodePrehydration = val
-}
-
-func (c *Config) SetEnableEpisodePrefetch(val bool) {
-	c.SetEnableEpisodePrehydration(val)
 }
 
 var GlobalConfig *Config
@@ -420,11 +400,11 @@ func parseConfigFromEnv() *Config {
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
 		DispatcharrURL:                getEnv("DISPATCHARR_URL", ""),
-		PrehydrateCapacityReservation: getEnvInt("PREHYDRATE_CAPACITY_RESERVATION", getEnvInt("PREFETCH_CAPACITY_RESERVATION", 1)),
+		PrehydrateCapacityReservation: getEnvInt("PREHYDRATE_CAPACITY_RESERVATION", 1),
 		DispatcharrPollInterval:       getEnvDuration("DISPATCHARR_POLL_INTERVAL", 5*time.Second),
-		PrehydrateYieldBackoff:        getEnvDuration("PREHYDRATE_YIELD_BACKOFF", getEnvDuration("PREFETCH_YIELD_BACKOFF", 30*time.Second)),
+		PrehydrateYieldBackoff:        getEnvDuration("PREHYDRATE_YIELD_BACKOFF", 30*time.Second),
 		EvictYieldedParts:             getEnvBool("EVICT_YIELDED_PARTS", false),
-		EnableEpisodePrehydration:     getEnvBool("ENABLE_EPISODE_PREHYDRATION", getEnvBool("ENABLE_EPISODE_PREFETCH", true)),
+		EnableEpisodePrehydration:     getEnvBool("ENABLE_EPISODE_PREHYDRATION", true),
 	}
 
 	// Format port if missing colon
