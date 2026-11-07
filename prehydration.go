@@ -116,7 +116,9 @@ func (pm *PrehydrationManager) AutoDiscoverDispatcharrURL(targetURL string) {
 
 func (pm *PrehydrationManager) getEffectiveDispatcharrURL() string {
 	if GlobalConfig != nil {
-		explicit := strings.TrimRight(strings.TrimSpace(GlobalConfig.GetDispatcharrURL()), "/")
+		explicit := strings.TrimSpace(GlobalConfig.GetDispatcharrURL())
+		explicit = strings.Trim(explicit, "\"'`")
+		explicit = strings.TrimRight(explicit, "/")
 		if explicit != "" {
 			return explicit
 		}
@@ -138,11 +140,13 @@ func (pm *PrehydrationManager) pollCapacityOnce() {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
 	if err != nil {
+		log.Printf("[Prehydration] Failed to create poll request for %s: %v", pollURL, err)
 		return
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		log.Printf("[Prehydration] Failed to poll Dispatcharr provider capacity at %s: %v", pollURL, err)
 		pm.mu.Lock()
 		pm.latestCapacity = &ProviderCapacityReport{
 			Status:    "unavailable",
@@ -155,6 +159,7 @@ func (pm *PrehydrationManager) pollCapacityOnce() {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		log.Printf("[Prehydration] Dispatcharr provider capacity at %s returned HTTP %d", pollURL, resp.StatusCode)
 		pm.mu.Lock()
 		pm.latestCapacity = &ProviderCapacityReport{
 			Status:    "unavailable",
@@ -167,18 +172,26 @@ func (pm *PrehydrationManager) pollCapacityOnce() {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("[Prehydration] Failed to read capacity response from %s: %v", pollURL, err)
 		return
 	}
 
 	var report ProviderCapacityReport
 	if err := json.Unmarshal(body, &report); err != nil {
+		log.Printf("[Prehydration] Failed to parse capacity JSON from %s: %v", pollURL, err)
 		return
 	}
 
 	pm.mu.Lock()
+	firstPoll := pm.latestCapacity == nil || pm.latestCapacity.Status != "ok"
 	pm.latestCapacity = &report
 	pm.lastPollTime = time.Now()
 	pm.mu.Unlock()
+
+	if firstPoll {
+		log.Printf("[Prehydration] Connected to Dispatcharr provider capacity (%s): active=%d, available=%d, max=%d",
+			pollURL, report.TotalActiveStreams, report.TotalAvailableStreams, report.TotalMaxStreams)
+	}
 
 	// Check if active prehydrations need to yield due to live streams taking reserved slots
 	pm.checkYieldConditions()
