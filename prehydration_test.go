@@ -338,3 +338,83 @@ func TestPrehydrationConfigEnv(t *testing.T) {
 	os.Unsetenv("PREHYDRATE_YIELD_BACKOFF")
 	os.Unsetenv("ENABLE_EPISODE_PREHYDRATION")
 }
+
+func TestServerMediaStreamNextURL(t *testing.T) {
+	oldPM := GlobalPrehydrationManager
+	defer func() { GlobalPrehydrationManager = oldPM }()
+
+	mockPM := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+	GlobalPrehydrationManager = mockPM
+
+	// 1. Test Cache Hit triggers OnCacheHit and enqueues next_url
+	testURL := "http://example.com/show/s01e01.mkv"
+	key, ext := getCacheKeyAndExt(testURL)
+	cacheFileName := key + ext
+	cacheDir := GlobalConfig.GetCacheDir()
+	filePath := filepath.Join(cacheDir, cacheFileName)
+
+	testContent := []byte("fake video content for s01e01")
+	if err := os.WriteFile(filePath, testContent, 0644); err != nil {
+		t.Fatalf("Failed to write mock cache file: %v", err)
+	}
+	defer os.Remove(filePath)
+
+	req := httptest.NewRequest("GET", fmt.Sprintf("/stream?url=%s&next_url=%s&next_url=%s",
+		testURL, "http://example.com/show/s01e02.mkv", "http://example.com/show/s01e03.mkv"), nil)
+	rec := httptest.NewRecorder()
+
+	handleMediaStream(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK for cache hit, got %d", rec.Code)
+	}
+	if rec.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("Expected X-Cache: HIT, got %s", rec.Header().Get("X-Cache"))
+	}
+
+	mockPM.mu.Lock()
+	if len(mockPM.queue) != 1 {
+		mockPM.mu.Unlock()
+		t.Fatalf("Expected 1 prehydration task queued on cache hit, got %d", len(mockPM.queue))
+	}
+	task := mockPM.queue[0]
+	mockPM.mu.Unlock()
+
+	if task.TargetURL != "http://example.com/show/s01e02.mkv" {
+		t.Errorf("Expected queued task URL ep2, got %s", task.TargetURL)
+	}
+	if len(task.NextURLs) != 1 || task.NextURLs[0] != "http://example.com/show/s01e03.mkv" {
+		t.Errorf("Expected queued task nextUrls to contain ep3, got %v", task.NextURLs)
+	}
+
+	// 2. Test Comma-separated next_url query parsing
+	mockPM.mu.Lock()
+	mockPM.queue = nil
+	mockPM.mu.Unlock()
+
+	reqComma := httptest.NewRequest("GET", fmt.Sprintf("/stream?url=%s&next_url=%s",
+		testURL, "http://example.com/show/s01e02.mkv,http://example.com/show/s01e03.mkv"), nil)
+	recComma := httptest.NewRecorder()
+
+	handleMediaStream(recComma, reqComma)
+
+	mockPM.mu.Lock()
+	if len(mockPM.queue) != 1 {
+		mockPM.mu.Unlock()
+		t.Fatalf("Expected 1 prehydration task queued for comma-separated next_url, got %d", len(mockPM.queue))
+	}
+	taskComma := mockPM.queue[0]
+	mockPM.mu.Unlock()
+
+	if taskComma.TargetURL != "http://example.com/show/s01e02.mkv" {
+		t.Errorf("Expected queued task URL ep2, got %s", taskComma.TargetURL)
+	}
+	if len(taskComma.NextURLs) != 1 || taskComma.NextURLs[0] != "http://example.com/show/s01e03.mkv" {
+		t.Errorf("Expected queued task nextUrls to contain ep3, got %v", taskComma.NextURLs)
+	}
+}
+
