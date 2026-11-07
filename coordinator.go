@@ -281,11 +281,23 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 		}
 
+		state.Lock.Lock()
+		if state.IsPrehydrating {
+			state.WorkersLock.Lock()
+			count := len(state.ActiveWorkers)
+			state.WorkersLock.Unlock()
+			if count >= 1 {
+				state.Lock.Unlock()
+				return
+			}
+		}
+		state.Lock.Unlock()
+
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
 	}
 
-	spawnPrefetchWorker := func(startOffset int64) {
+	spawnTailPrefetchWorker := func(startOffset int64) {
 		state.WorkersLock.Lock()
 		defer state.WorkersLock.Unlock()
 		workerIdGen++
@@ -309,10 +321,22 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				otherTarget := atomic.LoadInt64(&other.targetEndOffset)
 				if otherTarget <= 0 || otherTarget > startOffset {
 					atomic.StoreInt64(&other.targetEndOffset, startOffset)
-					log.Printf("[Coord] Immediately clamped Worker %d target boundary to %d (metadata prefetch Worker %d)", other.id, startOffset, w.id)
+					log.Printf("[Coord] Immediately clamped Worker %d target boundary to %d (metadata tail Worker %d)", other.id, startOffset, w.id)
 				}
 			}
 		}
+
+		state.Lock.Lock()
+		if state.IsPrehydrating {
+			state.WorkersLock.Lock()
+			count := len(state.ActiveWorkers)
+			state.WorkersLock.Unlock()
+			if count >= 1 {
+				state.Lock.Unlock()
+				return
+			}
+		}
+		state.Lock.Unlock()
 
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
@@ -341,8 +365,14 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 	// Main Coordinator Orchestration Loop
 	for {
-		// Sniff check for container optimization
-		sniffAndSchedulePrefetch(state, file)
+		// Sniff check for container optimization (skip during prehydration)
+		state.Lock.Lock()
+		isPrehydrating := state.IsPrehydrating
+		state.Lock.Unlock()
+
+		if !isPrehydrating {
+			sniffAndSchedulePrefetch(state, file)
+		}
 
 		// Check if fully completed
 		if state.RangeSet.IsComplete(state.TotalSize) {
@@ -371,12 +401,15 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 
 		state.Lock.Lock()
 		pendingTail := state.PendingTailPrefetchOffset
-		if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() > 1 {
+		isPrehydrating = state.IsPrehydrating
+		if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() > 1 && !isPrehydrating {
 			state.PendingTailPrefetchOffset = -1
 			state.Lock.Unlock()
 			log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at offset %d", pendingTail)
-			spawnPrefetchWorker(pendingTail)
+			spawnTailPrefetchWorker(pendingTail)
 			state.Lock.Lock()
+		} else if isPrehydrating {
+			state.PendingTailPrefetchOffset = -1
 		}
 
 		// Find all starving offsets that are not covered
@@ -818,6 +851,15 @@ func runDownloadWorker(
 			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 				hadFailure = true
 				_ = resp.Body.Close()
+				state.Lock.Lock()
+				isPrehydrating := state.IsPrehydrating
+				state.Lock.Unlock()
+				if isPrehydrating && (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests) {
+					if GlobalPrehydrationManager != nil {
+						GlobalPrehydrationManager.YieldState(state, fmt.Sprintf("HTTP %d upstream backpressure", resp.StatusCode))
+					}
+					return
+				}
 				isPermanent := resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone
 				if handleFailure(isPermanent, "[Worker-%d] Upstream returned error status %d", w.id, resp.StatusCode) {
 					return
@@ -1173,7 +1215,7 @@ func runInlineTailPrefetch(
 
 func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 	state.Lock.Lock()
-	if state.Sniffed {
+	if state.Sniffed || state.IsPrehydrating {
 		state.Lock.Unlock()
 		return
 	}
@@ -1330,6 +1372,10 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 		if GlobalLogBroker != nil {
 			GlobalLogBroker.BroadcastStateUpdate()
 		}
+	}
+
+	if GlobalPrehydrationManager != nil {
+		GlobalPrehydrationManager.OnHydrationCompleted(state)
 	}
 
 	runtime.GC()

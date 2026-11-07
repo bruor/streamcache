@@ -29,7 +29,9 @@ func TestMain(m *testing.M) {
 		CacheRevalidateInterval: 50 * time.Millisecond, // short for test
 		SchedulerMinTime:        20 * time.Millisecond,
 		MaxUpstreamRetries:      8, // Cap retries in unit test harness to prevent infinite background retry loops on closed mock servers
-		MaxUpstreamWorkers:      2,
+		MaxUpstreamWorkers:          2,
+		EnableEpisodePrefetch:       true,
+		PrefetchCapacityReservation: 1,
 	}
 
 	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
@@ -784,7 +786,9 @@ func TestIncompleteDownloadCleanup(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
@@ -952,7 +956,9 @@ func TestCoordinatorRetryTempering(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
@@ -1096,7 +1102,9 @@ func TestCoordinatorNoBlockSkippingOnFailure(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
@@ -1737,7 +1745,9 @@ func TestSequentialLastBlockPrefetch(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
@@ -1839,7 +1849,9 @@ func TestMp4NonFastStartOpportunisticPrefetch(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
@@ -2219,7 +2231,9 @@ func TestCoordinatorResuscitationOnClientStarvation(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
@@ -2276,7 +2290,9 @@ func TestCancelHydrationAPI(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
@@ -2410,7 +2426,9 @@ func TestCancellationAndResuscitation(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()
@@ -2573,7 +2591,9 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
+	GlobalConfig.EvictYieldedParts = true
 	defer func() {
+		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
 	}()

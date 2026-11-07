@@ -30,6 +30,12 @@ type Config struct {
 	StarvationStallTimeout  time.Duration
 	LogVerbose              bool
 	WritebackBufferSize     int64
+	DispatcharrURL              string
+	PrefetchCapacityReservation int
+	DispatcharrPollInterval     time.Duration
+	PrefetchYieldBackoff        time.Duration
+	EvictYieldedParts           bool
+	EnableEpisodePrefetch       bool
 }
 
 func (c *Config) Lock() {
@@ -272,6 +278,105 @@ func (c *Config) SetWritebackBufferSize(val int64) {
 	c.WritebackBufferSize = val
 }
 
+func (c *Config) GetDispatcharrURL() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.DispatcharrURL
+}
+
+func (c *Config) SetDispatcharrURL(val string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.DispatcharrURL = val
+}
+
+func (c *Config) GetPrefetchCapacityReservation() int {
+	if c == nil {
+		return 1
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.PrefetchCapacityReservation <= 0 {
+		return 1
+	}
+	return c.PrefetchCapacityReservation
+}
+
+func (c *Config) SetPrefetchCapacityReservation(val int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.PrefetchCapacityReservation = val
+}
+
+func (c *Config) GetDispatcharrPollInterval() time.Duration {
+	if c == nil {
+		return 5 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.DispatcharrPollInterval <= 0 {
+		return 5 * time.Second
+	}
+	return c.DispatcharrPollInterval
+}
+
+func (c *Config) GetPrefetchYieldBackoff() time.Duration {
+	if c == nil {
+		return 30 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.PrefetchYieldBackoff <= 0 {
+		return 30 * time.Second
+	}
+	return c.PrefetchYieldBackoff
+}
+
+func (c *Config) GetEvictYieldedParts() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.EvictYieldedParts
+}
+
+func (c *Config) SetEvictYieldedParts(val bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.EvictYieldedParts = val
+}
+
+func (c *Config) GetEnableEpisodePrefetch() bool {
+	if c == nil {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.EnableEpisodePrefetch
+}
+
+func (c *Config) SetEnableEpisodePrefetch(val bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.EnableEpisodePrefetch = val
+}
+
 var GlobalConfig *Config
 
 func LoadConfig() {
@@ -294,6 +399,12 @@ func LoadConfig() {
 		StarvationStallTimeout:  getEnvDuration("STARVATION_STALL_TIMEOUT", 30*time.Second),
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
+		DispatcharrURL:              getEnv("DISPATCHARR_URL", ""),
+		PrefetchCapacityReservation: getEnvInt("PREFETCH_CAPACITY_RESERVATION", 1),
+		DispatcharrPollInterval:     getEnvDuration("DISPATCHARR_POLL_INTERVAL", 5*time.Second),
+		PrefetchYieldBackoff:        getEnvDuration("PREFETCH_YIELD_BACKOFF", 30*time.Second),
+		EvictYieldedParts:           getEnvBool("EVICT_YIELDED_PARTS", false),
+		EnableEpisodePrefetch:       getEnvBool("ENABLE_EPISODE_PREFETCH", true),
 	}
 
 	// Format port if missing colon

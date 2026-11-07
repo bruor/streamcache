@@ -19,6 +19,9 @@ func main() {
 	// 4. Initialize Cache Registry (scans directory, calculates cache size, sets bounds)
 	InitRegistry()
 
-	// 5. Start HTTP Servers (Media streams and Dashboard UI)
+	// 5. Initialize Prehydration Manager (Dispatcharr capacity awareness & next episode prehydration)
+	InitPrehydrationManager()
+
+	// 6. Start HTTP Servers (Media streams and Dashboard UI)
 	StartServer()
 }
