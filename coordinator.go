@@ -242,6 +242,15 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	spawnWorker := func(startOffset int64) {
 		state.WorkersLock.Lock()
 		defer state.WorkersLock.Unlock()
+
+		state.Lock.Lock()
+		isPrehydrating := state.IsPrehydrating
+		state.Lock.Unlock()
+
+		if isPrehydrating && len(state.ActiveWorkers) >= 1 {
+			return
+		}
+
 		workerIdGen++
 		wCtx, wCancel := context.WithCancel(parentCtx)
 		w := &Worker{
@@ -281,23 +290,18 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			}
 		}
 
-		state.Lock.Lock()
-		if state.IsPrehydrating {
-			state.WorkersLock.Lock()
-			count := len(state.ActiveWorkers)
-			state.WorkersLock.Unlock()
-			if count >= 1 {
-				state.Lock.Unlock()
-				return
-			}
-		}
-		state.Lock.Unlock()
-
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
 	}
 
 	spawnTailPrefetchWorker := func(startOffset int64) {
+		state.Lock.Lock()
+		if state.IsPrehydrating {
+			state.Lock.Unlock()
+			return
+		}
+		state.Lock.Unlock()
+
 		state.WorkersLock.Lock()
 		defer state.WorkersLock.Unlock()
 		workerIdGen++
@@ -325,18 +329,6 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 				}
 			}
 		}
-
-		state.Lock.Lock()
-		if state.IsPrehydrating {
-			state.WorkersLock.Lock()
-			count := len(state.ActiveWorkers)
-			state.WorkersLock.Unlock()
-			if count >= 1 {
-				state.Lock.Unlock()
-				return
-			}
-		}
-		state.Lock.Unlock()
 
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
 		go runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
