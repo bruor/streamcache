@@ -714,6 +714,189 @@ func TestHeadRequestSkipsPrehydrationAndHydration(t *testing.T) {
 	}
 }
 
+func TestDeferredPartFileCreationAndProbeBypass(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "probe_bypass_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	oldWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldThreshold := GlobalConfig.MinReadThresholdBytes
+	oldMaxBytes := GlobalConfig.CacheMaxBytes
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	GlobalConfig.MaxUpstreamWorkers = 1
+	GlobalConfig.MinReadThresholdBytes = 256 * 1024
+	GlobalConfig.CacheMaxBytes = 50 * 1024 * 1024
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.MaxUpstreamWorkers = oldWorkers
+		GlobalConfig.MinReadThresholdBytes = oldThreshold
+		GlobalConfig.CacheMaxBytes = oldMaxBytes
+		GlobalConfig.Unlock()
+	}()
+
+	oldPM := GlobalPrehydrationManager
+	defer func() { GlobalPrehydrationManager = oldPM }()
+
+	mockPM := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+	GlobalPrehydrationManager = mockPM
+
+	// Create 10MB test payload
+	testPayload := make([]byte, 10*1024*1024)
+	for i := range testPayload {
+		testPayload[i] = byte(i % 256)
+	}
+
+	blockUpstream := true
+	var blockMu sync.Mutex
+	unblockCh := make(chan struct{})
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(testPayload)))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusOK)
+
+		blockMu.Lock()
+		shouldBlock := blockUpstream
+		blockMu.Unlock()
+
+		if shouldBlock {
+			// Write first 64KB (headers/initial chunks) and wait
+			_, _ = w.Write(testPayload[:64*1024])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			select {
+			case <-unblockCh:
+				_, _ = w.Write(testPayload[64*1024:])
+			case <-r.Context().Done():
+				return
+			}
+		} else {
+			_, _ = w.Write(testPayload)
+		}
+	}))
+	defer upstreamServer.Close()
+
+	streamURL := upstreamServer.URL + "/show_ep1.mp4"
+	key, ext := getCacheKeyAndExt(streamURL)
+	cacheFileName := key + ext
+	partPath := filepath.Join(tmpDir, cacheFileName+".part")
+	metaPath := filepath.Join(tmpDir, cacheFileName+".json")
+
+	// Phase 1: Client simulates XC series view probe (reads 64KB < 256KB threshold, then disconnects)
+	req1 := httptest.NewRequest("GET", fmt.Sprintf("/stream?url=%s&next_url=%s",
+		streamURL, upstreamServer.URL+"/show_ep2.mp4"), nil)
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	req1 = req1.WithContext(ctx1)
+
+	rec1 := httptest.NewRecorder()
+
+	doneCh1 := make(chan struct{})
+	go func() {
+		defer close(doneCh1)
+		handleMediaStream(rec1, req1)
+	}()
+
+	// Wait for coordinator to start and buffer initial chunks into LiveBuffer in RAM
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify .part file has NOT been created on disk!
+	if FileExists(partPath) {
+		t.Fatalf("Part file %s was created on disk prematurely during RAM-only probe phase!", partPath)
+	}
+	if FileExists(metaPath) {
+		t.Fatalf("Meta file %s was created on disk prematurely during RAM-only probe phase!", metaPath)
+	}
+
+	// Client closes connection (probe finished)
+	cancel1()
+	<-doneCh1
+
+	// Give reader cleanup a moment
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify NO part file or meta file remains on disk
+	if FileExists(partPath) {
+		t.Fatalf("Part file %s exists on disk after probe disconnect!", partPath)
+	}
+	if FileExists(metaPath) {
+		t.Fatalf("Meta file %s exists on disk after probe disconnect!", metaPath)
+	}
+
+	// Verify next episode was NOT enqueued
+	mockPM.mu.Lock()
+	if len(mockPM.queue) != 0 {
+		mockPM.mu.Unlock()
+		t.Fatalf("Expected 0 prehydration tasks queued for aborted probe, got %d", len(mockPM.queue))
+	}
+	mockPM.mu.Unlock()
+
+	// Verify state removed from GlobalRegistry
+	GlobalRegistry.Lock.RLock()
+	_, exists := GlobalRegistry.Files[cacheFileName]
+	GlobalRegistry.Lock.RUnlock()
+	if exists {
+		t.Fatalf("Expected FileCacheState to be deleted from registry on probe exit")
+	}
+
+	// Unblock upstream server for Phase 2 (real playback)
+	blockMu.Lock()
+	blockUpstream = false
+	blockMu.Unlock()
+	close(unblockCh)
+
+	// Phase 2: Client plays video and streams past threshold (reads 512KB >= 256KB threshold)
+	req2 := httptest.NewRequest("GET", fmt.Sprintf("/stream?url=%s&next_url=%s",
+		streamURL, upstreamServer.URL+"/show_ep2.mp4"), nil)
+	rec2 := httptest.NewRecorder()
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	req2 = req2.WithContext(ctx2)
+
+	go handleMediaStream(rec2, req2)
+
+	// Wait for streaming and reader to cross threshold
+	time.Sleep(150 * time.Millisecond)
+
+	// Fetch registered state and simulate client reading 512KB
+	GlobalRegistry.Lock.RLock()
+	state2 := GlobalRegistry.Files[cacheFileName]
+	GlobalRegistry.Lock.RUnlock()
+
+	if state2 != nil {
+		reader := NewCacheReader(ctx2, state2, req2)
+		buf := make([]byte, 512*1024)
+		_, _ = reader.ReadAt(buf, 0)
+		_ = reader.Close()
+	}
+
+	cancel2()
+	time.Sleep(100 * time.Millisecond)
+	if state2 != nil {
+		CancelCoordinator(state2)
+	}
+
+	// Now that read threshold was crossed, part file or cached file MUST be materialized on disk!
+	if !FileExists(partPath) && !FileExists(filepath.Join(tmpDir, cacheFileName)) {
+		t.Fatalf("Expected part file %s to be materialized on disk once read threshold was crossed", partPath)
+	}
+}
+
 
 
 

@@ -25,6 +25,8 @@ type CacheReader struct {
 	file              *os.File
 	fileMu            sync.Mutex
 	lastEvictedOffset int64
+	totalBytesRead    int64
+	maxReadOffset     int64
 }
 
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
@@ -97,6 +99,9 @@ func (r *CacheReader) getFile() (*os.File, error) {
 	if r.file != nil {
 		return r.file, nil
 	}
+	if !FileExists(r.state.PartPath) && !FileExists(r.state.Path) {
+		_ = r.state.MaterializeDiskFile()
+	}
 	f, err := os.Open(r.state.PartPath)
 	if err != nil {
 		f, err = os.Open(r.state.Path)
@@ -106,6 +111,36 @@ func (r *CacheReader) getFile() (*os.File, error) {
 	}
 	r.file = f
 	return r.file, nil
+}
+
+func (r *CacheReader) recordRead(off int64, n int) {
+	if n <= 0 {
+		return
+	}
+	atomic.AddInt64(&r.totalBytesRead, int64(n))
+	newEnd := off + int64(n)
+	for {
+		oldMax := atomic.LoadInt64(&r.maxReadOffset)
+		if newEnd <= oldMax || atomic.CompareAndSwapInt64(&r.maxReadOffset, oldMax, newEnd) {
+			break
+		}
+	}
+
+	minThreshold := int64(5 * 1024 * 1024)
+	if GlobalConfig != nil {
+		minThreshold = GlobalConfig.GetMinReadThresholdBytes()
+	}
+
+	totalRead := atomic.LoadInt64(&r.totalBytesRead)
+	isTailSeek := r.state != nil && r.state.TotalSize > 0 && off >= (r.state.TotalSize-2*1024*1024)
+	if totalRead >= minThreshold || (off >= minThreshold && !isTailSeek) {
+		if r.state != nil && !r.state.IsDiskMaterialized() {
+			if GlobalRegistry != nil && r.state.TotalSize > 0 {
+				GlobalRegistry.PreEvict(r.state.TotalSize)
+			}
+			_ = r.state.MaterializeDiskFile()
+		}
+	}
 }
 
 func (r *CacheReader) Close() error {
@@ -130,22 +165,70 @@ func (r *CacheReader) Close() error {
 	log.Printf("[Reader] Unregistered client %s from media %s", r.clientID, r.state.Key)
 
 	isCompleted := r.state.RangeSet.IsComplete(r.state.TotalSize)
-	shouldFinalize := len(r.state.Clients) == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
+	remainingClients := len(r.state.Clients)
+
+	minThreshold := int64(5 * 1024 * 1024)
+	if GlobalConfig != nil {
+		minThreshold = GlobalConfig.GetMinReadThresholdBytes()
+	}
+	totalRead := atomic.LoadInt64(&r.totalBytesRead)
+	maxOffset := atomic.LoadInt64(&r.maxReadOffset)
 	isPrehydrating := r.state.IsPrehydrating || r.state.IsYielding
-	shouldCleanUpIncomplete := len(r.state.Clients) == 0 && !isCompleted && !r.state.WriterActive && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
+	isProbe := !isCompleted && !isPrehydrating && totalRead < minThreshold && maxOffset < minThreshold
+
+	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
+	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
 
 	var fileToClose *os.File
 	var pipelineToClose StorageSink
-	if len(r.state.Clients) == 0 && !r.state.WriterActive && !shouldFinalize && shouldCleanUpIncomplete {
+	var cancelFunc context.CancelFunc
+
+	if isProbe && remainingClients == 0 {
+		cancelFunc = r.state.Cancel
+		r.state.Cancel = nil
+		r.state.WriterActive = false
+		r.state.NextURLs = nil
+		fileToClose = r.state.File
+		r.state.File = nil
+		pipelineToClose = r.state.Pipeline
+		r.state.Pipeline = nil
+		if r.state.LiveBuffer != nil {
+			r.state.LiveBuffer.Clear()
+			r.state.LiveBuffer = nil
+		}
+	} else if remainingClients == 0 && !r.state.WriterActive && !shouldFinalize && shouldCleanUpIncomplete {
 		fileToClose = r.state.File
 		r.state.File = nil
 		pipelineToClose = r.state.Pipeline
 		r.state.Pipeline = nil
 	}
-	remainingClients := len(r.state.Clients)
 	r.state.Lock.Unlock()
 
 	GlobalRegistry.UnregisterConnection(r.clientID)
+
+	if isProbe && remainingClients == 0 {
+		log.Printf("[Reader] Client %s closed probe (%d bytes read, below %d threshold). Aborted without disk write or downshift for %s", r.clientID, totalRead, minThreshold, r.state.Key)
+		if cancelFunc != nil {
+			cancelFunc()
+		}
+		if pipelineToClose != nil {
+			_ = pipelineToClose.FlushAndClose()
+		}
+		if fileToClose != nil {
+			_ = fileToClose.Close()
+		}
+		_ = os.Remove(r.state.PartPath)
+		_ = os.Remove(r.state.MetaPath)
+
+		GlobalRegistry.Lock.Lock()
+		if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
+			delete(GlobalRegistry.Files, r.state.Key)
+		}
+		GlobalRegistry.Lock.Unlock()
+
+		debug.FreeOSMemory()
+		return nil
+	}
 
 	if shouldFinalize {
 		r.finalizeCache()
@@ -329,6 +412,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 					memN += diskN
 				}
 			}
+			r.recordRead(off, memN)
 			GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(memN))
 			if r.state.RangeSet.IsComplete(r.state.TotalSize) {
 				GlobalRegistry.SetConnectionInCache(r.clientID, true)
@@ -345,6 +429,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 
 	n, err = file.ReadAt(p[:toRead], off)
 	if n > 0 {
+		r.recordRead(off, n)
 		GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
 
 		curReadEnd := off + int64(n)

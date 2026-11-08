@@ -204,6 +204,26 @@ func (lb *LiveBuffer) Clear() {
 	lb.curBytes = 0
 }
 
+// FlushToFile writes all currently retained chunks in LiveBuffer to file
+func (lb *LiveBuffer) FlushToFile(file *os.File) error {
+	if lb == nil || file == nil {
+		return nil
+	}
+
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+
+	for _, c := range lb.chunks {
+		if c != nil && c.bufPtr != nil && c.length > 0 {
+			_, err := file.WriteAt((*c.bufPtr)[:c.length], c.offset)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // StorageSink represents an abstraction for writing media chunks
 type StorageSink interface {
 	WriteChunk(offset int64, data []byte) error
@@ -322,13 +342,42 @@ func (wp *WritebackPipeline) WriteChunkContext(ctx context.Context, offset int64
 	}
 }
 
+// AttachFile binds a newly materialized disk file to the writeback pipeline and flushes in-memory chunks
+func (wp *WritebackPipeline) AttachFile(file *os.File) error {
+	if wp == nil || file == nil {
+		return nil
+	}
+
+	wp.mu.Lock()
+	defer wp.mu.Unlock()
+
+	if wp.file != nil {
+		return nil
+	}
+
+	wp.file = file
+	wp.fd = file.Fd()
+
+	if wp.liveBuffer != nil {
+		if err := wp.liveBuffer.FlushToFile(file); err != nil {
+			log.Printf("[WritebackPipeline] Error flushing LiveBuffer to file: %v", err)
+			return err
+		}
+	}
+	return nil
+}
+
 // storageConsumer runs as a dedicated consumer goroutine writing chunks to disk
 func (wp *WritebackPipeline) storageConsumer() {
 	defer wp.wg.Done()
 
 	for chunk := range wp.queue {
-		if wp.file != nil && chunk.bufPtr != nil {
-			_, err := wp.file.WriteAt((*chunk.bufPtr)[:chunk.length], chunk.offset)
+		wp.mu.RLock()
+		file := wp.file
+		wp.mu.RUnlock()
+
+		if file != nil && chunk.bufPtr != nil {
+			_, err := file.WriteAt((*chunk.bufPtr)[:chunk.length], chunk.offset)
 			if err != nil {
 				log.Printf("[WritebackPipeline] WriteAt error at offset %d: %v", chunk.offset, err)
 				wp.errMu.Lock()
@@ -352,7 +401,11 @@ func (wp *WritebackPipeline) storageConsumer() {
 
 // paceWriteback accumulates written bytes into windows and paces asynchronous flush to physical disk
 func (wp *WritebackPipeline) paceWriteback(offset int64, length int64) {
-	if wp.fd == 0 {
+	wp.mu.RLock()
+	fd := wp.fd
+	wp.mu.RUnlock()
+
+	if fd == 0 {
 		return
 	}
 

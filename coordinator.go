@@ -125,32 +125,34 @@ type Worker struct {
 func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	log.Printf("[Coord] Starting concurrent background coordinator for cache: %s", state.Key)
 
-	// Open the target file in Read/Write mode (or create it)
-	// Truncate to allocate file space on disk immediately
-	var file *os.File
-	var err error
-	if FileExists(state.PartPath) {
-		file, err = os.OpenFile(state.PartPath, os.O_RDWR, 0644)
-	} else {
-		file, err = os.OpenFile(state.PartPath, os.O_CREATE|os.O_RDWR, 0644)
-	}
-	if err != nil {
-		log.Printf("[Coord] Error opening part file: %v", err)
-		state.Lock.Lock()
-		state.WriterActive = false
-		state.Lock.Unlock()
-		return
-	}
-	_ = file.Truncate(state.TotalSize)
+	state.Lock.Lock()
+	shouldMaterializeImmediately := state.IsPrehydrating || FileExists(state.PartPath)
+	state.Lock.Unlock()
 
-	pipeline := NewWritebackPipeline(file, state, GlobalConfig.GetWritebackBufferSize())
+	if shouldMaterializeImmediately {
+		if err := state.MaterializeDiskFile(); err != nil {
+			log.Printf("[Coord] Error materializing part file: %v", err)
+			state.Lock.Lock()
+			state.WriterActive = false
+			state.Lock.Unlock()
+			return
+		}
+	}
+
+	var file *os.File
+	state.Lock.Lock()
+	file = state.File
+	pipeline := state.Pipeline
+	state.Lock.Unlock()
+
+	if pipeline == nil {
+		pipeline = NewWritebackPipeline(file, state, GlobalConfig.GetWritebackBufferSize())
+		state.Lock.Lock()
+		state.Pipeline = pipeline
+		state.Lock.Unlock()
+	}
 
 	state.Lock.Lock()
-	if state.File != nil && state.File != file {
-		_ = state.File.Close()
-	}
-	state.File = file
-	state.Pipeline = pipeline
 	if state.HydrationStartTime == 0 {
 		state.HydrationStartTime = time.Now().Unix()
 	}
@@ -176,6 +178,14 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 		isCompleted := state.RangeSet.IsComplete(state.TotalSize)
 
 		if isCompleted {
+			shouldMaterialize := !state.DiskMaterialized
+			state.Lock.Unlock()
+
+			if shouldMaterialize {
+				_ = state.MaterializeDiskFile()
+			}
+
+			state.Lock.Lock()
 			fileToClose := state.File
 			state.File = nil
 			pipelineToClose := state.Pipeline
@@ -942,6 +952,11 @@ func runDownloadWorker(
 				sniffAndSchedulePrefetch(state, file)
 			}
 
+			// If cumulative downloaded bytes in memory cross 32MB without being materialized yet, materialize to disk
+			if !state.IsDiskMaterialized() && state.RangeSet.TotalBytes() >= 32*1024*1024 {
+				_ = state.MaterializeDiskFile()
+			}
+
 			currentOffset += int64(n)
 			atomic.StoreInt64(&w.currentOffset, currentOffset)
 			atomic.AddInt64(&w.connBytesWritten, int64(n))
@@ -1219,13 +1234,14 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 		return
 	}
 	state.Sniffed = true
+	lb := state.LiveBuffer
 	state.Lock.Unlock()
 
 	log.Printf("[Coord] Initial header bytes available. Sniffing media container...")
 	buf := make([]byte, 128*1024)
 	n := 0
-	if state.LiveBuffer != nil {
-		n, _ = state.LiveBuffer.ReadAt(buf, 0)
+	if lb != nil {
+		n, _ = lb.ReadAt(buf, 0)
 	}
 	if n == 0 && file != nil {
 		n, _ = file.ReadAt(buf, 0)

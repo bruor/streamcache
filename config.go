@@ -36,6 +36,7 @@ type Config struct {
 	PrehydrateYieldBackoff        time.Duration
 	EvictYieldedParts             bool
 	EnableEpisodePrehydration     bool
+	MinReadThresholdBytes         int64
 }
 
 func (c *Config) Lock() {
@@ -377,6 +378,27 @@ func (c *Config) SetEnableEpisodePrehydration(val bool) {
 	c.EnableEpisodePrehydration = val
 }
 
+func (c *Config) GetMinReadThresholdBytes() int64 {
+	if c == nil {
+		return 5 * 1024 * 1024
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.MinReadThresholdBytes <= 0 {
+		return 5 * 1024 * 1024
+	}
+	return c.MinReadThresholdBytes
+}
+
+func (c *Config) SetMinReadThresholdBytes(val int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.MinReadThresholdBytes = val
+}
+
 var GlobalConfig *Config
 
 func parseConfigFromEnv() *Config {
@@ -405,6 +427,7 @@ func parseConfigFromEnv() *Config {
 		PrehydrateYieldBackoff:        getEnvDuration("PREHYDRATE_YIELD_BACKOFF", 30*time.Second),
 		EvictYieldedParts:             getEnvBool("EVICT_YIELDED_PARTS", false),
 		EnableEpisodePrehydration:     getEnvBool("ENABLE_EPISODE_PREHYDRATION", true),
+		MinReadThresholdBytes:         getEnvSize("MIN_READ_THRESHOLD_BYTES", 5*1024*1024), // 5MB
 	}
 
 	// Format port if missing colon
@@ -429,7 +452,7 @@ func parseConfigFromEnv() *Config {
 func LoadConfig() {
 	cfg := parseConfigFromEnv()
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.CacheMaxBytes/(1024*1024*1024),
@@ -443,6 +466,7 @@ func LoadConfig() {
 		cfg.SchedulerMinTime,
 		cfg.GetUpstreamUserAgent(),
 		cfg.GetUpstreamUserAgentMode(),
+		cfg.GetMinReadThresholdBytes()/(1024*1024),
 	)
 }
 
