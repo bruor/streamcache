@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -201,11 +202,27 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 				defer GlobalRegistry.UnregisterConnection(connID)
 
 				// Wrap file in a tracking reader to monitor read offsets
+				var hitPrehydrateOnce sync.Once
+				var hitTotalRead int64
+				minThreshold := int64(5 * 1024 * 1024)
+				if GlobalConfig != nil {
+					minThreshold = GlobalConfig.GetMinReadThresholdBytes()
+				}
+				fileSize := totalSize
+
 				tracker := &trackingReader{
 					reader:            reader,
 					lastEvictedOffset: startOffset,
 					onRead: func(off int64, n int) {
 						GlobalRegistry.UpdateConnectionOffset(connID, off+int64(n))
+						if r.Method != http.MethodHead && GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
+							newRead := atomic.AddInt64(&hitTotalRead, int64(n))
+							if newRead >= minThreshold || (fileSize > 0 && newRead >= fileSize) {
+								hitPrehydrateOnce.Do(func() {
+									GlobalPrehydrationManager.OnCacheHit(targetURL, nextURLs)
+								})
+							}
+						}
 					},
 				}
 
@@ -222,9 +239,6 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 							w.Header().Set("Content-Type", meta.ContentType)
 						}
 					}
-				}
-				if r.Method != http.MethodHead && GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
-					GlobalPrehydrationManager.OnCacheHit(targetURL, nextURLs)
 				}
 				http.ServeContent(w, r, cacheFileName, time.Now(), tracker)
 				return
@@ -282,13 +296,10 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Pre-evict cache space to ensure sufficient disk space and cache quota before starting hydration
-		GlobalRegistry.PreEvict(totalSize)
-
 		metaPath := cacheFilePath + ".json"
 		partPath := filepath.Join(GlobalConfig.GetTmpDir(), cacheFileName+".part")
 
-		// Double-check if another concurrent request created FileCacheState during probe/pre-evict
+		// Double-check if another concurrent request created FileCacheState during probe
 		GlobalRegistry.Lock.Lock()
 		existingState, exists := GlobalRegistry.Files[cacheFileName]
 		if exists {
@@ -297,19 +308,6 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		} else {
 			state = NewFileCacheState(cacheFileName, targetURL, cacheFilePath, partPath, metaPath, probeContentType, etag, lastMod, totalSize)
 			state.NextURLs = nextURLs
-
-			// Save initial sparse metadata
-			meta := FileMeta{
-				URL:           targetURL,
-				TotalSize:     totalSize,
-				ContentType:   probeContentType,
-				ETag:          etag,
-				LastModified:  lastMod,
-				LastValidated: time.Now().Unix(),
-				Completed:     false,
-			}
-			metaBytes, _ := json.Marshal(meta)
-			_ = os.WriteFile(metaPath, metaBytes, 0644)
 
 			GlobalRegistry.Files[cacheFileName] = state
 			GlobalRegistry.Lock.Unlock()
@@ -645,7 +643,13 @@ func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
 	GlobalRegistry.Lock.RUnlock()
 
 	if !exists || fileState == nil {
-		http.Error(w, "Hydration not found for specified key", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Hydration not active (already cancelled or completed)",
+			"key":     key,
+		})
 		return
 	}
 

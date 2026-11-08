@@ -409,6 +409,10 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 		return
 	}
 
+	if !state.IsDiskMaterialized() {
+		_ = state.MaterializeDiskFile()
+	}
+
 	state.Lock.Lock()
 	state.IsPrehydrating = true
 	key := state.Key

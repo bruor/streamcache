@@ -106,6 +106,7 @@ type FileCacheState struct {
 	IsYielding           bool
 	YieldCooldownUntil   time.Time
 	NextURLs             []string
+	DiskMaterialized     bool
 }
 
 func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod string, totalSize int64) *FileCacheState {
@@ -209,6 +210,91 @@ func (s *FileCacheState) RecordConnEnd(connID string) {
 			conn.Closed = time.Now()
 		}
 	}
+}
+
+func (s *FileCacheState) IsDiskMaterialized() bool {
+	if s == nil {
+		return false
+	}
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	return s.DiskMaterialized
+}
+
+// MaterializeDiskFile creates and truncates the .part file on disk, saves metadata .json,
+// and flushes any chunks currently held in memory in LiveBuffer to disk.
+func (s *FileCacheState) MaterializeDiskFile() error {
+	if s == nil {
+		return nil
+	}
+
+	s.Lock.Lock()
+	if s.DiskMaterialized || FileExists(s.Path) {
+		s.Lock.Unlock()
+		return nil
+	}
+	totalSize := s.TotalSize
+	partPath := s.PartPath
+	metaPath := s.MetaPath
+	url := s.URL
+	contentType := s.ContentType
+	etag := s.ETag
+	lastMod := s.LastModified
+	key := s.Key
+	s.Lock.Unlock()
+
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+
+	if s.DiskMaterialized || FileExists(s.Path) {
+		return nil
+	}
+
+	var file *os.File
+	var err error
+	if FileExists(partPath) {
+		file, err = os.OpenFile(partPath, os.O_RDWR, 0644)
+	} else {
+		file, err = os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0644)
+	}
+	if err != nil {
+		log.Printf("[State] Error opening part file %s: %v", partPath, err)
+		return err
+	}
+	if totalSize > 0 {
+		_ = file.Truncate(totalSize)
+	}
+
+	// Save initial sparse metadata
+	meta := FileMeta{
+		URL:           url,
+		TotalSize:     totalSize,
+		ContentType:   contentType,
+		ETag:          etag,
+		LastModified:  lastMod,
+		LastValidated: time.Now().Unix(),
+		Completed:     false,
+	}
+	metaBytes, _ := json.Marshal(meta)
+	_ = os.WriteFile(metaPath, metaBytes, 0644)
+
+	if s.Pipeline != nil {
+		if wp, ok := s.Pipeline.(*WritebackPipeline); ok && wp != nil {
+			if err := wp.AttachFile(file); err != nil {
+				log.Printf("[State] Error attaching file to pipeline for %s: %v", key, err)
+			}
+		}
+	} else if s.LiveBuffer != nil {
+		_ = s.LiveBuffer.FlushToFile(file)
+	}
+
+	if s.File != nil && s.File != file {
+		_ = s.File.Close()
+	}
+	s.File = file
+	s.DiskMaterialized = true
+	log.Printf("[State] Materialized part file on disk for %s (size: %d bytes)", key, totalSize)
+	return nil
 }
 
 type CacheRegistry struct {
