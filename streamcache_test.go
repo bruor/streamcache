@@ -2588,15 +2588,19 @@ func TestSingleWorkerTailPrefetch(t *testing.T) {
 }
 
 func TestCancelAndRehydrateSameMedia(t *testing.T) {
+	GlobalConfig.Lock()
 	oldCacheDir := GlobalConfig.CacheDir
 	oldTmpDir := GlobalConfig.TmpDir
 	GlobalConfig.CacheDir = t.TempDir()
 	GlobalConfig.TmpDir = t.TempDir()
 	GlobalConfig.EvictYieldedParts = true
+	GlobalConfig.Unlock()
 	defer func() {
+		GlobalConfig.Lock()
 		GlobalConfig.EvictYieldedParts = false
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.Unlock()
 	}()
 
 	testBytes := make([]byte, 10000)
@@ -2628,13 +2632,19 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 	key, ext := getCacheKeyAndExt(targetURL)
 	cacheFileName := key + ext
 
+	var wg sync.WaitGroup
+
 	req1 := httptest.NewRequest("GET", "/stream?url="+url.QueryEscape(targetURL), nil)
 	rr1 := httptest.NewRecorder()
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	req1 = req1.WithContext(ctx1)
 
-	go handleMediaStream(rr1, req1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		handleMediaStream(rr1, req1)
+	}()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -2657,7 +2667,11 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 	defer cancel2()
 	req2 = req2.WithContext(ctx2)
 
-	go handleMediaStream(rr2, req2)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		handleMediaStream(rr2, req2)
+	}()
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -2679,6 +2693,7 @@ func TestCancelAndRehydrateSameMedia(t *testing.T) {
 
 	cancel2()
 	CancelCoordinator(state2)
+	wg.Wait()
 	time.Sleep(50 * time.Millisecond)
 }
 

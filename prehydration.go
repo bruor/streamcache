@@ -44,9 +44,11 @@ type ProviderCapacityReport struct {
 }
 
 type PrehydrationTask struct {
-	TargetURL  string
-	NextURLs   []string
-	EnqueuedAt time.Time
+	TargetURL     string
+	NextURLs      []string
+	EnqueuedAt    time.Time
+	NotBefore     time.Time
+	ProbeAttempts int
 }
 
 type PrehydrationManager struct {
@@ -567,12 +569,20 @@ func (pm *PrehydrationManager) processNextTask() {
 
 	// 2. Pop next queued tasks as long as capacity permits
 	for {
+		now := time.Now()
 		pm.mu.Lock()
-		if len(pm.queue) == 0 {
+		readyIdx := -1
+		for i, t := range pm.queue {
+			if t.NotBefore.IsZero() || now.After(t.NotBefore) {
+				readyIdx = i
+				break
+			}
+		}
+		if readyIdx == -1 {
 			pm.mu.Unlock()
 			break
 		}
-		task := pm.queue[0]
+		task := pm.queue[readyIdx]
 		pm.mu.Unlock()
 
 		if !pm.CanStartPrehydration(task.TargetURL) {
@@ -580,10 +590,19 @@ func (pm *PrehydrationManager) processNextTask() {
 		}
 
 		pm.mu.Lock()
-		if len(pm.queue) > 0 && pm.queue[0] == task {
-			pm.queue = pm.queue[1:]
+		removed := false
+		for i, t := range pm.queue {
+			if t == task {
+				pm.queue = append(pm.queue[:i], pm.queue[i+1:]...)
+				removed = true
+				break
+			}
 		}
 		pm.mu.Unlock()
+
+		if !removed {
+			continue
+		}
 
 		pm.executePrehydration(task)
 	}
@@ -632,32 +651,36 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 
 	log.Printf("[Prehydration] Probing upstream for upcoming episode: %s", targetURL)
 	totalSize, contentType, etag, lastMod, _, err := probeUpstream(ctx, targetURL, header, nil)
-	if err != nil {
+	if err != nil || totalSize <= 0 {
 		pm.mu.Lock()
 		if pm.prehydrationsStartedSinceLastPoll > 0 {
 			pm.prehydrationsStartedSinceLastPoll--
 		}
 		pm.mu.Unlock()
 
-		log.Printf("[Prehydration] Probe error for %s: %v. Placing into Yielding state without blocking live clients.", targetURL, err)
-		// Do NOT record FailedProbe tombstone on prehydration failure!
-		// Instead create state in Yielding mode so live clients can still stream or resume.
-		partPath := filepath.Join(GlobalConfig.GetTmpDir(), cacheFileName+".part")
-		metaPath := cacheFilePath + ".json"
-		backoff := 30 * time.Second
-		if GlobalConfig != nil {
-			backoff = GlobalConfig.GetPrehydrateYieldBackoff()
+		log.Printf("[Prehydration] Probe error for %s (size=%d, err=%v). Deferring without registering hydration card or blocking live clients.", targetURL, totalSize, err)
+		// Do NOT record FailedProbe tombstone and do NOT register a TotalSize=0 card in GlobalRegistry.Files.
+		// Re-queue transient probe failures with backoff so they retry quietly when capacity/upstream recovers.
+		if !isPermanentProbeError(err) && task.ProbeAttempts < 5 {
+			backoff := 30 * time.Second
+			if GlobalConfig != nil {
+				backoff = GlobalConfig.GetPrehydrateYieldBackoff()
+			}
+			task.ProbeAttempts++
+			task.NotBefore = time.Now().Add(backoff)
+			pm.mu.Lock()
+			alreadyQueued := false
+			for _, t := range pm.queue {
+				if t.TargetURL == targetURL {
+					alreadyQueued = true
+					break
+				}
+			}
+			if !alreadyQueued {
+				pm.queue = append(pm.queue, task)
+			}
+			pm.mu.Unlock()
 		}
-
-		GlobalRegistry.Lock.Lock()
-		state = NewFileCacheState(cacheFileName, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod, totalSize)
-		state.IsPrehydrating = true
-		state.IsYielding = true
-		state.YieldCooldownUntil = time.Now().Add(backoff)
-		state.NextURLs = task.NextURLs
-		state.UpstreamStatus = "Yielding"
-		GlobalRegistry.Files[cacheFileName] = state
-		GlobalRegistry.Lock.Unlock()
 		return
 	}
 

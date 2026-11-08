@@ -85,8 +85,8 @@ func (lb *LiveBuffer) Put(chunk *pooledChunk) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
-	lb.seqGen++
-	chunk.seq = lb.seqGen
+	seq := atomic.AddUint64(&lb.seqGen, 1)
+	atomic.StoreUint64(&chunk.seq, seq)
 
 	// Find insertion point by offset (binary search)
 	idx := sort.Search(len(lb.chunks), func(i int) bool {
@@ -107,16 +107,24 @@ func (lb *LiveBuffer) Put(chunk *pooledChunk) {
 	}
 	lb.curBytes += int64(chunk.length)
 
-	// Evict least recently used/added chunks if exceeding maxBytes
+	// Evict least recently used/added chunks if exceeding maxBytes,
+	// but never evict a chunk that is still in-flight to disk (refCount > 1).
 	for lb.curBytes > lb.maxBytes && len(lb.chunks) > 0 {
-		minIdx := 0
-		minSeq := atomic.LoadUint64(&lb.chunks[0].seq)
-		for i := 1; i < len(lb.chunks); i++ {
+		minIdx := -1
+		var minSeq uint64
+		for i := 0; i < len(lb.chunks); i++ {
+			if atomic.LoadInt32(&lb.chunks[i].refCount) > 1 {
+				continue
+			}
 			s := atomic.LoadUint64(&lb.chunks[i].seq)
-			if s < minSeq {
+			if minIdx == -1 || s < minSeq {
 				minSeq = s
 				minIdx = i
 			}
+		}
+		if minIdx == -1 {
+			// All chunks in LiveBuffer are still in-flight to disk; keep them pinned in RAM until written.
+			break
 		}
 
 		evicted := lb.chunks[minIdx]

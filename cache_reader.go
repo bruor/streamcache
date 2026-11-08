@@ -111,7 +111,7 @@ func (r *CacheReader) getFile() (*os.File, error) {
 	if r.file != nil {
 		return r.file, nil
 	}
-	if !FileExists(r.state.PartPath) && !FileExists(r.state.Path) {
+	if !r.state.IsDiskMaterialized() && !FileExists(r.state.Path) {
 		_ = r.state.MaterializeDiskFile()
 	}
 	f, err := os.Open(r.state.PartPath)
@@ -261,6 +261,11 @@ func (r *CacheReader) Close() error {
 		_ = os.Remove(r.state.PartPath)
 		_ = os.Remove(r.state.MetaPath)
 
+		accounted := atomic.SwapInt64(&r.state.TotalBytesDownloaded, 0)
+		if accounted > 0 && GlobalRegistry != nil {
+			GlobalRegistry.UpdateSize(-accounted)
+		}
+
 		GlobalRegistry.Lock.Lock()
 		if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
 			delete(GlobalRegistry.Files, r.state.Key)
@@ -284,6 +289,10 @@ func (r *CacheReader) Close() error {
 		if shouldCleanUpIncomplete {
 			_ = os.Remove(r.state.PartPath)
 			_ = os.Remove(r.state.MetaPath)
+			accounted := atomic.SwapInt64(&r.state.TotalBytesDownloaded, 0)
+			if accounted > 0 && GlobalRegistry != nil {
+				GlobalRegistry.UpdateSize(-accounted)
+			}
 			GlobalRegistry.Lock.Lock()
 			if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
 				delete(GlobalRegistry.Files, r.state.Key)
@@ -371,6 +380,7 @@ func (r *CacheReader) finalizeCache() {
 	meta = FileMeta{
 		URL:           r.state.URL,
 		TotalSize:     r.state.TotalSize,
+		ContentType:   r.state.ContentType,
 		ETag:          r.state.ETag,
 		LastModified:  r.state.LastModified,
 		LastValidated: time.Now().Unix(),
@@ -378,13 +388,23 @@ func (r *CacheReader) finalizeCache() {
 	}
 	newBytes, err := json.Marshal(meta)
 	if err == nil {
-		_ = os.WriteFile(metaPath, newBytes, 0644)
+		_ = writeMetaFileAtomic(metaPath, newBytes)
 	}
+
+	GlobalRegistry.MarkConnectionsAsInCache(r.state.Key)
+	r.state.SetUpstreamStatus("Completed")
 
 	// Remove from active registry
 	GlobalRegistry.Lock.Lock()
 	delete(GlobalRegistry.Files, r.state.Key)
 	GlobalRegistry.Lock.Unlock()
+
+	if GlobalLogBroker != nil {
+		go GlobalLogBroker.BroadcastStateUpdate()
+	}
+	if GlobalPrehydrationManager != nil {
+		GlobalPrehydrationManager.OnHydrationCompleted(r.state)
+	}
 
 	debug.FreeOSMemory()
 
@@ -475,7 +495,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	// 1. LiveBuffer Fast-Path: check in-memory buffer first for zero-copy playback
 	if r.state.LiveBuffer != nil {
 		if memN, ok := r.state.LiveBuffer.ReadAt(p[:toRead], off); ok && memN > 0 {
-			if memN < int(toRead) {
+			if memN < int(toRead) && (r.state.IsDiskMaterialized() || FileExists(r.state.PartPath) || FileExists(r.state.Path)) {
 				if f, ferr := r.getFile(); ferr == nil {
 					diskN, _ := f.ReadAt(p[memN:toRead], off+int64(memN))
 					memN += diskN
@@ -605,11 +625,12 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
 
 		curReadEnd := off + int64(n)
-		if curReadEnd-r.lastEvictedOffset >= 16*1024*1024 {
-			evictLen := curReadEnd - r.lastEvictedOffset - 8*1024*1024
+		lastEvict := atomic.LoadInt64(&r.lastEvictedOffset)
+		if curReadEnd-lastEvict >= 16*1024*1024 {
+			evictLen := curReadEnd - lastEvict - 8*1024*1024
 			if evictLen > 0 {
-				FadviseDontNeed(file.Fd(), r.lastEvictedOffset, evictLen)
-				r.lastEvictedOffset += evictLen
+				FadviseDontNeed(file.Fd(), lastEvict, evictLen)
+				atomic.AddInt64(&r.lastEvictedOffset, evictLen)
 			}
 		}
 
@@ -642,7 +663,7 @@ func (r *CacheReader) Seek(offset int64, whence int) (int64, error) {
 		return 0, errors.New("negative position")
 	}
 	r.offset = next
-	r.lastEvictedOffset = next
+	atomic.StoreInt64(&r.lastEvictedOffset, next)
 	return next, nil
 }
 

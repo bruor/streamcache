@@ -20,7 +20,7 @@ import (
 
 var (
 	coordinatorSleepMu sync.RWMutex
-	coordinatorSleepFn = time.Sleep
+	coordinatorSleepFn func(time.Duration)
 )
 
 // StartCoordinator spawns the manager goroutine for a given file
@@ -99,6 +99,10 @@ func CancelCoordinator(state *FileCacheState) {
 		if exists && (existingState == state || existingState == nil) {
 			delete(GlobalRegistry.Files, key)
 			GlobalRegistry.Lock.Unlock()
+			accounted := atomic.SwapInt64(&state.TotalBytesDownloaded, 0)
+			if accounted > 0 && GlobalRegistry != nil {
+				GlobalRegistry.UpdateSize(-accounted)
+			}
 			if FileExists(partPath) {
 				_ = os.Remove(partPath)
 			}
@@ -250,6 +254,10 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 				if exists && (existingState == state || existingState == nil) {
 					delete(GlobalRegistry.Files, state.Key)
 					GlobalRegistry.Lock.Unlock()
+					accounted := atomic.SwapInt64(&state.TotalBytesDownloaded, 0)
+					if accounted > 0 && GlobalRegistry != nil {
+						GlobalRegistry.UpdateSize(-accounted)
+					}
 					_ = os.Remove(state.PartPath)
 					_ = os.Remove(state.MetaPath)
 					log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
@@ -746,20 +754,35 @@ func runDownloadWorker(
 		sleepFn := coordinatorSleepFn
 		coordinatorSleepMu.RUnlock()
 
-		done := make(chan struct{})
-		go func() {
-			sleepFn(backoff)
-			close(done)
-		}()
-
-		select {
-		case <-ctx.Done():
-			log.Printf("[Worker-%d] Context canceled during retry backoff. Exiting worker.", w.id)
-			return true
-		case <-done:
-			if ctx.Err() != nil {
+		if sleepFn == nil {
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
 				log.Printf("[Worker-%d] Context canceled during retry backoff. Exiting worker.", w.id)
 				return true
+			case <-timer.C:
+				if ctx.Err() != nil {
+					log.Printf("[Worker-%d] Context canceled during retry backoff. Exiting worker.", w.id)
+					return true
+				}
+			}
+		} else {
+			done := make(chan struct{})
+			go func() {
+				sleepFn(backoff)
+				close(done)
+			}()
+
+			select {
+			case <-ctx.Done():
+				log.Printf("[Worker-%d] Context canceled during retry backoff. Exiting worker.", w.id)
+				return true
+			case <-done:
+				if ctx.Err() != nil {
+					log.Printf("[Worker-%d] Context canceled during retry backoff. Exiting worker.", w.id)
+					return true
+				}
 			}
 		}
 
@@ -1433,7 +1456,7 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 			}
 			newBytes, err := json.Marshal(meta)
 			if err == nil {
-				_ = os.WriteFile(metaPath, newBytes, 0644)
+				_ = writeMetaFileAtomic(metaPath, newBytes)
 			}
 			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
 			state.SetUpstreamStatus("Completed")

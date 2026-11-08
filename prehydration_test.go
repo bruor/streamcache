@@ -871,7 +871,11 @@ func TestDeferredPartFileCreationAndProbeBypass(t *testing.T) {
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	req2 = req2.WithContext(ctx2)
 
-	go handleMediaStream(rec2, req2)
+	doneCh2 := make(chan struct{})
+	go func() {
+		defer close(doneCh2)
+		handleMediaStream(rec2, req2)
+	}()
 
 	// Wait for streaming and reader to cross threshold
 	time.Sleep(150 * time.Millisecond)
@@ -889,14 +893,34 @@ func TestDeferredPartFileCreationAndProbeBypass(t *testing.T) {
 	}
 
 	cancel2()
+	<-doneCh2
 	time.Sleep(100 * time.Millisecond)
-	if state2 != nil {
-		CancelCoordinator(state2)
-	}
 
 	// Now that read threshold was crossed, part file or cached file MUST be materialized on disk!
 	if !FileExists(partPath) && !FileExists(filepath.Join(tmpDir, cacheFileName)) {
 		t.Fatalf("Expected part file %s to be materialized on disk once read threshold was crossed", partPath)
+	}
+
+	if state2 != nil {
+		CancelCoordinator(state2)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		GlobalRegistry.Lock.RLock()
+		curState, inReg := GlobalRegistry.Files[cacheFileName]
+		GlobalRegistry.Lock.RUnlock()
+		status := ""
+		writerActive := false
+		if curState != nil {
+			curState.Lock.Lock()
+			status = curState.UpstreamStatus
+			writerActive = curState.WriterActive
+			curState.Lock.Unlock()
+		}
+		if (!inReg || status != "Committing") && !writerActive && (GlobalLogBroker == nil || GlobalLogBroker.broadcasting.Load() == 0) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1486,6 +1510,112 @@ func TestPriorityUpgradeWhileSSEActiveNoSelfDeadlock(t *testing.T) {
 		t.Fatalf("Expected Priority Upgrade to remove %s from activePrehydrations", cacheFileName)
 	}
 }
+
+func TestFailedPrehydrationProbeDoesNotRegisterHydrationCard(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldConfig := GlobalConfig
+	GlobalConfig = &Config{
+		CacheDir:                  tmpDir,
+		TmpDir:                    tmpDir,
+		MaxUpstreamWorkers:        2,
+		EnableEpisodePrehydration: true,
+		PrehydrateYieldBackoff:    10 * time.Second,
+	}
+	defer func() { GlobalConfig = oldConfig }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+	oldPM := GlobalPrehydrationManager
+	GlobalPrehydrationManager = pm
+	defer func() { GlobalPrehydrationManager = oldPM }()
+
+	targetURL := ts.URL + "/failed_prehydrate_probe.mkv"
+	key, ext := getCacheKeyAndExt(targetURL)
+	cacheFileName := key + ext
+
+	pm.Enqueue(targetURL, []string{ts.URL + "/next_ep.mkv"})
+	pm.processNextTask()
+
+	// 1. Verify no FileCacheState was registered in GlobalRegistry.Files
+	GlobalRegistry.Lock.RLock()
+	_, exists := GlobalRegistry.Files[cacheFileName]
+	GlobalRegistry.Lock.RUnlock()
+	if exists {
+		t.Fatalf("Expected failed prehydration probe NOT to register a FileCacheState card in GlobalRegistry.Files")
+	}
+
+	// 2. Verify no FailedProbe tombstone was recorded (so live viewers are not blocked)
+	if GlobalRegistry.IsProbeFailed(cacheFileName) {
+		t.Fatalf("Expected failed prehydration probe NOT to record a FailedProbe tombstone")
+	}
+
+	// 3. Verify tentative slot was released and task was re-queued with NotBefore backoff
+	pm.mu.RLock()
+	started := pm.prehydrationsStartedSinceLastPoll
+	qLen := len(pm.queue)
+	var requeued *PrehydrationTask
+	if qLen > 0 {
+		requeued = pm.queue[0]
+	}
+	pm.mu.RUnlock()
+
+	if started != 0 {
+		t.Fatalf("Expected prehydrationsStartedSinceLastPoll to be 0 after failed probe, got %d", started)
+	}
+	if qLen != 1 || requeued == nil || requeued.ProbeAttempts != 1 || requeued.NotBefore.IsZero() {
+		t.Fatalf("Expected transient probe failure to re-queue task with ProbeAttempts=1 and NotBefore set")
+	}
+}
+
+func TestLiveBufferPinsInFlightChunksWithRefCountGreaterThanOne(t *testing.T) {
+	// Create a LiveBuffer with 4096-byte max capacity
+	lb := NewLiveBuffer(4096)
+
+	// Insert chunk 1 at offset 0 with refCount = 2 (in-flight to disk)
+	data1 := bytes.Repeat([]byte("1"), 4096)
+	chunk1 := newPooledChunk(0, data1, 2)
+	lb.Put(chunk1)
+
+	// Insert chunk 2 at offset 4096 with refCount = 2 (also in-flight to disk)
+	// Because chunk 1 has refCount == 2, LiveBuffer must keep chunk 1 pinned in RAM!
+	data2 := bytes.Repeat([]byte("2"), 4096)
+	chunk2 := newPooledChunk(4096, data2, 2)
+	lb.Put(chunk2)
+
+	buf := make([]byte, 4096)
+	if n, ok := lb.ReadAt(buf, 0); !ok || n != 4096 || buf[0] != '1' {
+		t.Fatalf("Expected in-flight chunk 1 (refCount=2) to remain pinned in LiveBuffer, got ok=%v n=%d", ok, n)
+	}
+
+	// Now simulate storageConsumer finishing disk write for chunk 1 (drops refCount from 2 -> 1)
+	chunk1.release()
+
+	// Insert chunk 3 at offset 8192 with refCount = 2; now chunk 1 (refCount == 1) can be evicted!
+	data3 := bytes.Repeat([]byte("3"), 4096)
+	chunk3 := newPooledChunk(8192, data3, 2)
+	lb.Put(chunk3)
+
+	if _, ok := lb.ReadAt(buf, 0); ok {
+		t.Fatalf("Expected chunk 1 (refCount=1) to be evicted once capacity was exceeded")
+	}
+	if n, ok := lb.ReadAt(buf, 4096); !ok || n != 4096 || buf[0] != '2' {
+		t.Fatalf("Expected in-flight chunk 2 (refCount=2) to remain pinned in LiveBuffer")
+	}
+
+	chunk2.release()
+	chunk3.release()
+	lb.Clear()
+}
+
 
 
 

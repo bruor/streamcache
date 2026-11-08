@@ -126,11 +126,23 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	}
 	newMetaBytes, err := json.Marshal(meta)
 	if err == nil {
-		_ = os.WriteFile(metaPath, newMetaBytes, 0644)
+		_ = writeMetaFileAtomic(metaPath, newMetaBytes)
 	}
 
 	log.Printf("[Revalidate] Cache validated successfully. Serving HIT for: %s", key)
 	return true, nil
+}
+
+func writeMetaFileAtomic(metaPath string, data []byte) error {
+	tmpPath := fmt.Sprintf("%s.tmp.%d", metaPath, time.Now().UnixNano())
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return os.WriteFile(metaPath, data, 0644)
+	}
+	if err := os.Rename(tmpPath, metaPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return os.WriteFile(metaPath, data, 0644)
+	}
+	return nil
 }
 
 func evictCachedFile(path, metaPath string) {
@@ -198,7 +210,7 @@ func recreateMetadata(filePath, metaPath, url string) error {
 		return err
 	}
 
-	return os.WriteFile(metaPath, metaBytes, 0644)
+	return writeMetaFileAtomic(metaPath, metaBytes)
 }
 
 // probeUpstream attempts to determine the file's size, Content-Type, ETag, and Last-Modified headers.
@@ -253,7 +265,10 @@ func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Head
 }
 
 func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, string, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	probeCtx, cancelProbe := context.WithCancel(ctx)
+	defer cancelProbe()
+
+	req, err := http.NewRequestWithContext(probeCtx, "GET", targetURL, nil)
 	if err != nil {
 		return 0, "", "", "", false, err
 	}
@@ -275,7 +290,10 @@ func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Head
 	if err != nil {
 		return 0, "", "", "", false, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		cancelProbe()
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode == http.StatusNotModified {
 		return 0, "", resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), true, nil
@@ -305,7 +323,10 @@ func tryRangeProbe(ctx context.Context, targetURL string, playerHeader http.Head
 }
 
 func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, string, bool, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	probeCtx, cancelProbe := context.WithCancel(ctx)
+	defer cancelProbe()
+
+	req, err := http.NewRequestWithContext(probeCtx, "GET", targetURL, nil)
 	if err != nil {
 		return 0, "", "", "", false, err
 	}
@@ -326,7 +347,10 @@ func tryStandardProbe(ctx context.Context, targetURL string, playerHeader http.H
 	if err != nil {
 		return 0, "", "", "", false, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		cancelProbe()
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode == http.StatusNotModified {
 		return 0, "", resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), true, nil
