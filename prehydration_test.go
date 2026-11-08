@@ -1021,6 +1021,250 @@ func TestProbeSuppressionAndIndicatorInDashboard(t *testing.T) {
 	}
 }
 
+func TestDynamicCapacityAccounting(t *testing.T) {
+	oldRes := GlobalConfig.GetPrehydrateCapacityReservation()
+	oldPrefetch := GlobalConfig.GetEnableEpisodePrehydration()
+	GlobalConfig.SetPrehydrateCapacityReservation(1)
+	GlobalConfig.SetEnableEpisodePrehydration(true)
+	defer func() {
+		GlobalConfig.SetPrehydrateCapacityReservation(oldRes)
+		GlobalConfig.SetEnableEpisodePrehydration(oldPrefetch)
+	}()
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		latestCapacity: &ProviderCapacityReport{
+			Status:                 "ok",
+			TotalMaxStreams:        5,
+			TotalActiveStreams:     2,
+			TotalAvailableStreams:  3,
+			TargetAvailableStreams: 3,
+		},
+	}
+
+	// Available = 3, Reservation = 1.
+	// Can start prehydration 1: (3 - 0) >= 2 -> true
+	if !pm.CanStartPrehydration("http://example.com/ep1") {
+		t.Fatalf("Expected CanStartPrehydration=true initially")
+	}
+
+	// Simulate starting prehydration 1
+	pm.mu.Lock()
+	pm.activePrehydrations["ep1"] = true
+	pm.prehydrationsStartedSinceLastPoll++
+	pm.mu.Unlock()
+
+	// Prehydration 2: effective available = 3 - 1 = 2 >= 2 -> true
+	if !pm.CanStartPrehydration("http://example.com/ep2") {
+		t.Fatalf("Expected CanStartPrehydration=true for 2nd prehydration")
+	}
+
+	// Simulate starting prehydration 2
+	pm.mu.Lock()
+	pm.activePrehydrations["ep2"] = true
+	pm.prehydrationsStartedSinceLastPoll++
+	pm.mu.Unlock()
+
+	// Prehydration 3: effective available = 3 - 2 = 1 < 2 -> false (reservation preserved for live viewers!)
+	if pm.CanStartPrehydration("http://example.com/ep3") {
+		t.Fatalf("Expected CanStartPrehydration=false when capacity reservation threshold is reached")
+	}
+
+	// Capacity poll arrives and resets started counter (with updated provider metrics)
+	pm.mu.Lock()
+	pm.prehydrationsStartedSinceLastPoll = 0
+	pm.latestCapacity = &ProviderCapacityReport{
+		Status:                 "ok",
+		TotalMaxStreams:        5,
+		TotalActiveStreams:     4,
+		TotalAvailableStreams:  1,
+		TargetAvailableStreams: 1,
+	}
+	pm.mu.Unlock()
+
+	// Now available is 1, reservation 1 -> 1 >= 2 is false
+	if pm.CanStartPrehydration("http://example.com/ep3") {
+		t.Fatalf("Expected CanStartPrehydration=false after capacity poll confirmed streams are active")
+	}
+}
+
+func TestYieldDeficiencySelectivePacing(t *testing.T) {
+	oldRes := GlobalConfig.GetPrehydrateCapacityReservation()
+	GlobalConfig.SetPrehydrateCapacityReservation(1)
+	defer GlobalConfig.SetPrehydrateCapacityReservation(oldRes)
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		latestCapacity: &ProviderCapacityReport{
+			Status:                 "ok",
+			TotalMaxStreams:        5,
+			TotalActiveStreams:     5,
+			TotalAvailableStreams:  0, // 0 available < reservation 1 -> deficiency of 1!
+			TargetAvailableStreams: 0,
+		},
+	}
+
+	tmpDir := t.TempDir()
+	fs1 := NewFileCacheState("f1.mkv", "http://example.com/f1", filepath.Join(tmpDir, "f1.mkv"), filepath.Join(tmpDir, "f1.mkv.part"), filepath.Join(tmpDir, "f1.mkv.json"), "video/mp4", "", "", 100)
+	fs1.IsPrehydrating = true
+	fs1.WriterActive = true
+	fs1.SetUpstreamStatus("Prehydrating")
+
+	fs2 := NewFileCacheState("f2.mkv", "http://example.com/f2", filepath.Join(tmpDir, "f2.mkv"), filepath.Join(tmpDir, "f2.mkv.part"), filepath.Join(tmpDir, "f2.mkv.json"), "video/mp4", "", "", 100)
+	fs2.IsPrehydrating = true
+	fs2.WriterActive = true
+	fs2.SetUpstreamStatus("Prehydrating")
+
+	fs3 := NewFileCacheState("f3.mkv", "http://example.com/f3", filepath.Join(tmpDir, "f3.mkv"), filepath.Join(tmpDir, "f3.mkv.part"), filepath.Join(tmpDir, "f3.mkv.json"), "video/mp4", "", "", 100)
+	fs3.IsPrehydrating = true
+	fs3.WriterActive = true
+	fs3.SetUpstreamStatus("Prehydrating")
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[fs1.Key] = fs1
+	GlobalRegistry.Files[fs2.Key] = fs2
+	GlobalRegistry.Files[fs3.Key] = fs3
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		CancelCoordinator(fs1)
+		CancelCoordinator(fs2)
+		CancelCoordinator(fs3)
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, fs1.Key)
+		delete(GlobalRegistry.Files, fs2.Key)
+		delete(GlobalRegistry.Files, fs3.Key)
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// Run checkYieldConditions. Since available=0 and reservation=1, deficiency=1.
+	// Exactly 1 prehydration should yield, NOT all 3!
+	pm.checkYieldConditions()
+
+	yieldedCount := 0
+	if fs1.IsYielding {
+		yieldedCount++
+	}
+	if fs2.IsYielding {
+		yieldedCount++
+	}
+	if fs3.IsYielding {
+		yieldedCount++
+	}
+
+	if yieldedCount != 1 {
+		t.Fatalf("Expected exactly 1 file to yield to satisfy reservation deficiency, got %d", yieldedCount)
+	}
+}
+
+func TestConcurrentYieldedReactivation(t *testing.T) {
+	oldRes := GlobalConfig.GetPrehydrateCapacityReservation()
+	GlobalConfig.SetPrehydrateCapacityReservation(1)
+	defer GlobalConfig.SetPrehydrateCapacityReservation(oldRes)
+
+	oldPM := GlobalPrehydrationManager
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.Header().Set("Content-Type", "video/mp4")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 100))
+	}))
+	defer ts.Close()
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		latestCapacity: &ProviderCapacityReport{
+			Status:                 "ok",
+			TotalMaxStreams:        6,
+			TotalActiveStreams:     2,
+			TotalAvailableStreams:  4, // 4 available, 1 reserved -> can run 3 prehydrations!
+			TargetAvailableStreams: 4,
+		},
+	}
+	GlobalPrehydrationManager = pm
+
+	tmpDir := t.TempDir()
+	fs1 := NewFileCacheState("f1.mkv", ts.URL+"/f1", filepath.Join(tmpDir, "f1.mkv"), filepath.Join(tmpDir, "f1.mkv.part"), filepath.Join(tmpDir, "f1.mkv.json"), "video/mp4", "", "", 100)
+	fs1.IsYielding = true
+	fs1.YieldCooldownUntil = time.Now().Add(-1 * time.Second)
+
+	fs2 := NewFileCacheState("f2.mkv", ts.URL+"/f2", filepath.Join(tmpDir, "f2.mkv"), filepath.Join(tmpDir, "f2.mkv.part"), filepath.Join(tmpDir, "f2.mkv.json"), "video/mp4", "", "", 100)
+	fs2.IsYielding = true
+	fs2.YieldCooldownUntil = time.Now().Add(-1 * time.Second)
+
+	fs3 := NewFileCacheState("f3.mkv", ts.URL+"/f3", filepath.Join(tmpDir, "f3.mkv"), filepath.Join(tmpDir, "f3.mkv.part"), filepath.Join(tmpDir, "f3.mkv.json"), "video/mp4", "", "", 100)
+	fs3.IsYielding = true
+	fs3.YieldCooldownUntil = time.Now().Add(-1 * time.Second)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[fs1.Key] = fs1
+	GlobalRegistry.Files[fs2.Key] = fs2
+	GlobalRegistry.Files[fs3.Key] = fs3
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		CancelCoordinator(fs1)
+		CancelCoordinator(fs2)
+		CancelCoordinator(fs3)
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			fs1.Lock.Lock()
+			w1 := fs1.WriterActive
+			fs1.Lock.Unlock()
+			fs2.Lock.Lock()
+			w2 := fs2.WriterActive
+			fs2.Lock.Unlock()
+			fs3.Lock.Lock()
+			w3 := fs3.WriterActive
+			fs3.Lock.Unlock()
+			if !w1 && !w2 && !w3 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, fs1.Key)
+		delete(GlobalRegistry.Files, fs2.Key)
+		delete(GlobalRegistry.Files, fs3.Key)
+		GlobalRegistry.Lock.Unlock()
+		GlobalPrehydrationManager = oldPM
+	}()
+
+	// Execute processNextTask.
+	// Since 3 slots are available above reservation (4 - 1 = 3),
+	// ALL 3 yielded prehydrations should reactivate concurrently!
+	pm.processNextTask()
+
+	if fs1.IsYielding || !fs1.IsPrehydrating {
+		t.Fatalf("Expected fs1 to be reactivated (IsYielding=false, IsPrehydrating=true)")
+	}
+	if fs2.IsYielding || !fs2.IsPrehydrating {
+		t.Fatalf("Expected fs2 to be reactivated (IsYielding=false, IsPrehydrating=true)")
+	}
+	if fs3.IsYielding || !fs3.IsPrehydrating {
+		t.Fatalf("Expected fs3 to be reactivated (IsYielding=false, IsPrehydrating=true)")
+	}
+
+	pm.mu.RLock()
+	activeCount := len(pm.activePrehydrations)
+	startedCount := pm.prehydrationsStartedSinceLastPoll
+	pm.mu.RUnlock()
+
+	if activeCount != 3 {
+		t.Fatalf("Expected 3 active prehydrations, got %d", activeCount)
+	}
+	if startedCount != 3 {
+		t.Fatalf("Expected 3 prehydrations started since last poll, got %d", startedCount)
+	}
+}
+
 
 
 

@@ -237,14 +237,15 @@ type writeWindow struct {
 
 // WritebackPipeline coordinates decoupled disk writes and continuous writeback pacing
 type WritebackPipeline struct {
+	fileMu     sync.RWMutex
 	file       *os.File
+	fd         uintptr
 	state      *FileCacheState
 	liveBuffer *LiveBuffer
 	queue      chan *pooledChunk
 	mu         sync.RWMutex
 	closed     bool
 	wg         sync.WaitGroup
-	fd         uintptr
 	lastErr    error
 	errMu      sync.Mutex
 
@@ -348,8 +349,8 @@ func (wp *WritebackPipeline) AttachFile(file *os.File) error {
 		return nil
 	}
 
-	wp.mu.Lock()
-	defer wp.mu.Unlock()
+	wp.fileMu.Lock()
+	defer wp.fileMu.Unlock()
 
 	if wp.file != nil {
 		return nil
@@ -372,9 +373,9 @@ func (wp *WritebackPipeline) storageConsumer() {
 	defer wp.wg.Done()
 
 	for chunk := range wp.queue {
-		wp.mu.RLock()
+		wp.fileMu.RLock()
 		file := wp.file
-		wp.mu.RUnlock()
+		wp.fileMu.RUnlock()
 
 		if file != nil && chunk.bufPtr != nil {
 			_, err := file.WriteAt((*chunk.bufPtr)[:chunk.length], chunk.offset)
@@ -401,9 +402,9 @@ func (wp *WritebackPipeline) storageConsumer() {
 
 // paceWriteback accumulates written bytes into windows and paces asynchronous flush to physical disk
 func (wp *WritebackPipeline) paceWriteback(offset int64, length int64) {
-	wp.mu.RLock()
+	wp.fileMu.RLock()
 	fd := wp.fd
-	wp.mu.RUnlock()
+	wp.fileMu.RUnlock()
 
 	if fd == 0 {
 		return
@@ -430,8 +431,8 @@ func (wp *WritebackPipeline) paceWriteback(offset int64, length int64) {
 			wp.windows = wp.windows[1:]
 			span := oldest.end - oldest.start
 			if span > 0 {
-				SyncFileRangeWrite(wp.fd, oldest.start, span)
-				SyncFileRangeWaitAndEvict(wp.fd, oldest.start, span)
+				SyncFileRangeWrite(fd, oldest.start, span)
+				SyncFileRangeWaitAndEvict(fd, oldest.start, span)
 			}
 		}
 		wp.windows = append(wp.windows, writeWindow{start: offset, end: chunkEnd})
@@ -445,11 +446,11 @@ func (wp *WritebackPipeline) paceWriteback(offset int64, length int64) {
 		currLength := span
 
 		// 1. Asynchronously initiate writeout of the completed window
-		SyncFileRangeWrite(wp.fd, currOffset, currLength)
+		SyncFileRangeWrite(fd, currOffset, currLength)
 
 		// 2. Await hardware writeout completion of previous window and evict clean pages from host RAM
 		if wp.prevWindowLength > 0 {
-			SyncFileRangeWaitAndEvict(wp.fd, wp.prevWindowOffset, wp.prevWindowLength)
+			SyncFileRangeWaitAndEvict(fd, wp.prevWindowOffset, wp.prevWindowLength)
 		}
 
 		wp.prevWindowOffset = currOffset
@@ -460,21 +461,25 @@ func (wp *WritebackPipeline) paceWriteback(offset int64, length int64) {
 
 // flushFinalWriteback cleanly flushes and evicts remaining written bytes
 func (wp *WritebackPipeline) flushFinalWriteback() {
-	if wp.fd == 0 {
+	wp.fileMu.RLock()
+	fd := wp.fd
+	wp.fileMu.RUnlock()
+
+	if fd == 0 {
 		return
 	}
 
 	for _, w := range wp.windows {
 		span := w.end - w.start
 		if span > 0 {
-			SyncFileRangeWrite(wp.fd, w.start, span)
-			SyncFileRangeWaitAndEvict(wp.fd, w.start, span)
+			SyncFileRangeWrite(fd, w.start, span)
+			SyncFileRangeWaitAndEvict(fd, w.start, span)
 		}
 	}
 	wp.windows = nil
 
 	if wp.prevWindowLength > 0 {
-		SyncFileRangeWaitAndEvict(wp.fd, wp.prevWindowOffset, wp.prevWindowLength)
+		SyncFileRangeWaitAndEvict(fd, wp.prevWindowOffset, wp.prevWindowLength)
 		wp.prevWindowLength = 0
 	}
 }
