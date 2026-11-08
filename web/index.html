@@ -878,6 +878,43 @@
             font-size: 0.78rem;
         }
 
+        @keyframes probe-pulse {
+            0% {
+                opacity: 1;
+                box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.6);
+            }
+            50% {
+                opacity: 0.7;
+                box-shadow: 0 0 8px 3px rgba(245, 158, 11, 0.35);
+            }
+            100% {
+                opacity: 1;
+                box-shadow: 0 0 0 0 rgba(245, 158, 11, 0);
+            }
+        }
+
+        .probe-status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(245, 158, 11, 0.12) !important;
+            border: 1px solid rgba(245, 158, 11, 0.45) !important;
+            color: #f59e0b !important;
+            font-size: 0.82rem;
+            font-weight: 600;
+            padding: 6px 14px;
+            border-radius: 12px;
+            animation: probe-pulse 1.2s infinite ease-in-out;
+            cursor: default;
+        }
+
+        .probe-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #f59e0b;
+            box-shadow: 0 0 8px #f59e0b;
+        }
 
     </style>
 </head>
@@ -889,9 +926,13 @@
             <div class="status-pill cache-status-pill" id="provider-capacity-pill" style="display: none;">
                 <span style="font-size: 1.2rem;">📡</span>
                 <div class="cache-status-info">
-                    <div id="topbar-provider-text">Providers: -- / -- slots</div>
-                    <div id="topbar-provider-avail-text" style="color: var(--accent-green); font-size: 0.78rem;">Available: --</div>
+                    <div id="topbar-provider-text">Serving: 0 VOD</div>
+                    <div id="topbar-provider-avail-text" style="color: var(--accent-green); font-size: 0.78rem;">Upstream: -- slots</div>
                 </div>
+            </div>
+            <div class="status-pill probe-status-pill" id="probe-status-pill" style="display: none;" title="Player is actively probing media container headers in RAM">
+                <span class="probe-dot"></span>
+                <span>Probe Active</span>
             </div>
             <div class="status-pill cache-status-pill">
                 <span style="font-size: 1.2rem;">💾</span>
@@ -1688,21 +1729,60 @@
                 const minDiskText = minDiskFree > 0 ? ` (${formatBytes(minDiskFree)} Reserved)` : '';
                 topbarDiskText.innerText = `Disk Free: ${formatBytes(diskFree)}${minDiskText}`;
 
-                if (data.provider_capacity && data.provider_capacity.status === 'ok') {
-                    const cap = data.provider_capacity;
-                    const provPill = document.getElementById('provider-capacity-pill');
-                    const provText = document.getElementById('topbar-provider-text');
-                    const provAvail = document.getElementById('topbar-provider-avail-text');
-                    if (provPill && provText && provAvail) {
-                        provPill.style.display = 'flex';
-                        const maxStr = cap.total_max_streams >= 999 ? 'Unlimited' : cap.total_max_streams;
-                        provText.innerText = `Providers: ${cap.total_active_streams} / ${maxStr} slots`;
-                        provAvail.innerText = `Available: ${cap.total_available_streams}`;
-                        if (cap.total_available_streams <= 1) {
-                            provAvail.style.color = 'var(--accent-orange)';
-                        } else {
-                            provAvail.style.color = 'var(--accent-green)';
+                // Update Serving & Provider Capacity Pill
+                const provPill = document.getElementById('provider-capacity-pill');
+                const provText = document.getElementById('topbar-provider-text');
+                const provAvail = document.getElementById('topbar-provider-avail-text');
+                const vodClients = (data.active_vod_clients !== undefined) ? data.active_vod_clients :
+                    (data.active_connections ? data.active_connections.filter(c => c.active_conns > 0).length : 0);
+
+                if (provPill && provText && provAvail) {
+                    provPill.style.display = 'flex';
+                    let liveClientsStr = '';
+                    let upstreamStr = 'Upstream: -- slots';
+                    let availColor = 'var(--accent-green)';
+                    let tooltipLines = [`Active Clients Served:`, `• VOD (Streamcache): ${vodClients}`];
+
+                    if (data.provider_capacity && data.provider_capacity.status === 'ok') {
+                        const cap = data.provider_capacity;
+                        const liveClients = cap.live_clients !== undefined ? cap.live_clients : 0;
+                        liveClientsStr = ` · ${liveClients} Live`;
+                        tooltipLines.push(`• Live TV (Dispatcharr): ${liveClients}`);
+
+                        const maxStr = cap.total_max_streams >= 999 ? '∞' : cap.total_max_streams;
+                        const activeStr = cap.total_active_streams;
+                        const ratio = (cap.total_max_streams > 0 && cap.total_max_streams < 999)
+                            ? ` (${Math.round((activeStr / cap.total_max_streams) * 100)}%)`
+                            : '';
+                        upstreamStr = `Upstream: ${activeStr} / ${maxStr} slots${ratio}`;
+                        tooltipLines.push(``, `Upstream Slots Consumed:`, `• ${activeStr} of ${maxStr} active (${cap.total_available_streams} free)`);
+
+                        if (cap.providers && cap.providers.length > 0) {
+                            tooltipLines.push(``, `Providers:`);
+                            cap.providers.forEach(p => {
+                                const pMax = p.max_streams >= 999 ? '∞' : p.max_streams;
+                                tooltipLines.push(`• ${p.account_name}: ${p.active_streams}/${pMax} used (${p.available_streams} free)`);
+                            });
                         }
+
+                        if (cap.total_available_streams <= 1) {
+                            availColor = 'var(--accent-orange)';
+                        }
+                    }
+
+                    provText.innerText = `Serving: ${vodClients} VOD${liveClientsStr}`;
+                    provAvail.innerText = upstreamStr;
+                    provAvail.style.color = availColor;
+                    provPill.title = tooltipLines.join('\n');
+                }
+
+                // Update Probe Activity Indicator Pill
+                const probePill = document.getElementById('probe-status-pill');
+                if (probePill) {
+                    if (data.probe_active) {
+                        probePill.style.display = 'inline-flex';
+                    } else {
+                        probePill.style.display = 'none';
                     }
                 }
 

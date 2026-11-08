@@ -3285,6 +3285,7 @@ func TestDashboardSSEStateStream(t *testing.T) {
 	state.UpstreamStatus = "Downloading"
 	state.DownloadSpeed = 10000000
 	state.ZeroSpeedSec = 4 // Stalled
+	state.DiskMaterialized = true
 
 	GlobalRegistry.Lock.Lock()
 	GlobalRegistry.Files[key] = state
