@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1621,6 +1622,252 @@ func TestLiveBufferPinsInFlightChunksWithRefCountGreaterThanOne(t *testing.T) {
 	chunk3.release()
 	lb.Clear()
 }
+
+func TestLiveBufferSmallReadsCoalesceInto128KBChunks(t *testing.T) {
+	lb := NewLiveBuffer(64 * 1024 * 1024)
+	defer lb.Clear()
+
+	smallSlice := bytes.Repeat([]byte("A"), 3000)
+	var offset int64
+	for i := 0; i < 2000; i++ {
+		req := lb.PutSlice(offset, smallSlice, false)
+		if req.length != 3000 {
+			t.Fatalf("Expected writeReq length 3000, got %d", req.length)
+		}
+		offset += 3000
+	}
+
+	lb.mu.RLock()
+	numChunks := len(lb.chunks)
+	curBytes := lb.curBytes
+	lb.mu.RUnlock()
+
+	if curBytes != 6000000 {
+		t.Fatalf("Expected curBytes=6000000, got %d", curBytes)
+	}
+	// 6,000,000 bytes / 131,072 bytes per chunk = 45.77 -> 46 chunks (instead of 2,000 chunks!)
+	if numChunks > 50 {
+		t.Fatalf("Expected small slices to coalesce into <= 50 128KB chunks, got %d chunks", numChunks)
+	}
+
+	readBuf := make([]byte, 10000)
+	if n, ok := lb.ReadAt(readBuf, 129000); !ok || n != 10000 {
+		t.Fatalf("Expected cross-chunk ReadAt to succeed with 10000 bytes, got ok=%v n=%d", ok, n)
+	}
+}
+
+func TestPreEvictAccountsForConcurrentActiveUnwrittenBytes(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldMaxBytes := GlobalConfig.CacheMaxBytes
+	oldMinFree := GlobalConfig.MinDiskFreeBytes
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.CacheMaxBytes = 300
+	GlobalConfig.MinDiskFreeBytes = 0
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.CacheMaxBytes = oldMaxBytes
+		GlobalConfig.MinDiskFreeBytes = oldMinFree
+		GlobalConfig.Unlock()
+	}()
+
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	oldTotal := atomic.LoadInt64(&GlobalRegistry.TotalCacheSize)
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	atomic.StoreInt64(&GlobalRegistry.TotalCacheSize, 230)
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		atomic.StoreInt64(&GlobalRegistry.TotalCacheSize, oldTotal)
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// Write two inactive 100-byte files in cacheDir
+	for i, name := range []string{"old1.mkv", "old2.mkv"} {
+		p := filepath.Join(tmpDir, name)
+		if err := os.WriteFile(p, bytes.Repeat([]byte("x"), 100), 0644); err != nil {
+			t.Fatal(err)
+		}
+		meta := FileMeta{
+			URL:           "http://example.com/" + name,
+			TotalSize:     100,
+			Completed:     true,
+			LastValidated: time.Now().Add(time.Duration(i-2) * time.Hour).Unix(),
+		}
+		mb, _ := json.Marshal(meta)
+		_ = os.WriteFile(p+".json", mb, 0644)
+	}
+
+	// Register an active materialized file with TotalSize=150 and TotalBytesDownloaded=30 (120 bytes unwritten)
+	activeState := NewFileCacheState(
+		"active1.mkv",
+		"http://example.com/active1.mkv",
+		filepath.Join(tmpDir, "active1.mkv"),
+		filepath.Join(tmpDir, "active1.mkv.part"),
+		filepath.Join(tmpDir, "active1.mkv.json"),
+		"video/x-matroska",
+		"",
+		"",
+		150,
+	)
+	activeState.DiskMaterialized = true
+	atomic.StoreInt64(&activeState.TotalBytesDownloaded, 30)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files["active1.mkv"] = activeState
+	GlobalRegistry.Lock.Unlock()
+
+	// Call PreEvict(100) for a second incoming file.
+	// Total projected = currentSize(230) + unwrittenActive(120) + incoming(100) = 450 > maxBytes(300) -> must free 150 bytes (both old1 and old2).
+	GlobalRegistry.PreEvict(100)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !FileExists(filepath.Join(tmpDir, "old1.mkv")) && !FileExists(filepath.Join(tmpDir, "old2.mkv")) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if FileExists(filepath.Join(tmpDir, "old1.mkv")) || FileExists(filepath.Join(tmpDir, "old2.mkv")) {
+		t.Fatalf("Expected both old1.mkv and old2.mkv to be evicted when accounting for active unwritten bytes")
+	}
+}
+
+func TestProbeDisconnectDoesNotAbortMaterializedPrehydration(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	oldEnablePre := GlobalConfig.EnableEpisodePrehydration
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	GlobalConfig.EnableEpisodePrehydration = true
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.EnableEpisodePrehydration = oldEnablePre
+		GlobalConfig.Unlock()
+	}()
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		latestCapacity: &ProviderCapacityReport{
+			Status:                 "ok",
+			TotalMaxStreams:        10,
+			TotalActiveStreams:     2,
+			TotalAvailableStreams:  8,
+			TargetAvailableStreams: 8,
+		},
+	}
+	oldPM := GlobalPrehydrationManager
+	GlobalPrehydrationManager = pm
+	defer func() { GlobalPrehydrationManager = oldPM }()
+
+	partPath := filepath.Join(tmpDir, "bigmovie.mkv.part")
+	metaPath := filepath.Join(tmpDir, "bigmovie.mkv.json")
+	cachePath := filepath.Join(tmpDir, "bigmovie.mkv")
+
+	state := NewFileCacheState(
+		"bigmovie.mkv",
+		"http://example.com/bigmovie.mkv",
+		cachePath,
+		partPath,
+		metaPath,
+		"video/x-matroska",
+		"",
+		"",
+		80*1024*1024,
+	)
+	state.IsPrehydrating = true
+	state.WriterActive = true
+	if err := state.MaterializeDiskFile(); err != nil {
+		t.Fatal(err)
+	}
+	// Write 4096 cached bytes at offset 0
+	chunk := newPooledChunk(0, bytes.Repeat([]byte("M"), 4096), 1)
+	state.LiveBuffer.Put(chunk)
+	state.RangeSet.Add(0, 4096)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files["bigmovie.mkv"] = state
+	GlobalRegistry.Lock.Unlock()
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, "bigmovie.mkv")
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	pm.mu.Lock()
+	pm.activePrehydrations["bigmovie.mkv"] = true
+	pm.prehydrationsStartedSinceLastPoll = 1
+	pm.mu.Unlock()
+
+	// Phase 1: A probe (<5MB read) connects to the active prehydration.
+	// It must NOT alter IsPrehydrating while open or abort the hydration on disconnect.
+	req := httptest.NewRequest("GET", "/stream?url=http://example.com/bigmovie.mkv", nil)
+	reader := NewCacheReader(context.Background(), state, req)
+	buf := make([]byte, 4096)
+	if n, err := reader.ReadAt(buf, 0); err != nil || n != 4096 {
+		t.Fatalf("Expected probe ReadAt to succeed, got n=%d err=%v", n, err)
+	}
+	state.Lock.Lock()
+	stillPreDuringProbe := state.IsPrehydrating
+	state.Lock.Unlock()
+	if !stillPreDuringProbe {
+		t.Fatalf("Expected <5MB probe NOT to alter state.IsPrehydrating while reading")
+	}
+	_ = reader.Close()
+
+	// Verify part file was NOT deleted and state remained IsPrehydrating=true!
+	if !FileExists(partPath) {
+		t.Fatalf("Expected materialized .part file to be preserved after <5MB probe disconnect!")
+	}
+	state.Lock.Lock()
+	isPre := state.IsPrehydrating
+	writerActive := state.WriterActive
+	state.Lock.Unlock()
+	if !isPre || !writerActive {
+		t.Fatalf("Expected state to remain active and IsPrehydrating=true, got isPre=%v writerActive=%v", isPre, writerActive)
+	}
+
+	// Phase 2: Even if a client had upgraded to live playback and disconnected early, .part is preserved and downshifted.
+	state.Lock.Lock()
+	state.IsPrehydrating = false
+	state.Lock.Unlock()
+	pm.OnPriorityUpgrade("bigmovie.mkv")
+
+	reader2 := NewCacheReader(context.Background(), state, req)
+	if n, err := reader2.ReadAt(buf, 0); err != nil || n != 4096 {
+		t.Fatalf("Expected second ReadAt to succeed, got n=%d err=%v", n, err)
+	}
+	_ = reader2.Close()
+
+	if !FileExists(partPath) {
+		t.Fatalf("Expected materialized .part file to be preserved after upgraded client disconnect!")
+	}
+	state.Lock.Lock()
+	isPreAfterDownshift := state.IsPrehydrating
+	state.Lock.Unlock()
+	if !isPreAfterDownshift {
+		t.Fatalf("Expected state to downshift back to IsPrehydrating=true after upgraded client disconnect")
+	}
+}
+
 
 
 

@@ -117,6 +117,32 @@ func (r *CacheReader) getFile() (*os.File, error) {
 	return r.file, nil
 }
 
+func (r *CacheReader) upgradeFromPrehydration() {
+	if r.state == nil {
+		return
+	}
+	r.state.Lock.Lock()
+	wasPrehydrating := r.state.IsPrehydrating || r.state.IsYielding
+	if !wasPrehydrating {
+		r.state.Lock.Unlock()
+		return
+	}
+	r.state.IsPrehydrating = false
+	r.state.IsYielding = false
+	key := r.state.Key
+	isWriterActive := r.state.WriterActive
+	r.state.Lock.Unlock()
+
+	log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", key)
+	if GlobalPrehydrationManager != nil {
+		GlobalPrehydrationManager.OnPriorityUpgrade(key)
+	}
+	r.state.SetUpstreamStatus("Connecting")
+	if !isWriterActive && !r.state.RangeSet.IsComplete(r.state.TotalSize) {
+		StartCoordinator(r.state, nil)
+	}
+}
+
 func (r *CacheReader) recordRead(off int64, n int) {
 	if n <= 0 {
 		return
@@ -144,6 +170,7 @@ func (r *CacheReader) recordRead(off int64, n int) {
 			}
 			_ = r.state.MaterializeDiskFile()
 		}
+		r.upgradeFromPrehydration()
 	} else if r.state != nil && !r.state.IsDiskMaterialized() && GlobalRegistry != nil {
 		GlobalRegistry.RecordProbeActivity()
 	}
@@ -180,7 +207,7 @@ func (r *CacheReader) Close() error {
 	totalRead := atomic.LoadInt64(&r.totalBytesRead)
 	maxOffset := atomic.LoadInt64(&r.maxReadOffset)
 	isPrehydrating := r.state.IsPrehydrating || r.state.IsYielding
-	isProbe := !isCompleted && !isPrehydrating && totalRead < minThreshold && maxOffset < minThreshold
+	isProbe := !isCompleted && !r.state.DiskMaterialized && !isPrehydrating && totalRead < minThreshold && maxOffset < minThreshold
 
 	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
 	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
@@ -267,7 +294,7 @@ func (r *CacheReader) Close() error {
 			}
 			GlobalRegistry.Lock.Unlock()
 			log.Printf("[Reader] Removed incomplete cache file on last client exit: %s", r.state.Key)
-		} else if remainingClients == 0 && !isCompleted {
+		} else if remainingClients == 0 && !isCompleted && !isPrehydrating {
 			// Downshift incomplete hydration to prehydration mode
 			if GlobalPrehydrationManager != nil {
 				GlobalPrehydrationManager.OnDownshift(r.state)
@@ -385,6 +412,10 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 
 		r.state.Lock.Lock()
 		if !r.state.WriterActive {
+			wasYielding := r.state.IsYielding
+			if wasYielding {
+				r.state.IsYielding = false
+			}
 			r.state.Lock.Unlock()
 			log.Printf("[Reader] Upstream coordinator inactive for %s while offset %d is required. Resuscitation triggered.", r.state.Key, off)
 			StartCoordinator(r.state, nil)

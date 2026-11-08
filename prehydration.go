@@ -429,7 +429,12 @@ func (pm *PrehydrationManager) OnPriorityUpgrade(key string) {
 		return
 	}
 	pm.mu.Lock()
-	delete(pm.activePrehydrations, key)
+	if pm.activePrehydrations[key] {
+		delete(pm.activePrehydrations, key)
+		if pm.prehydrationsStartedSinceLastPoll > 0 {
+			pm.prehydrationsStartedSinceLastPoll--
+		}
+	}
 	pm.mu.Unlock()
 }
 
@@ -488,6 +493,9 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 	}
 
 	if !state.IsDiskMaterialized() {
+		if GlobalRegistry != nil && state.TotalSize > 0 {
+			GlobalRegistry.PreEvict(state.TotalSize)
+		}
 		_ = state.MaterializeDiskFile()
 	}
 

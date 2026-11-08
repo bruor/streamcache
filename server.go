@@ -320,27 +320,11 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Priority Upgrade: if file was prehydrating or yielding, immediately upgrade to live playback!
 		state.Lock.Lock()
-		wasPrehydrating := state.IsPrehydrating || state.IsYielding
-		state.IsPrehydrating = false
-		state.IsYielding = false
 		if len(nextURLs) > 0 {
 			state.NextURLs = nextURLs
 		}
-		isWriterActive := state.WriterActive
 		state.Lock.Unlock()
-
-		if wasPrehydrating {
-			log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", cacheFileName)
-			if GlobalPrehydrationManager != nil {
-				GlobalPrehydrationManager.OnPriorityUpgrade(cacheFileName)
-			}
-			state.SetUpstreamStatus("Connecting")
-			if !isWriterActive && !state.RangeSet.IsComplete(state.TotalSize) {
-				StartCoordinator(state, r.Header)
-			}
-		}
 	}
 
 	// Create request-bound CacheReader
@@ -350,8 +334,13 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// Check if all bytes are already completed before starting coordinator
 	isCompleted := state.RangeSet.IsComplete(state.TotalSize)
 
+	state.Lock.Lock()
+	isYielding := state.IsYielding
+	state.Lock.Unlock()
+
 	// Spin up Upstream Download Coordinator if not active and file not fully completed
-	if !isCompleted {
+	// (If state is currently Yielding, defer waking coordinator until CacheReader crosses read threshold or requires uncached bytes)
+	if !isCompleted && !isYielding {
 		StartCoordinator(state, r.Header)
 	}
 
