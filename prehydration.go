@@ -290,15 +290,20 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 
 	// Capacity tight: yield running prehydrations
 	GlobalRegistry.Lock.RLock()
-	var prehydratingFiles []*FileCacheState
+	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
 	for _, fs := range GlobalRegistry.Files {
+		files = append(files, fs)
+	}
+	GlobalRegistry.Lock.RUnlock()
+
+	var prehydratingFiles []*FileCacheState
+	for _, fs := range files {
 		fs.Lock.Lock()
 		if fs.IsPrehydrating && len(fs.Clients) == 0 && !fs.IsYielding && fs.WriterActive {
 			prehydratingFiles = append(prehydratingFiles, fs)
 		}
 		fs.Lock.Unlock()
 	}
-	GlobalRegistry.Lock.RUnlock()
 
 	for _, fs := range prehydratingFiles {
 		log.Printf("[Prehydration] Provider capacity tight (Available: %d, Reserved: %d). Yielding prehydration: %s",
@@ -486,15 +491,20 @@ func (pm *PrehydrationManager) schedulerLoop() {
 func (pm *PrehydrationManager) processNextTask() {
 	// 1. First, check if any yielded states are ready to resume
 	GlobalRegistry.Lock.RLock()
-	var yieldedCandidates []*FileCacheState
+	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
 	for _, fs := range GlobalRegistry.Files {
+		files = append(files, fs)
+	}
+	GlobalRegistry.Lock.RUnlock()
+
+	var yieldedCandidates []*FileCacheState
+	for _, fs := range files {
 		fs.Lock.Lock()
 		if fs.IsYielding && len(fs.Clients) == 0 && time.Now().After(fs.YieldCooldownUntil) {
 			yieldedCandidates = append(yieldedCandidates, fs)
 		}
 		fs.Lock.Unlock()
 	}
-	GlobalRegistry.Lock.RUnlock()
 
 	for _, fs := range yieldedCandidates {
 		if pm.CanStartPrehydration(fs.URL) {
