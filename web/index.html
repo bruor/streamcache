@@ -901,7 +901,7 @@
         .capacity-split-section {
             display: flex;
             flex-direction: column;
-            justify-content: center;
+            justify-content: flex-start;
             gap: 3px;
             min-width: 96px;
         }
@@ -915,7 +915,10 @@
             display: flex;
             align-items: center;
             gap: 5px;
-            margin-bottom: 1px;
+            height: 18px;
+            line-height: 18px;
+            margin-bottom: 3px;
+            box-sizing: border-box;
         }
 
         .capacity-section-header.vod {
@@ -931,6 +934,7 @@
             height: 6px;
             border-radius: 50%;
             display: inline-block;
+            flex-shrink: 0;
         }
 
         .capacity-section-header.vod .capacity-section-dot {
@@ -948,8 +952,10 @@
             justify-content: space-between;
             align-items: center;
             gap: 10px;
+            height: 16px;
+            line-height: 16px;
             font-size: 0.76rem;
-            line-height: 1.2;
+            box-sizing: border-box;
         }
 
         .capacity-metric-label {
@@ -991,16 +997,15 @@
 
         .capacity-providers-section {
             display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            flex-wrap: wrap;
+            align-items: stretch;
+            gap: 0.85rem;
         }
 
         .capacity-provider-block {
             display: flex;
             flex-direction: column;
-            justify-content: center;
-            gap: 4px;
+            justify-content: flex-start;
+            gap: 3px;
             min-width: 120px;
         }
 
@@ -1009,26 +1014,40 @@
             align-items: center;
             justify-content: space-between;
             gap: 8px;
-            font-size: 0.78rem;
-            line-height: 1.2;
+            height: 18px;
+            line-height: 18px;
+            margin-bottom: 3px;
+            box-sizing: border-box;
         }
 
         .capacity-provider-name {
-            font-weight: 700;
+            font-family: var(--font-mono);
+            font-size: 0.68rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
             color: var(--text-main);
             white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .capacity-provider-total {
             font-family: var(--font-mono);
-            font-size: 0.73rem;
+            font-size: 0.68rem;
             font-weight: 700;
-            padding: 1px 6px;
+            padding: 0 5px;
+            height: 16px;
+            line-height: 14px;
             border-radius: 4px;
             background: rgba(0, 240, 255, 0.12);
             color: var(--accent-secondary);
             border: 1px solid rgba(0, 240, 255, 0.3);
             white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            flex-shrink: 0;
+            box-sizing: border-box;
         }
 
         .capacity-provider-total.warn {
@@ -1044,34 +1063,47 @@
         }
 
         .capacity-profiles-list {
-            display: flex;
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, auto));
+            gap: 3px 6px;
             align-items: center;
-            gap: 5px;
-            flex-wrap: wrap;
+            justify-content: start;
+        }
+
+        .capacity-profiles-list.single-profile {
+            grid-template-columns: auto;
         }
 
         .capacity-profile-chip {
             display: inline-flex;
             align-items: center;
-            gap: 4px;
+            gap: 5px;
             font-size: 0.7rem;
-            padding: 1px 6px;
+            height: 16px;
+            line-height: 14px;
+            padding: 0 6px;
             border-radius: 4px;
             background: rgba(255, 255, 255, 0.05);
             border: 1px solid rgba(255, 255, 255, 0.1);
             color: var(--text-sub);
             white-space: nowrap;
+            box-sizing: border-box;
+            max-width: 140px;
         }
 
         .capacity-profile-chip .prof-name {
             font-weight: 500;
             color: var(--text-sub);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .capacity-profile-chip .prof-count {
             font-family: var(--font-mono);
             font-weight: 700;
             color: var(--text-main);
+            flex-shrink: 0;
         }
 
         .capacity-profile-chip.warn {
@@ -1103,6 +1135,12 @@
             .capacity-split-section {
                 flex: 1 1 45%;
             }
+            .capacity-providers-section {
+                flex: 1 1 100%;
+                flex-wrap: wrap;
+                gap: 0.6rem;
+            }
+        }
             .capacity-providers-section {
                 flex: 1 1 100%;
                 border-top: 1px solid rgba(255, 255, 255, 0.1);
@@ -1196,7 +1234,7 @@
                             <span class="capacity-provider-name">Provider</span>
                             <span class="capacity-provider-total">-- / --</span>
                         </div>
-                        <div class="capacity-profiles-list">
+                        <div class="capacity-profiles-list single-profile">
                             <span class="capacity-profile-chip"><span class="prof-name">Profiles</span> <span class="prof-count">--</span></span>
                         </div>
                     </div>
@@ -2044,7 +2082,7 @@
 
                         if (cap.providers && cap.providers.length > 0) {
                             tooltipLines.push(``, `Providers & Profiles:`);
-                            const providerBlocksHtml = cap.providers.map(p => {
+                            const providerBlocksHtml = cap.providers.map((p, idx) => {
                                 const pMax = (p.max_streams >= 999 || p.max_streams === 0) ? '∞' : p.max_streams;
                                 const pActive = p.active_streams || 0;
                                 const pAvail = p.available_streams !== undefined ? p.available_streams : 0;
@@ -2074,18 +2112,21 @@
                                             }
                                         }
                                         tooltipLines.push(`   ◦ ${prof.name}: ${profActive}/${profMax} consumed (${profAvail} free)`);
-                                        return `<span class="capacity-profile-chip ${profClass}"><span class="prof-name">${escapeHtmlStr(prof.name)}</span><span class="prof-count">${profActive}/${profMax}</span></span>`;
+                                        return `<span class="capacity-profile-chip ${profClass}" title="${escapeHtmlStr(prof.name)}: ${profActive}/${profMax}"><span class="prof-name">${escapeHtmlStr(prof.name)}</span><span class="prof-count">${profActive}/${profMax}</span></span>`;
                                     }).join('');
                                 } else {
                                     profilesHtml = `<span class="capacity-profile-chip"><span class="prof-name">Default</span><span class="prof-count">${pActive}/${pMax}</span></span>`;
                                 }
 
-                                return `<div class="capacity-provider-block">
+                                const singleProfileClass = (profiles.length <= 1) ? 'single-profile' : '';
+                                const dividerHtml = (idx > 0) ? `<div class="capacity-divider"></div>` : '';
+
+                                return `${dividerHtml}<div class="capacity-provider-block">
                                     <div class="capacity-provider-header">
-                                        <span class="capacity-provider-name">${escapeHtmlStr(p.account_name)}</span>
+                                        <span class="capacity-provider-name" title="${escapeHtmlStr(p.account_name)}">${escapeHtmlStr(p.account_name)}</span>
                                         <span class="capacity-provider-total ${pStatusClass}">${pActive} / ${pMax}</span>
                                     </div>
-                                    <div class="capacity-profiles-list">${profilesHtml}</div>
+                                    <div class="capacity-profiles-list ${singleProfileClass}">${profilesHtml}</div>
                                 </div>`;
                             }).join('');
                             provContainer.innerHTML = providerBlocksHtml;
@@ -2103,7 +2144,7 @@
                                     <span class="capacity-provider-name">Total Capacity</span>
                                     <span class="capacity-provider-total ${pStatusClass}">${activeStr} / ${maxStr}</span>
                                 </div>
-                                <div class="capacity-profiles-list">
+                                <div class="capacity-profiles-list single-profile">
                                     <span class="capacity-profile-chip"><span class="prof-name">Available</span><span class="prof-count">${cap.total_available_streams}</span></span>
                                 </div>
                             </div>`;
@@ -2115,7 +2156,7 @@
                                 <span class="capacity-provider-name">Provider</span>
                                 <span class="capacity-provider-total">-- / --</span>
                             </div>
-                            <div class="capacity-profiles-list">
+                            <div class="capacity-profiles-list single-profile">
                                 <span class="capacity-profile-chip"><span class="prof-name">Profiles</span><span class="prof-count">--</span></span>
                             </div>
                         </div>`;
