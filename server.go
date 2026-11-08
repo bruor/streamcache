@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -222,7 +223,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 				}
-				if GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
+				if r.Method != http.MethodHead && GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
 					GlobalPrehydrationManager.OnCacheHit(targetURL, nextURLs)
 				}
 				http.ServeContent(w, r, cacheFileName, time.Now(), tracker)
@@ -266,6 +267,21 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			probeContentType = getMimeTypeByExt(ext)
 		}
 
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Type", probeContentType)
+			w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("X-Cache", "MISS")
+			if etag != "" {
+				w.Header().Set("ETag", etag)
+			}
+			if lastMod != "" {
+				w.Header().Set("Last-Modified", lastMod)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		// Pre-evict cache space to ensure sufficient disk space and cache quota before starting hydration
 		GlobalRegistry.PreEvict(totalSize)
 
@@ -299,6 +315,28 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			GlobalRegistry.Lock.Unlock()
 		}
 	} else {
+		if r.Method == http.MethodHead {
+			GlobalRegistry.Lock.Unlock()
+			w.Header().Set("X-Cache", "MISS")
+			w.Header().Set("Accept-Ranges", "bytes")
+			state.Lock.Lock()
+			if state.ContentType != "" {
+				w.Header().Set("Content-Type", state.ContentType)
+			}
+			if state.TotalSize > 0 {
+				w.Header().Set("Content-Length", strconv.FormatInt(state.TotalSize, 10))
+			}
+			if state.ETag != "" {
+				w.Header().Set("ETag", state.ETag)
+			}
+			if state.LastModified != "" {
+				w.Header().Set("Last-Modified", state.LastModified)
+			}
+			state.Lock.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		// Priority Upgrade: if file was prehydrating or yielding, immediately upgrade to live playback!
 		state.Lock.Lock()
 		wasPrehydrating := state.IsPrehydrating || state.IsYielding
