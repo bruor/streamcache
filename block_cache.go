@@ -344,6 +344,7 @@ func (r *CacheRegistry) startSpeedMonitor() {
 			fs.Lock.Unlock()
 		}
 
+		var maxSpeedCandidate int64
 		for _, fileState := range files {
 			fileState.Lock.Lock()
 			instantSpeed := float64(fileState.BytesDownloadedSec)
@@ -359,12 +360,8 @@ func (r *CacheRegistry) startSpeedMonitor() {
 			}
 			fileState.DownloadSpeed = int64(fileState.SmoothDownloadSpeed)
 
-			if fileState.DownloadSpeed > 0 {
-				r.Lock.Lock()
-				if fileState.DownloadSpeed > r.MaxObservedSpeed {
-					r.MaxObservedSpeed = fileState.DownloadSpeed
-				}
-				r.Lock.Unlock()
+			if fileState.DownloadSpeed > maxSpeedCandidate {
+				maxSpeedCandidate = fileState.DownloadSpeed
 			}
 
 			// Calculate overall average download speed
@@ -395,6 +392,14 @@ func (r *CacheRegistry) startSpeedMonitor() {
 			}
 
 			fileState.Lock.Unlock()
+		}
+
+		if maxSpeedCandidate > 0 {
+			r.Lock.Lock()
+			if maxSpeedCandidate > r.MaxObservedSpeed {
+				r.MaxObservedSpeed = maxSpeedCandidate
+			}
+			r.Lock.Unlock()
 		}
 
 		if shouldBroadcast && GlobalLogBroker != nil {

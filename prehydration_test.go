@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -475,5 +476,141 @@ func TestPrehydrationSpawnWorkerNoDeadlock(t *testing.T) {
 
 	CancelCoordinator(state)
 }
+
+func TestGlobalRegistryAndFileStateNoLockInversionDeadlock(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "lockinversion_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldConfig := GlobalConfig
+	GlobalConfig = &Config{
+		CacheDir:                  tmpDir,
+		TmpDir:                    tmpDir,
+		MaxUpstreamWorkers:        2,
+		EnableEpisodePrehydration: true,
+	}
+	defer func() { GlobalConfig = oldConfig }()
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 100),
+	}
+
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("test_file_%d.mkv", i)
+		fs := NewFileCacheState(key, "http://example.com/"+key, filepath.Join(tmpDir, key), filepath.Join(tmpDir, key+".part"), filepath.Join(tmpDir, key+".json"), "video/mp4", "", "", 10000000)
+		fs.IsPrehydrating = (i%2 == 0)
+		fs.IsYielding = (i%2 != 0)
+		fs.WriterActive = true
+		GlobalRegistry.Files[key] = fs
+	}
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Goroutine 1: processNextTask & checkYieldConditions
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				pm.processNextTask()
+				pm.checkYieldConditions()
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Goroutine 2: GlobalRegistry write operations (MarkConnectionsAsInCache, UpdateConnectionOffset, GetActiveSessions)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				GlobalRegistry.MarkConnectionsAsInCache("test_file_0.mkv")
+				_ = GlobalRegistry.GetActiveSessions()
+				GlobalRegistry.UpdateConnectionOffset("test-conn-1", 1024)
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Goroutine 3: Speed monitor lock simulation on FileCacheState
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				GlobalRegistry.Lock.RLock()
+				var states []*FileCacheState
+				for _, fs := range GlobalRegistry.Files {
+					states = append(states, fs)
+				}
+				GlobalRegistry.Lock.RUnlock()
+
+				var maxSpeed int64
+				for _, fs := range states {
+					fs.Lock.Lock()
+					fs.BytesDownloadedSec = 1000
+					fs.DownloadSpeed = 1000
+					if fs.DownloadSpeed > maxSpeed {
+						maxSpeed = fs.DownloadSpeed
+					}
+					fs.Lock.Unlock()
+				}
+
+				if maxSpeed > 0 {
+					GlobalRegistry.Lock.Lock()
+					if maxSpeed > GlobalRegistry.MaxObservedSpeed {
+						GlobalRegistry.MaxObservedSpeed = maxSpeed
+					}
+					GlobalRegistry.Lock.Unlock()
+				}
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Let the goroutines contend for 500ms
+	time.Sleep(500 * time.Millisecond)
+	close(done)
+
+	// Wait with timeout
+	testFinished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(testFinished)
+	}()
+
+	select {
+	case <-testFinished:
+		// Success! No deadlock occurred.
+	case <-time.After(3 * time.Second):
+		t.Fatal("Deadlock detected between GlobalRegistry.Lock and FileCacheState.Lock!")
+	}
+}
+
 
 
