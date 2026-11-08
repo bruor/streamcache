@@ -888,6 +888,228 @@
             font-size: 0.78rem;
         }
 
+        .capacity-widget-pill {
+            display: flex;
+            align-items: stretch;
+            gap: 0.85rem;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 7px 14px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .capacity-split-section {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 3px;
+            min-width: 96px;
+        }
+
+        .capacity-section-header {
+            font-family: var(--font-mono);
+            font-size: 0.68rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin-bottom: 1px;
+        }
+
+        .capacity-section-header.vod {
+            color: var(--accent-secondary);
+        }
+
+        .capacity-section-header.live {
+            color: var(--accent-green);
+        }
+
+        .capacity-section-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .capacity-section-header.vod .capacity-section-dot {
+            background-color: var(--accent-secondary);
+            box-shadow: 0 0 6px var(--accent-secondary);
+        }
+
+        .capacity-section-header.live .capacity-section-dot {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 6px var(--accent-green);
+        }
+
+        .capacity-metric-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.76rem;
+            line-height: 1.2;
+        }
+
+        .capacity-metric-label {
+            color: var(--text-sub);
+            font-weight: 500;
+        }
+
+        .capacity-metric-val {
+            font-family: var(--font-mono);
+            font-weight: 700;
+            color: var(--text-main);
+        }
+
+        .capacity-metric-row.probe-row {
+            transition: color 0.2s ease;
+        }
+
+        .capacity-metric-row.probe-row.active .capacity-metric-label {
+            color: #f59e0b;
+            font-weight: 600;
+        }
+
+        .capacity-metric-row.probe-row.active .capacity-metric-val {
+            color: #f59e0b;
+            text-shadow: 0 0 8px rgba(245, 158, 11, 0.5);
+        }
+
+        .capacity-metric-row.probe-row:not(.active) .capacity-metric-val {
+            color: var(--text-sub);
+            opacity: 0.7;
+        }
+
+        .capacity-divider {
+            width: 1px;
+            background: rgba(255, 255, 255, 0.12);
+            align-self: stretch;
+            margin: 2px 0;
+        }
+
+        .capacity-providers-section {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .capacity-provider-block {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 4px;
+            min-width: 120px;
+        }
+
+        .capacity-provider-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 0.78rem;
+            line-height: 1.2;
+        }
+
+        .capacity-provider-name {
+            font-weight: 700;
+            color: var(--text-main);
+            white-space: nowrap;
+        }
+
+        .capacity-provider-total {
+            font-family: var(--font-mono);
+            font-size: 0.73rem;
+            font-weight: 700;
+            padding: 1px 6px;
+            border-radius: 4px;
+            background: rgba(0, 240, 255, 0.12);
+            color: var(--accent-secondary);
+            border: 1px solid rgba(0, 240, 255, 0.3);
+            white-space: nowrap;
+        }
+
+        .capacity-provider-total.warn {
+            background: rgba(255, 159, 28, 0.15);
+            color: var(--accent-orange);
+            border-color: rgba(255, 159, 28, 0.4);
+        }
+
+        .capacity-provider-total.full {
+            background: rgba(255, 75, 75, 0.15);
+            color: #ff5555;
+            border-color: rgba(255, 75, 75, 0.4);
+        }
+
+        .capacity-profiles-list {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            flex-wrap: wrap;
+        }
+
+        .capacity-profile-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 0.7rem;
+            padding: 1px 6px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: var(--text-sub);
+            white-space: nowrap;
+        }
+
+        .capacity-profile-chip .prof-name {
+            font-weight: 500;
+            color: var(--text-sub);
+        }
+
+        .capacity-profile-chip .prof-count {
+            font-family: var(--font-mono);
+            font-weight: 700;
+            color: var(--text-main);
+        }
+
+        .capacity-profile-chip.warn {
+            border-color: rgba(255, 159, 28, 0.35);
+            background: rgba(255, 159, 28, 0.08);
+        }
+
+        .capacity-profile-chip.warn .prof-count {
+            color: var(--accent-orange);
+        }
+
+        .capacity-profile-chip.full {
+            border-color: rgba(255, 75, 75, 0.35);
+            background: rgba(255, 75, 75, 0.1);
+        }
+
+        .capacity-profile-chip.full .prof-count {
+            color: #ff5555;
+        }
+
+        @media (max-width: 768px) {
+            .capacity-widget-pill {
+                flex-wrap: wrap;
+                gap: 0.6rem;
+            }
+            .capacity-divider {
+                display: none;
+            }
+            .capacity-split-section {
+                flex: 1 1 45%;
+            }
+            .capacity-providers-section {
+                flex: 1 1 100%;
+                border-top: 1px solid rgba(255, 255, 255, 0.1);
+                padding-top: 6px;
+            }
+        }
+
         @keyframes probe-pulse {
             0% {
                 opacity: 1;
@@ -933,16 +1155,52 @@
     <header>
         <h1><span class="logo-dot"></span> Streamcache VOD Proxy</h1>
         <div class="system-status">
-            <div class="status-pill cache-status-pill" id="provider-capacity-pill" style="display: none;">
-                <span style="font-size: 1.2rem;">📡</span>
-                <div class="cache-status-info">
-                    <div id="topbar-provider-text">Upstream: -- slots</div>
-                    <div id="topbar-provider-avail-text" style="color: var(--accent-green); font-size: 0.78rem;">Serving: 0 VOD</div>
+            <div class="status-pill capacity-widget-pill" id="provider-capacity-pill" style="display: none;">
+                <div class="capacity-split-section">
+                    <div class="capacity-section-header vod">
+                        <span class="capacity-section-dot"></span>
+                        <span>VOD</span>
+                    </div>
+                    <div class="capacity-metric-row">
+                        <span class="capacity-metric-label">Upstream</span>
+                        <span class="capacity-metric-val" id="topbar-vod-upstream">0</span>
+                    </div>
+                    <div class="capacity-metric-row">
+                        <span class="capacity-metric-label">Downstream</span>
+                        <span class="capacity-metric-val" id="topbar-vod-downstream">0</span>
+                    </div>
+                    <div class="capacity-metric-row probe-row" id="topbar-vod-probes-row">
+                        <span class="capacity-metric-label">Probes</span>
+                        <span class="capacity-metric-val" id="topbar-vod-probes">0</span>
+                    </div>
                 </div>
-            </div>
-            <div class="status-pill probe-status-pill" id="probe-status-pill" style="display: none;" title="Player is actively probing media container headers in RAM">
-                <span class="probe-dot"></span>
-                <span>Probe Active</span>
+                <div class="capacity-divider"></div>
+                <div class="capacity-split-section">
+                    <div class="capacity-section-header live">
+                        <span class="capacity-section-dot"></span>
+                        <span>LIVE</span>
+                    </div>
+                    <div class="capacity-metric-row">
+                        <span class="capacity-metric-label">Upstream</span>
+                        <span class="capacity-metric-val" id="topbar-live-upstream">--</span>
+                    </div>
+                    <div class="capacity-metric-row">
+                        <span class="capacity-metric-label">Downstream</span>
+                        <span class="capacity-metric-val" id="topbar-live-downstream">--</span>
+                    </div>
+                </div>
+                <div class="capacity-divider"></div>
+                <div class="capacity-providers-section" id="topbar-providers-container">
+                    <div class="capacity-provider-block">
+                        <div class="capacity-provider-header">
+                            <span class="capacity-provider-name">Provider</span>
+                            <span class="capacity-provider-total">-- / --</span>
+                        </div>
+                        <div class="capacity-profiles-list">
+                            <span class="capacity-profile-chip"><span class="prof-name">Profiles</span> <span class="prof-count">--</span></span>
+                        </div>
+                    </div>
+                </div>
             </div>
             <div class="status-pill cache-status-pill">
                 <span style="font-size: 1.2rem;">💾</span>
@@ -1739,63 +1997,145 @@
                 const minDiskText = minDiskFree > 0 ? ` (${formatBytes(minDiskFree)} Reserved)` : '';
                 topbarDiskText.innerText = `Disk Free: ${formatBytes(diskFree)}${minDiskText}`;
 
-                // Update Serving & Provider Capacity Pill (Upstream on top of Downstream)
+                // Update VOD / LIVE Split View & Provider Capacity Pill
                 const provPill = document.getElementById('provider-capacity-pill');
-                const provText = document.getElementById('topbar-provider-text');
-                const provAvail = document.getElementById('topbar-provider-avail-text');
+                const vodUpEl = document.getElementById('topbar-vod-upstream');
+                const vodDownEl = document.getElementById('topbar-vod-downstream');
+                const vodProbesEl = document.getElementById('topbar-vod-probes');
+                const vodProbesRow = document.getElementById('topbar-vod-probes-row');
+                const liveUpEl = document.getElementById('topbar-live-upstream');
+                const liveDownEl = document.getElementById('topbar-live-downstream');
+                const provContainer = document.getElementById('topbar-providers-container');
+
                 const vodClients = (data.active_vod_clients !== undefined) ? data.active_vod_clients :
                     (data.active_connections ? data.active_connections.filter(c => c.active_conns > 0).length : 0);
+                const localVodUpstream = (data.active_vod_upstream !== undefined) ? data.active_vod_upstream :
+                    (data.active_downloads ? data.active_downloads.reduce((acc, d) => acc + (d.active_workers || 0), 0) : 0);
+                const vodProbes = (data.active_vod_probes !== undefined) ? data.active_vod_probes : (data.probe_active ? 1 : 0);
 
-                if (provPill && provText && provAvail) {
+                if (provPill && vodUpEl && vodDownEl && liveUpEl && liveDownEl && provContainer) {
                     provPill.style.display = 'flex';
-                    let liveClientsStr = '';
-                    let upstreamStr = 'Upstream: -- slots';
-                    let upstreamColor = '#ffffff';
-                    let tooltipLines = [`Active Clients Served:`, `• VOD (Streamcache): ${vodClients}`];
+                    let vodUpstream = localVodUpstream;
+                    let liveUpstreamText = '--';
+                    let liveDownstreamText = '--';
+                    let tooltipLines = [];
 
-                    let liveClients = 0;
+                    const escapeHtmlStr = (str) => String(str || '').replace(/[&<>"']/g, ch => ({
+                        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+                    }[ch]));
+
                     if (data.provider_capacity && data.provider_capacity.status === 'ok') {
                         const cap = data.provider_capacity;
-                        liveClients = cap.live_clients !== undefined ? cap.live_clients : 0;
-                        liveClientsStr = ` · ${liveClients} Live`;
-                        tooltipLines.push(`• Live TV (Dispatcharr): ${liveClients}`);
+                        if (cap.vod_streams !== undefined && cap.vod_streams > vodUpstream) {
+                            vodUpstream = cap.vod_streams;
+                        }
+                        const liveUpstream = (cap.live_streams !== undefined)
+                            ? cap.live_streams
+                            : Math.max(0, (cap.total_active_streams || 0) - vodUpstream);
+                        const liveClients = (cap.live_clients !== undefined) ? cap.live_clients : 0;
 
-                        const maxStr = cap.total_max_streams >= 999 ? '∞' : cap.total_max_streams;
-                        const activeStr = cap.total_active_streams;
-                        const ratio = (cap.total_max_streams > 0 && cap.total_max_streams < 999)
-                            ? ` (${Math.round((activeStr / cap.total_max_streams) * 100)}%)`
-                            : '';
-                        upstreamStr = `Upstream: ${activeStr} / ${maxStr} slots${ratio}`;
-                        tooltipLines.push(``, `Upstream Slots Consumed:`, `• ${activeStr} of ${maxStr} active (${cap.total_available_streams} free)`);
+                        liveUpstreamText = String(liveUpstream);
+                        liveDownstreamText = String(liveClients);
+
+                        tooltipLines.push(
+                            `VOD: ${vodUpstream} Upstream / ${vodClients} Downstream / ${vodProbes} Probes`,
+                            `LIVE: ${liveUpstream} Upstream / ${liveClients} Downstream`
+                        );
 
                         if (cap.providers && cap.providers.length > 0) {
-                            tooltipLines.push(``, `Providers:`);
-                            cap.providers.forEach(p => {
-                                const pMax = p.max_streams >= 999 ? '∞' : p.max_streams;
-                                tooltipLines.push(`• ${p.account_name}: ${p.active_streams}/${pMax} used (${p.available_streams} free)`);
-                            });
+                            tooltipLines.push(``, `Providers & Profiles:`);
+                            const providerBlocksHtml = cap.providers.map(p => {
+                                const pMax = (p.max_streams >= 999 || p.max_streams === 0) ? '∞' : p.max_streams;
+                                const pActive = p.active_streams || 0;
+                                const pAvail = p.available_streams !== undefined ? p.available_streams : 0;
+                                let pStatusClass = '';
+                                if (p.max_streams > 0 && p.max_streams < 999) {
+                                    if (pAvail <= 0 || pActive >= p.max_streams) {
+                                        pStatusClass = 'full';
+                                    } else if (pAvail <= 1) {
+                                        pStatusClass = 'warn';
+                                    }
+                                }
+                                tooltipLines.push(`• ${p.account_name}: ${pActive}/${pMax} consumed (${pAvail} free)`);
+
+                                const profiles = Array.isArray(p.profiles) ? p.profiles : [];
+                                let profilesHtml = '';
+                                if (profiles.length > 0) {
+                                    profilesHtml = profiles.map(prof => {
+                                        const profMax = (prof.max_streams === 0 || prof.max_streams >= 999) ? '∞' : prof.max_streams;
+                                        const profActive = prof.active_streams || 0;
+                                        const profAvail = prof.available_streams !== undefined ? prof.available_streams : 0;
+                                        let profClass = '';
+                                        if (prof.max_streams > 0 && prof.max_streams < 999) {
+                                            if (profAvail <= 0 || profActive >= prof.max_streams) {
+                                                profClass = 'full';
+                                            } else if (profAvail <= 1) {
+                                                profClass = 'warn';
+                                            }
+                                        }
+                                        tooltipLines.push(`   ◦ ${prof.name}: ${profActive}/${profMax} consumed (${profAvail} free)`);
+                                        return `<span class="capacity-profile-chip ${profClass}"><span class="prof-name">${escapeHtmlStr(prof.name)}</span><span class="prof-count">${profActive}/${profMax}</span></span>`;
+                                    }).join('');
+                                } else {
+                                    profilesHtml = `<span class="capacity-profile-chip"><span class="prof-name">Default</span><span class="prof-count">${pActive}/${pMax}</span></span>`;
+                                }
+
+                                return `<div class="capacity-provider-block">
+                                    <div class="capacity-provider-header">
+                                        <span class="capacity-provider-name">${escapeHtmlStr(p.account_name)}</span>
+                                        <span class="capacity-provider-total ${pStatusClass}">${pActive} / ${pMax}</span>
+                                    </div>
+                                    <div class="capacity-profiles-list">${profilesHtml}</div>
+                                </div>`;
+                            }).join('');
+                            provContainer.innerHTML = providerBlocksHtml;
+                        } else {
+                            const maxStr = (cap.total_max_streams >= 999 || cap.total_max_streams === 0) ? '∞' : cap.total_max_streams;
+                            const activeStr = cap.total_active_streams || 0;
+                            let pStatusClass = '';
+                            if (cap.total_available_streams <= 0 && cap.total_max_streams > 0) {
+                                pStatusClass = 'full';
+                            } else if (cap.total_available_streams <= 1 && cap.total_max_streams > 0) {
+                                pStatusClass = 'warn';
+                            }
+                            provContainer.innerHTML = `<div class="capacity-provider-block">
+                                <div class="capacity-provider-header">
+                                    <span class="capacity-provider-name">Total Capacity</span>
+                                    <span class="capacity-provider-total ${pStatusClass}">${activeStr} / ${maxStr}</span>
+                                </div>
+                                <div class="capacity-profiles-list">
+                                    <span class="capacity-profile-chip"><span class="prof-name">Available</span><span class="prof-count">${cap.total_available_streams}</span></span>
+                                </div>
+                            </div>`;
                         }
-
-                        if (cap.total_available_streams <= 1) {
-                            upstreamColor = 'var(--accent-orange)';
-                        }
-                    }
-
-                    provText.innerText = upstreamStr;
-                    provText.style.color = upstreamColor;
-                    provAvail.innerText = `Serving: ${vodClients} VOD${liveClientsStr}`;
-                    provAvail.style.color = 'var(--accent-green)';
-                    provPill.title = tooltipLines.join('\n');
-                }
-
-                // Update Probe Activity Indicator Pill
-                const probePill = document.getElementById('probe-status-pill');
-                if (probePill) {
-                    if (data.probe_active) {
-                        probePill.style.display = 'inline-flex';
                     } else {
-                        probePill.style.display = 'none';
+                        tooltipLines.push(`VOD: ${vodUpstream} Upstream / ${vodClients} Downstream / ${vodProbes} Probes`);
+                        provContainer.innerHTML = `<div class="capacity-provider-block">
+                            <div class="capacity-provider-header">
+                                <span class="capacity-provider-name">Provider</span>
+                                <span class="capacity-provider-total">-- / --</span>
+                            </div>
+                            <div class="capacity-profiles-list">
+                                <span class="capacity-profile-chip"><span class="prof-name">Profiles</span><span class="prof-count">--</span></span>
+                            </div>
+                        </div>`;
                     }
+
+                    vodUpEl.innerText = String(vodUpstream);
+                    vodDownEl.innerText = String(vodClients);
+                    if (vodProbesEl) {
+                        vodProbesEl.innerText = String(vodProbes);
+                    }
+                    if (vodProbesRow) {
+                        if (vodProbes > 0 || data.probe_active) {
+                            vodProbesRow.classList.add('active');
+                        } else {
+                            vodProbesRow.classList.remove('active');
+                        }
+                    }
+                    liveUpEl.innerText = liveUpstreamText;
+                    liveDownEl.innerText = liveDownstreamText;
+                    provPill.title = tooltipLines.join('\n');
                 }
 
                 updateActiveDownloadsDOM(data.active_downloads || []);

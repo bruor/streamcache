@@ -1033,6 +1033,12 @@ func TestProbeSuppressionAndIndicatorInDashboard(t *testing.T) {
 		t.Fatalf("Expected active_vod_clients to be 1, got %v", stateMap["active_vod_clients"])
 	}
 
+	// Check active_vod_probes (1 unmaterialized probe state)
+	vodProbes, ok := stateMap["active_vod_probes"].(float64)
+	if !ok || int(vodProbes) != 1 {
+		t.Fatalf("Expected active_vod_probes to be 1, got %v", stateMap["active_vod_probes"])
+	}
+
 	// Verify active_downloads ONLY includes playbackState, and NOT probeState!
 	activeDownloads, ok := stateMap["active_downloads"].([]interface{})
 	if !ok {

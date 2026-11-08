@@ -403,8 +403,26 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var activeFiles []debugFile
+	activeVODUpstream := 0
+	activeVODProbes := 0
 	for _, fileState := range files {
 		fileState.Lock.Lock()
+		isDiskMat := fileState.DiskMaterialized
+		isProbeFile := !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing"
+		fileActiveConns := 0
+		for _, conn := range fileState.RecentConnections {
+			if conn.Closed.IsZero() {
+				fileActiveConns++
+			}
+		}
+		activeVODUpstream += fileActiveConns
+		if isProbeFile {
+			if fileActiveConns > 0 {
+				activeVODProbes += fileActiveConns
+			} else {
+				activeVODProbes++
+			}
+		}
 		k := fileState.Key
 		downloaded := fileState.RangeSet.TotalBytes()
 		isCompleted := fileState.RangeSet.IsComplete(fileState.TotalSize)
@@ -414,8 +432,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		isDiskMat := fileState.DiskMaterialized
-		if !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing" {
+		if isProbeFile {
 			fileState.Lock.Unlock()
 			continue
 		}
@@ -466,8 +483,12 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	probeActive := false
-	if GlobalRegistry != nil {
+	inFlightHeaderProbes := int(GlobalInFlightProbes.Load())
+	activeVODProbes += inFlightHeaderProbes
+	activeVODUpstream += inFlightHeaderProbes
+
+	probeActive := activeVODProbes > 0
+	if !probeActive && GlobalRegistry != nil {
 		probeActive = GlobalRegistry.IsProbeActive()
 	}
 
@@ -480,6 +501,8 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		"active_downloads":       activeFiles,
 		"active_connections":     activeSessions,
 		"active_vod_clients":     activeVODClients,
+		"active_vod_upstream":    activeVODUpstream,
+		"active_vod_probes":      activeVODProbes,
 		"probe_active":           probeActive,
 	}
 

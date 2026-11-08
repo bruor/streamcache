@@ -222,8 +222,26 @@ func buildStatePayload() ([]byte, error) {
 	}
 
 	var activeFiles []sseFile
+	activeVODUpstream := 0
+	activeVODProbes := 0
 	for _, fileState := range files {
 		fileState.Lock.Lock()
+		isDiskMat := fileState.DiskMaterialized
+		isProbeFile := !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing"
+		fileActiveConns := 0
+		for _, conn := range fileState.RecentConnections {
+			if conn.Closed.IsZero() {
+				fileActiveConns++
+			}
+		}
+		activeVODUpstream += fileActiveConns
+		if isProbeFile {
+			if fileActiveConns > 0 {
+				activeVODProbes += fileActiveConns
+			} else {
+				activeVODProbes++
+			}
+		}
 		k := fileState.Key
 		downloaded := fileState.RangeSet.TotalBytes()
 		isCompleted := fileState.RangeSet.IsComplete(fileState.TotalSize)
@@ -236,8 +254,7 @@ func buildStatePayload() ([]byte, error) {
 		// Do not draw hydrations until we are sure that they aren't probes:
 		// A file is drawn only if it has materialized on disk, is explicitly
 		// prehydrating/yielding, or is committing.
-		isDiskMat := fileState.DiskMaterialized
-		if !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing" {
+		if isProbeFile {
 			fileState.Lock.Unlock()
 			continue
 		}
@@ -351,8 +368,12 @@ func buildStatePayload() ([]byte, error) {
 		}
 	}
 
-	probeActive := false
-	if GlobalRegistry != nil {
+	inFlightHeaderProbes := int(GlobalInFlightProbes.Load())
+	activeVODProbes += inFlightHeaderProbes
+	activeVODUpstream += inFlightHeaderProbes
+
+	probeActive := activeVODProbes > 0
+	if !probeActive && GlobalRegistry != nil {
 		probeActive = GlobalRegistry.IsProbeActive()
 	}
 
@@ -368,6 +389,8 @@ func buildStatePayload() ([]byte, error) {
 		"active_downloads":       activeFiles,
 		"active_connections":     activeSessions,
 		"active_vod_clients":     activeVODClients,
+		"active_vod_upstream":    activeVODUpstream,
+		"active_vod_probes":      activeVODProbes,
 		"probe_active":           probeActive,
 	}
 

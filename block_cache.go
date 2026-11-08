@@ -197,20 +197,34 @@ func (s *FileCacheState) SetUpstreamStatus(status string) {
 
 func (s *FileCacheState) RecordConnStart(connID string) {
 	s.Lock.Lock()
-	defer s.Lock.Unlock()
 	if s.RecentConnections == nil {
 		s.RecentConnections = make(map[string]*ConnectionInfo)
 	}
 	s.RecentConnections[connID] = &ConnectionInfo{ID: connID, Opened: time.Now()}
+	s.Lock.Unlock()
+
+	if GlobalLogBroker != nil {
+		go GlobalLogBroker.BroadcastStateUpdate()
+	}
+	if GlobalPrehydrationManager != nil {
+		GlobalPrehydrationManager.TriggerCapacityPoll()
+	}
 }
 
 func (s *FileCacheState) RecordConnEnd(connID string) {
 	s.Lock.Lock()
-	defer s.Lock.Unlock()
 	if s.RecentConnections != nil {
 		if conn, exists := s.RecentConnections[connID]; exists {
 			conn.Closed = time.Now()
 		}
+	}
+	s.Lock.Unlock()
+
+	if GlobalLogBroker != nil {
+		go GlobalLogBroker.BroadcastStateUpdate()
+	}
+	if GlobalPrehydrationManager != nil {
+		GlobalPrehydrationManager.TriggerCapacityPoll()
 	}
 }
 
@@ -317,6 +331,9 @@ func (r *CacheRegistry) RecordProbeActivity() {
 }
 
 func (r *CacheRegistry) IsProbeActive() bool {
+	if GlobalInFlightProbes.Load() > 0 {
+		return true
+	}
 	if r == nil {
 		return false
 	}
