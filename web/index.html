@@ -878,6 +878,16 @@
             font-size: 0.78rem;
         }
 
+        #topbar-provider-text {
+            font-weight: 600;
+            color: #ffffff;
+        }
+
+        #topbar-provider-avail-text {
+            color: var(--accent-green);
+            font-size: 0.78rem;
+        }
+
         @keyframes probe-pulse {
             0% {
                 opacity: 1;
@@ -927,7 +937,7 @@
                 <span style="font-size: 1.2rem;">📡</span>
                 <div class="cache-status-info">
                     <div id="topbar-provider-text">Upstream: -- slots</div>
-                    <div id="topbar-provider-avail-text" style="color: var(--text-sub); font-size: 0.78rem;">Serving: 0 VOD</div>
+                    <div id="topbar-provider-avail-text" style="color: var(--accent-green); font-size: 0.78rem;">Serving: 0 VOD</div>
                 </div>
             </div>
             <div class="status-pill probe-status-pill" id="probe-status-pill" style="display: none;" title="Player is actively probing media container headers in RAM">
@@ -1740,7 +1750,7 @@
                     provPill.style.display = 'flex';
                     let liveClientsStr = '';
                     let upstreamStr = 'Upstream: -- slots';
-                    let upstreamColor = 'var(--text-main)';
+                    let upstreamColor = '#ffffff';
                     let tooltipLines = [`Active Clients Served:`, `• VOD (Streamcache): ${vodClients}`];
 
                     let liveClients = 0;
@@ -1774,7 +1784,7 @@
                     provText.innerText = upstreamStr;
                     provText.style.color = upstreamColor;
                     provAvail.innerText = `Serving: ${vodClients} VOD${liveClientsStr}`;
-                    provAvail.style.color = (vodClients > 0 || liveClients > 0) ? 'var(--accent-green)' : 'var(--text-sub)';
+                    provAvail.style.color = 'var(--accent-green)';
                     provPill.title = tooltipLines.join('\n');
                 }
 
