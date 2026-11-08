@@ -223,10 +223,12 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 	}
 
 	s.Lock.Lock()
+	defer s.Lock.Unlock()
+
 	if (s.DiskMaterialized && s.File != nil) || FileExists(s.Path) {
-		s.Lock.Unlock()
 		return nil
 	}
+
 	totalSize := s.TotalSize
 	partPath := s.PartPath
 	metaPath := s.MetaPath
@@ -235,14 +237,6 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 	etag := s.ETag
 	lastMod := s.LastModified
 	key := s.Key
-	s.Lock.Unlock()
-
-	s.Lock.Lock()
-	defer s.Lock.Unlock()
-
-	if (s.DiskMaterialized && s.File != nil) || FileExists(s.Path) {
-		return nil
-	}
 
 	var file *os.File
 	var err error
@@ -259,7 +253,7 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 		_ = file.Truncate(totalSize)
 	}
 
-	// Save initial sparse metadata
+	// Save initial sparse metadata atomically
 	meta := FileMeta{
 		URL:           url,
 		TotalSize:     totalSize,
@@ -269,8 +263,9 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 		LastValidated: time.Now().Unix(),
 		Completed:     false,
 	}
-	metaBytes, _ := json.Marshal(meta)
-	_ = os.WriteFile(metaPath, metaBytes, 0644)
+	if metaBytes, merr := json.Marshal(meta); merr == nil {
+		_ = writeMetaFileAtomic(metaPath, metaBytes)
+	}
 
 	if s.Pipeline != nil {
 		if wp, ok := s.Pipeline.(*WritebackPipeline); ok && wp != nil {
@@ -328,8 +323,8 @@ func (r *CacheRegistry) IsProbeActive() bool {
 
 	for _, f := range files {
 		f.Lock.Lock()
-		isMat := f.DiskMaterialized || FileExists(f.PartPath) || FileExists(f.Path)
-		isPre := f.IsPrehydrating
+		isMat := f.DiskMaterialized
+		isPre := f.IsPrehydrating || f.IsYielding
 		f.Lock.Unlock()
 		if !isMat && !isPre {
 			return true
@@ -462,8 +457,7 @@ func (r *CacheRegistry) startSpeedMonitor() {
 		var maxSpeedCandidate int64
 		for _, fileState := range files {
 			fileState.Lock.Lock()
-			instantSpeed := float64(fileState.BytesDownloadedSec)
-			fileState.BytesDownloadedSec = 0
+			instantSpeed := float64(atomic.SwapInt64(&fileState.BytesDownloadedSec, 0))
 
 			// Fast-Snap Speed Engine: instant drop to 0 and instant jump on start
 			if instantSpeed == 0 {
@@ -485,7 +479,7 @@ func (r *CacheRegistry) startSpeedMonitor() {
 				if elapsed < 1 {
 					elapsed = 1
 				}
-				fileState.AvgDownloadSpeed = fileState.TotalBytesDownloaded / elapsed
+				fileState.AvgDownloadSpeed = atomic.LoadInt64(&fileState.TotalBytesDownloaded) / elapsed
 			}
 
 			// Zero-speed stall tracking
@@ -693,12 +687,25 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 func (r *CacheRegistry) UnregisterConnection(connID string) {
 	r.Lock.Lock()
 	defer r.Lock.Unlock()
+	var finalOffset int64 = -1
+	var connTotalSize int64
 	if r.Connections != nil {
+		if cc, ok := r.Connections[connID]; ok {
+			finalOffset = atomic.LoadInt64(&cc.Offset)
+			connTotalSize = cc.TotalSize
+		}
 		delete(r.Connections, connID)
 	}
 	if r.Sessions != nil {
 		for _, session := range r.Sessions {
 			if _, exists := session.Conns[connID]; exists {
+				if finalOffset >= 0 {
+					isNearEOF := connTotalSize > 0 && finalOffset >= connTotalSize-10*1024*1024
+					sessionIsNearEOF := session.TotalSize > 0 && session.Offset >= session.TotalSize-10*1024*1024
+					if len(session.Conns) <= 1 || !isNearEOF || sessionIsNearEOF {
+						session.Offset = finalOffset
+					}
+				}
 				delete(session.Conns, connID)
 				session.ActiveConns = len(session.Conns)
 				session.LastActive = time.Now()
@@ -709,30 +716,25 @@ func (r *CacheRegistry) UnregisterConnection(connID string) {
 }
 
 func (r *CacheRegistry) UpdateConnectionOffset(connID string, offset int64) {
-	r.Lock.Lock()
-	defer r.Lock.Unlock()
+	r.Lock.RLock()
 	if r.Connections != nil {
 		if conn, ok := r.Connections[connID]; ok {
-			conn.Offset = offset
-			if r.Sessions != nil {
-				for _, session := range r.Sessions {
-					if _, exists := session.Conns[connID]; exists {
-						isNearEOF := conn.TotalSize > 0 && offset >= conn.TotalSize-10*1024*1024
-						sessionIsNearEOF := session.TotalSize > 0 && session.Offset >= session.TotalSize-10*1024*1024
-
-						if len(session.Conns) <= 1 || !isNearEOF || sessionIsNearEOF {
-							session.Offset = offset
-						}
-						session.LastActive = time.Now()
-						break
-					}
-				}
-			}
+			atomic.StoreInt64(&conn.Offset, offset)
 		}
 	}
+	r.Lock.RUnlock()
 }
 
 func (r *CacheRegistry) SetConnectionInCache(connID string, inCache bool) {
+	r.Lock.RLock()
+	if r.Connections != nil {
+		if conn, ok := r.Connections[connID]; ok && conn.InCache == inCache {
+			r.Lock.RUnlock()
+			return
+		}
+	}
+	r.Lock.RUnlock()
+
 	r.Lock.Lock()
 	defer r.Lock.Unlock()
 	if r.Connections != nil {
@@ -802,11 +804,12 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 					}
 					if now.Sub(info.Opened) > 2*time.Second {
 						if cc, ok := r.Connections[id]; ok {
-							isNearEOF := cc.TotalSize > 0 && cc.Offset >= cc.TotalSize-10*1024*1024
-							isProbe := isNearEOF && (cc.Offset-cc.StartOffset) <= 2*1024*1024
+							ccOffset := atomic.LoadInt64(&cc.Offset)
+							isNearEOF := cc.TotalSize > 0 && ccOffset >= cc.TotalSize-10*1024*1024
+							isProbe := isNearEOF && (ccOffset-cc.StartOffset) <= 2*1024*1024
 							var initialMaxOffset int64
 							if !isProbe {
-								initialMaxOffset = cc.Offset
+								initialMaxOffset = ccOffset
 							}
 
 							newSession := &ClientSession{
@@ -816,7 +819,7 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 								RemoteAddr:     cc.RemoteAddr,
 								UserAgent:      cc.UserAgent,
 								Username:       cc.Username,
-								Offset:         cc.Offset,
+								Offset:         ccOffset,
 								MaxOffset:      initialMaxOffset,
 								TotalSize:      cc.TotalSize,
 								StartTime:      cc.StartTime,
@@ -847,16 +850,17 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 				if !ok {
 					continue
 				}
-				isNearEOF := cc.TotalSize > 0 && cc.Offset >= cc.TotalSize-10*1024*1024
+				ccOffset := atomic.LoadInt64(&cc.Offset)
+				isNearEOF := cc.TotalSize > 0 && ccOffset >= cc.TotalSize-10*1024*1024
 				wasNotPreceded := session.MaxOffset < cc.TotalSize-15*1024*1024
-				readLimitNotExceeded := (cc.Offset - cc.StartOffset) <= 2*1024*1024
+				readLimitNotExceeded := (ccOffset - cc.StartOffset) <= 2*1024*1024
 				isProbe := isNearEOF && wasNotPreceded && readLimitNotExceeded
 
 				if !isProbe {
 					nonProbeCount++
 					if oldestNonProbeTime.IsZero() || info.Opened.Before(oldestNonProbeTime) {
 						oldestNonProbeTime = info.Opened
-						oldestNonProbeOffset = cc.Offset
+						oldestNonProbeOffset = ccOffset
 					}
 				}
 			}
@@ -985,9 +989,18 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 		return
 	}
 
-	// Fast pre-flight check: count total size of available inactive files
+	activeKeys := make(map[string]bool, len(r.Files))
+	for k := range r.Files {
+		activeKeys[k] = true
+	}
+	r.Evicting = true
+	r.Lock.Unlock()
+
+	// Fast pre-flight check outside GlobalRegistry.Lock: count total size of available inactive files
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
+		r.Lock.Lock()
+		r.Evicting = false
 		r.Lock.Unlock()
 		return
 	}
@@ -997,8 +1010,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" {
 			continue
 		}
-		_, active := r.Files[entry.Name()]
-		if !active {
+		if !activeKeys[entry.Name()] {
 			if info, err := entry.Info(); err == nil {
 				availableFreeable += info.Size()
 			}
@@ -1015,9 +1027,6 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 		float64(currentSize)/(1024*1024*1024), float64(maxBytes)/(1024*1024*1024),
 		float64(freeSpace)/(1024*1024*1024), float64(minDiskFree)/(1024*1024*1024),
 		float64(bytesToFree)/(1024*1024))
-
-	r.Evicting = true
-	r.Lock.Unlock()
 
 	// Launch file deletions asynchronously in a background thread to prevent blocking HTTP handler/stream start
 	go func() {

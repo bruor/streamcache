@@ -399,8 +399,8 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		isDiskMat := fileState.DiskMaterialized || FileExists(fileState.PartPath) || FileExists(fileState.Path)
-		if !isDiskMat && !fileState.IsPrehydrating && fileState.UpstreamStatus != "Committing" {
+		isDiskMat := fileState.DiskMaterialized
+		if !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing" {
 			fileState.Lock.Unlock()
 			continue
 		}

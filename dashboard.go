@@ -235,9 +235,9 @@ func buildStatePayload() ([]byte, error) {
 
 		// Do not draw hydrations until we are sure that they aren't probes:
 		// A file is drawn only if it has materialized on disk, is explicitly
-		// prehydrating, or is committing.
-		isDiskMat := fileState.DiskMaterialized || FileExists(fileState.PartPath) || FileExists(fileState.Path)
-		if !isDiskMat && !fileState.IsPrehydrating && fileState.UpstreamStatus != "Committing" {
+		// prehydrating/yielding, or is committing.
+		isDiskMat := fileState.DiskMaterialized
+		if !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing" {
 			fileState.Lock.Unlock()
 			continue
 		}
