@@ -39,6 +39,8 @@ type ProviderCapacityReport struct {
 	TotalAvailableStreams  int              `json:"total_available_streams"`
 	TargetAvailableStreams int              `json:"target_available_streams"`
 	LiveClients            int              `json:"live_clients"`
+	LiveStreams            int              `json:"live_streams"`
+	VODStreams             int              `json:"vod_streams"`
 	Providers              []ProviderDetail `json:"providers"`
 	Error                  string           `json:"error,omitempty"`
 }
@@ -61,6 +63,7 @@ type PrehydrationManager struct {
 	prehydrationsStartedSinceLastPoll int             // Tracks prehydrations started/resumed since the last capacity poll
 	stopCh                            chan struct{}
 	notifyCh                          chan struct{}
+	pollCh                            chan struct{}
 }
 
 var GlobalPrehydrationManager *PrehydrationManager
@@ -72,10 +75,21 @@ func InitPrehydrationManager() {
 			activePrehydrations: make(map[string]bool),
 			stopCh:              make(chan struct{}),
 			notifyCh:            make(chan struct{}, 10),
+			pollCh:              make(chan struct{}, 1),
 		}
 		go GlobalPrehydrationManager.pollLoop()
 		go GlobalPrehydrationManager.schedulerLoop()
 	})
+}
+
+func (pm *PrehydrationManager) TriggerCapacityPoll() {
+	if pm == nil || pm.pollCh == nil {
+		return
+	}
+	select {
+	case pm.pollCh <- struct{}{}:
+	default:
+	}
 }
 
 func (pm *PrehydrationManager) Stop() {
@@ -187,6 +201,10 @@ func (pm *PrehydrationManager) pollCapacityOnce() {
 
 	// Check if active prehydrations need to yield due to live streams taking reserved slots
 	pm.checkYieldConditions()
+
+	if GlobalLogBroker != nil {
+		go GlobalLogBroker.BroadcastStateUpdate()
+	}
 }
 
 func (pm *PrehydrationManager) pollLoop() {
@@ -205,6 +223,17 @@ func (pm *PrehydrationManager) pollLoop() {
 		select {
 		case <-pm.stopCh:
 			return
+		case <-pm.pollCh:
+			select {
+			case <-pm.stopCh:
+				return
+			case <-time.After(150 * time.Millisecond):
+			}
+			select {
+			case <-pm.pollCh:
+			default:
+			}
+			pm.pollCapacityOnce()
 		case <-ticker.C:
 			ticker.Reset(interval)
 			pm.pollCapacityOnce()

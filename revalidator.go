@@ -11,10 +11,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 var contentRangeRegex = regexp.MustCompile(`/(\d+)\s*$`)
+
+// GlobalInFlightProbes tracks active metadata probe HTTP requests in probeUpstream.
+var GlobalInFlightProbes atomic.Int32
 
 // Revalidate checks if a cached VOD has expired and probes the origin
 // to see if the file changed on the CDN.
@@ -195,6 +199,17 @@ func recreateMetadata(filePath, metaPath, url string) error {
 
 // probeUpstream attempts to determine the file's size, Content-Type, ETag, and Last-Modified headers.
 func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, string, bool, error) {
+	GlobalInFlightProbes.Add(1)
+	if GlobalLogBroker != nil {
+		go GlobalLogBroker.BroadcastStateUpdate()
+	}
+	defer func() {
+		GlobalInFlightProbes.Add(-1)
+		if GlobalLogBroker != nil {
+			go GlobalLogBroker.BroadcastStateUpdate()
+		}
+	}()
+
 	originalHost := GetCleanHost(targetURL)
 	preferredMethod := GetProbeMethod(originalHost)
 
