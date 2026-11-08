@@ -397,6 +397,12 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		isDiskMat := fileState.DiskMaterialized || FileExists(fileState.PartPath) || FileExists(fileState.Path)
+		if !isDiskMat && !fileState.IsPrehydrating && fileState.UpstreamStatus != "Committing" {
+			fileState.Lock.Unlock()
+			continue
+		}
+
 		starvingCopy := make(map[string]int64, len(fileState.Starving))
 		for clientID, offset := range fileState.Starving {
 			starvingCopy[clientID] = offset
@@ -436,6 +442,18 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		return activeSessions[i].StartTime < activeSessions[j].StartTime
 	})
 
+	activeVODClients := 0
+	for _, sess := range activeSessions {
+		if sess.ActiveConns > 0 {
+			activeVODClients++
+		}
+	}
+
+	probeActive := false
+	if GlobalRegistry != nil {
+		probeActive = GlobalRegistry.IsProbeActive()
+	}
+
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
@@ -444,6 +462,8 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		"disk_free_bytes":        freeSpace,
 		"active_downloads":       activeFiles,
 		"active_connections":     activeSessions,
+		"active_vod_clients":     activeVODClients,
+		"probe_active":           probeActive,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

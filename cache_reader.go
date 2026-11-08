@@ -89,6 +89,10 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		lastEvictedOffset: startOffset,
 	}
 
+	if !isCompleted && !state.IsDiskMaterialized() && GlobalRegistry != nil {
+		GlobalRegistry.RecordProbeActivity()
+	}
+
 	log.Printf("[Reader] Registered client %s (%s, UA: %s) for media %s", clientID, remoteAddr, userAgent, key)
 	return r
 }
@@ -140,6 +144,8 @@ func (r *CacheReader) recordRead(off int64, n int) {
 			}
 			_ = r.state.MaterializeDiskFile()
 		}
+	} else if r.state != nil && !r.state.IsDiskMaterialized() && GlobalRegistry != nil {
+		GlobalRegistry.RecordProbeActivity()
 	}
 }
 
@@ -184,6 +190,9 @@ func (r *CacheReader) Close() error {
 	var cancelFunc context.CancelFunc
 
 	if isProbe && remainingClients == 0 {
+		if GlobalRegistry != nil {
+			GlobalRegistry.RecordProbeActivity()
+		}
 		cancelFunc = r.state.Cancel
 		r.state.Cancel = nil
 		r.state.WriterActive = false

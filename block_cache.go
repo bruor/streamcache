@@ -298,10 +298,45 @@ type CacheRegistry struct {
 	TotalCacheSize   int64
 	MaxObservedSpeed int64
 	Evicting         bool
+	lastProbeTime    int64
 }
 
 var GlobalRegistry *CacheRegistry
 var GlobalDiskFreeBytes uint64
+
+func (r *CacheRegistry) RecordProbeActivity() {
+	if r == nil {
+		return
+	}
+	atomic.StoreInt64(&r.lastProbeTime, time.Now().UnixNano())
+}
+
+func (r *CacheRegistry) IsProbeActive() bool {
+	if r == nil {
+		return false
+	}
+
+	// 1. Check if any file in memory is currently in unmaterialized probe stage
+	r.Lock.RLock()
+	for _, f := range r.Files {
+		f.Lock.Lock()
+		isMat := f.DiskMaterialized || FileExists(f.PartPath) || FileExists(f.Path)
+		isPre := f.IsPrehydrating
+		f.Lock.Unlock()
+		if !isMat && !isPre {
+			r.Lock.RUnlock()
+			return true
+		}
+	}
+	r.Lock.RUnlock()
+
+	// 2. Also check if a probe occurred within the last 4 seconds so the UI indicator has time to flash visibly
+	last := atomic.LoadInt64(&r.lastProbeTime)
+	if last > 0 && time.Since(time.Unix(0, last)) < 4*time.Second {
+		return true
+	}
+	return false
+}
 
 func InitRegistry() {
 	GlobalRegistry = &CacheRegistry{

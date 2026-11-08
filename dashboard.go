@@ -216,6 +216,15 @@ func buildStatePayload() ([]byte, error) {
 			continue
 		}
 
+		// Do not draw hydrations until we are sure that they aren't probes:
+		// A file is drawn only if it has materialized on disk, is explicitly
+		// prehydrating, or is committing.
+		isDiskMat := fileState.DiskMaterialized || FileExists(fileState.PartPath) || FileExists(fileState.Path)
+		if !isDiskMat && !fileState.IsPrehydrating && fileState.UpstreamStatus != "Committing" {
+			fileState.Lock.Unlock()
+			continue
+		}
+
 		ranges := fileState.RangeSet.ToSlices()
 
 		// Collect unique starvation offsets
@@ -318,6 +327,18 @@ func buildStatePayload() ([]byte, error) {
 		return activeSessions[i].StartTime < activeSessions[j].StartTime
 	})
 
+	activeVODClients := 0
+	for _, sess := range activeSessions {
+		if sess.ActiveConns > 0 {
+			activeVODClients++
+		}
+	}
+
+	probeActive := false
+	if GlobalRegistry != nil {
+		probeActive = GlobalRegistry.IsProbeActive()
+	}
+
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
@@ -329,6 +350,8 @@ func buildStatePayload() ([]byte, error) {
 		"min_disk_free_bytes":    GlobalConfig.GetMinDiskFreeBytes(),
 		"active_downloads":       activeFiles,
 		"active_connections":     activeSessions,
+		"active_vod_clients":     activeVODClients,
+		"probe_active":           probeActive,
 	}
 
 	if GlobalPrehydrationManager != nil {

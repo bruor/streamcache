@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -894,6 +895,129 @@ func TestDeferredPartFileCreationAndProbeBypass(t *testing.T) {
 	// Now that read threshold was crossed, part file or cached file MUST be materialized on disk!
 	if !FileExists(partPath) && !FileExists(filepath.Join(tmpDir, cacheFileName)) {
 		t.Fatalf("Expected part file %s to be materialized on disk once read threshold was crossed", partPath)
+	}
+}
+
+func TestProbeSuppressionAndIndicatorInDashboard(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "sc_dashboard_probe_test_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.Unlock()
+	}()
+
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	oldSessions := GlobalRegistry.Sessions
+	oldConns := GlobalRegistry.Connections
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	GlobalRegistry.Sessions = make(map[string]*ClientSession)
+	GlobalRegistry.Connections = make(map[string]*ClientConnection)
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.Sessions = oldSessions
+		GlobalRegistry.Connections = oldConns
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// 1. Create an unmaterialized probe file state (DiskMaterialized = false)
+	probeState := &FileCacheState{
+		Key:              "probe_key_1",
+		TotalSize:        10 * 1024 * 1024,
+		RangeSet:         NewRangeSet(),
+		Clients:          make(map[string]chan struct{}),
+		Starving:         make(map[string]int64),
+		StarvingSince:    make(map[string]time.Time),
+		DiskMaterialized: false,
+		IsPrehydrating:   false,
+		UpstreamStatus:   "Downloading",
+	}
+
+	// 2. Create a materialized normal playback file state (DiskMaterialized = true)
+	playbackState := &FileCacheState{
+		Key:              "playback_key_2",
+		TotalSize:        20 * 1024 * 1024,
+		RangeSet:         NewRangeSet(),
+		Clients:          make(map[string]chan struct{}),
+		Starving:         make(map[string]int64),
+		StarvingSince:    make(map[string]time.Time),
+		DiskMaterialized: true,
+		IsPrehydrating:   false,
+		UpstreamStatus:   "Downloading",
+	}
+
+	// 3. Register client connections
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[probeState.Key] = probeState
+	GlobalRegistry.Files[playbackState.Key] = playbackState
+	GlobalRegistry.Lock.Unlock()
+
+	conn1 := &ClientConnection{
+		ID:             "client-vod-1",
+		Key:            playbackState.Key,
+		URL:            "http://example.com/stream.mp4",
+		RemoteAddr:     "192.168.1.50:1111",
+		UserAgent:      "VLC/3.0.20",
+		Offset:         5000,
+		TotalSize:      playbackState.TotalSize,
+		StartTime:      time.Now().Unix(),
+		InCache:        false,
+		StarvingOffset: -1,
+	}
+	GlobalRegistry.RegisterConnection("client-vod-1", conn1)
+
+	// Verify Probe is active
+	if !GlobalRegistry.IsProbeActive() {
+		t.Fatalf("Expected IsProbeActive to be true with unmaterialized probe in registry")
+	}
+
+	// Generate dashboard JSON
+	rawJSON, err := buildStatePayload()
+	if err != nil {
+		t.Fatalf("Failed to build state payload: %v", err)
+	}
+
+	var stateMap map[string]interface{}
+	if err := json.Unmarshal(rawJSON, &stateMap); err != nil {
+		t.Fatalf("Failed to unmarshal dashboard JSON: %v", err)
+	}
+
+	// Check probe_active in JSON
+	probeActive, ok := stateMap["probe_active"].(bool)
+	if !ok || !probeActive {
+		t.Fatalf("Expected probe_active to be true in dashboard JSON, got %v", stateMap["probe_active"])
+	}
+
+	// Check active_vod_clients (1 active, 1 closed)
+	vodClients, ok := stateMap["active_vod_clients"].(float64)
+	if !ok || int(vodClients) != 1 {
+		t.Fatalf("Expected active_vod_clients to be 1, got %v", stateMap["active_vod_clients"])
+	}
+
+	// Verify active_downloads ONLY includes playbackState, and NOT probeState!
+	activeDownloads, ok := stateMap["active_downloads"].([]interface{})
+	if !ok {
+		t.Fatalf("Expected active_downloads to be a slice, got %T", stateMap["active_downloads"])
+	}
+	if len(activeDownloads) != 1 {
+		t.Fatalf("Expected exactly 1 active download (probe suppressed), got %d: %v", len(activeDownloads), activeDownloads)
+	}
+	item := activeDownloads[0].(map[string]interface{})
+	if item["key"] != "playback_key_2" {
+		t.Fatalf("Expected active download to be playback_key_2, got %v", item["key"])
 	}
 }
 
