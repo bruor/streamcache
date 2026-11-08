@@ -612,5 +612,108 @@ func TestGlobalRegistryAndFileStateNoLockInversionDeadlock(t *testing.T) {
 	}
 }
 
+func TestHeadRequestSkipsPrehydrationAndHydration(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "head_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldConfig := GlobalConfig
+	GlobalConfig = &Config{
+		CacheDir:                  tmpDir,
+		TmpDir:                    tmpDir,
+		MaxUpstreamWorkers:        2,
+		EnableEpisodePrehydration: true,
+	}
+	defer func() { GlobalConfig = oldConfig }()
+
+	oldPM := GlobalPrehydrationManager
+	defer func() { GlobalPrehydrationManager = oldPM }()
+
+	mockPM := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+	GlobalPrehydrationManager = mockPM
+
+	// 1. HEAD on Cache HIT: serves cached headers, must NOT enqueue next_url
+	testURL := "http://example.com/show/s02e01.mkv"
+	key, ext := getCacheKeyAndExt(testURL)
+	cacheFileName := key + ext
+	filePath := filepath.Join(tmpDir, cacheFileName)
+	testContent := []byte("fake video content for s02e01")
+	if err := os.WriteFile(filePath, testContent, 0644); err != nil {
+		t.Fatalf("Failed to write mock cache file: %v", err)
+	}
+	defer os.Remove(filePath)
+
+	reqHit := httptest.NewRequest("HEAD", fmt.Sprintf("/stream?url=%s&next_url=%s",
+		testURL, "http://example.com/show/s02e02.mkv"), nil)
+	recHit := httptest.NewRecorder()
+
+	handleMediaStream(recHit, reqHit)
+
+	if recHit.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK for HEAD cache hit, got %d", recHit.Code)
+	}
+	if recHit.Header().Get("X-Cache") != "HIT" {
+		t.Fatalf("Expected X-Cache: HIT, got %s", recHit.Header().Get("X-Cache"))
+	}
+
+	mockPM.mu.Lock()
+	if len(mockPM.queue) != 0 {
+		mockPM.mu.Unlock()
+		t.Fatalf("Expected 0 prehydration tasks queued for HEAD cache hit, got %d", len(mockPM.queue))
+	}
+	mockPM.mu.Unlock()
+
+	// 2. HEAD on Cache MISS: probes upstream headers, must NOT start coordinator or enqueue next_url
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Length", "50000000")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstreamServer.Close()
+
+	missURL := upstreamServer.URL + "/ep1.mp4"
+	missKey, missExt := getCacheKeyAndExt(missURL)
+	missCacheName := missKey + missExt
+
+	reqMiss := httptest.NewRequest("HEAD", fmt.Sprintf("/stream?url=%s&next_url=%s",
+		missURL, upstreamServer.URL+"/ep2.mp4"), nil)
+	recMiss := httptest.NewRecorder()
+
+	handleMediaStream(recMiss, reqMiss)
+
+	if recMiss.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK for HEAD cache miss, got %d", recMiss.Code)
+	}
+	if recMiss.Header().Get("X-Cache") != "MISS" {
+		t.Fatalf("Expected X-Cache: MISS, got %s", recMiss.Header().Get("X-Cache"))
+	}
+	if recMiss.Header().Get("Content-Length") != "50000000" {
+		t.Fatalf("Expected Content-Length: 50000000, got %s", recMiss.Header().Get("Content-Length"))
+	}
+
+	mockPM.mu.Lock()
+	if len(mockPM.queue) != 0 {
+		mockPM.mu.Unlock()
+		t.Fatalf("Expected 0 prehydration tasks queued for HEAD cache miss, got %d", len(mockPM.queue))
+	}
+	mockPM.mu.Unlock()
+
+	// Verify no active FileCacheState was registered for HEAD request
+	GlobalRegistry.Lock.RLock()
+	_, exists := GlobalRegistry.Files[missCacheName]
+	GlobalRegistry.Lock.RUnlock()
+	if exists {
+		t.Fatalf("Expected no FileCacheState to be created in GlobalRegistry for HEAD request, but found %s", missCacheName)
+	}
+}
+
+
 
 
