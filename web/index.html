@@ -926,8 +926,8 @@
             <div class="status-pill cache-status-pill" id="provider-capacity-pill" style="display: none;">
                 <span style="font-size: 1.2rem;">📡</span>
                 <div class="cache-status-info">
-                    <div id="topbar-provider-text">Serving: 0 VOD</div>
-                    <div id="topbar-provider-avail-text" style="color: var(--accent-green); font-size: 0.78rem;">Upstream: -- slots</div>
+                    <div id="topbar-provider-text">Upstream: -- slots</div>
+                    <div id="topbar-provider-avail-text" style="color: var(--text-sub); font-size: 0.78rem;">Serving: 0 VOD</div>
                 </div>
             </div>
             <div class="status-pill probe-status-pill" id="probe-status-pill" style="display: none;" title="Player is actively probing media container headers in RAM">
@@ -1729,7 +1729,7 @@
                 const minDiskText = minDiskFree > 0 ? ` (${formatBytes(minDiskFree)} Reserved)` : '';
                 topbarDiskText.innerText = `Disk Free: ${formatBytes(diskFree)}${minDiskText}`;
 
-                // Update Serving & Provider Capacity Pill
+                // Update Serving & Provider Capacity Pill (Upstream on top of Downstream)
                 const provPill = document.getElementById('provider-capacity-pill');
                 const provText = document.getElementById('topbar-provider-text');
                 const provAvail = document.getElementById('topbar-provider-avail-text');
@@ -1740,12 +1740,13 @@
                     provPill.style.display = 'flex';
                     let liveClientsStr = '';
                     let upstreamStr = 'Upstream: -- slots';
-                    let availColor = 'var(--accent-green)';
+                    let upstreamColor = 'var(--text-main)';
                     let tooltipLines = [`Active Clients Served:`, `• VOD (Streamcache): ${vodClients}`];
 
+                    let liveClients = 0;
                     if (data.provider_capacity && data.provider_capacity.status === 'ok') {
                         const cap = data.provider_capacity;
-                        const liveClients = cap.live_clients !== undefined ? cap.live_clients : 0;
+                        liveClients = cap.live_clients !== undefined ? cap.live_clients : 0;
                         liveClientsStr = ` · ${liveClients} Live`;
                         tooltipLines.push(`• Live TV (Dispatcharr): ${liveClients}`);
 
@@ -1766,13 +1767,14 @@
                         }
 
                         if (cap.total_available_streams <= 1) {
-                            availColor = 'var(--accent-orange)';
+                            upstreamColor = 'var(--accent-orange)';
                         }
                     }
 
-                    provText.innerText = `Serving: ${vodClients} VOD${liveClientsStr}`;
-                    provAvail.innerText = upstreamStr;
-                    provAvail.style.color = availColor;
+                    provText.innerText = upstreamStr;
+                    provText.style.color = upstreamColor;
+                    provAvail.innerText = `Serving: ${vodClients} VOD${liveClientsStr}`;
+                    provAvail.style.color = (vodClients > 0 || liveClients > 0) ? 'var(--accent-green)' : 'var(--text-sub)';
                     provPill.title = tooltipLines.join('\n');
                 }
 
