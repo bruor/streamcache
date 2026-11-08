@@ -19,9 +19,11 @@ type SSEEvent struct {
 }
 
 type LogBroker struct {
-	lock      sync.Mutex
-	listeners map[chan SSEEvent]bool
-	stdout    io.Writer
+	lock             sync.Mutex
+	listeners        map[chan SSEEvent]bool
+	stdout           io.Writer
+	broadcasting     atomic.Int32
+	broadcastPending atomic.Int32
 }
 
 var GlobalLogBroker *LogBroker
@@ -125,23 +127,38 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 func (lb *LogBroker) BroadcastStateUpdate() {
-	payload, err := buildStatePayload()
-	if err != nil {
+	lb.lock.Lock()
+	hasListeners := len(lb.listeners) > 0
+	lb.lock.Unlock()
+	if !hasListeners {
 		return
 	}
 
-	evt := SSEEvent{
-		Type: "state",
-		Data: string(payload),
+	lb.broadcastPending.Store(1)
+	if !lb.broadcasting.CompareAndSwap(0, 1) {
+		return
 	}
+	defer lb.broadcasting.Store(0)
 
-	lb.lock.Lock()
-	defer lb.lock.Unlock()
-	for listener := range lb.listeners {
-		select {
-		case listener <- evt:
-		default:
+	for lb.broadcastPending.Swap(0) == 1 {
+		payload, err := buildStatePayload()
+		if err != nil {
+			return
 		}
+
+		evt := SSEEvent{
+			Type: "state",
+			Data: string(payload),
+		}
+
+		lb.lock.Lock()
+		for listener := range lb.listeners {
+			select {
+			case listener <- evt:
+			default:
+			}
+		}
+		lb.lock.Unlock()
 	}
 }
 

@@ -298,8 +298,8 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			GlobalRegistry.Lock.Unlock()
 		}
 	} else {
+		GlobalRegistry.Lock.Unlock()
 		if r.Method == http.MethodHead {
-			GlobalRegistry.Lock.Unlock()
 			w.Header().Set("X-Cache", "MISS")
 			w.Header().Set("Accept-Ranges", "bytes")
 			state.Lock.Lock()
@@ -333,12 +333,14 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 		if wasPrehydrating {
 			log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", cacheFileName)
+			if GlobalPrehydrationManager != nil {
+				GlobalPrehydrationManager.OnPriorityUpgrade(cacheFileName)
+			}
 			state.SetUpstreamStatus("Connecting")
 			if !isWriterActive && !state.RangeSet.IsComplete(state.TotalSize) {
 				StartCoordinator(state, r.Header)
 			}
 		}
-		GlobalRegistry.Lock.Unlock()
 	}
 
 	// Create request-bound CacheReader
