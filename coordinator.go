@@ -31,13 +31,15 @@ func StartCoordinator(state *FileCacheState, initialHeader http.Header) {
 		return
 	}
 	state.WriterActive = true
+	state.coordGen++
+	myGen := state.coordGen
 	state.Lock.Unlock()
 
 	if GlobalLogBroker != nil {
-		GlobalLogBroker.BroadcastStateUpdate()
+		go GlobalLogBroker.BroadcastStateUpdate()
 	}
 
-	go runCoordinator(state, initialHeader)
+	go runCoordinator(state, initialHeader, myGen)
 }
 
 // CancelCoordinator cancels an active coordinator, stopping workers and deleting partial files if no clients exist
@@ -46,6 +48,9 @@ func CancelCoordinator(state *FileCacheState) {
 	cancel := state.Cancel
 	state.Cancel = nil
 	state.UpstreamStatus = "Cancelled"
+	state.IsPrehydrating = false
+	state.IsYielding = false
+	state.coordGen++
 	clientsCount := len(state.Clients)
 	fileToClose := state.File
 	state.File = nil
@@ -63,8 +68,12 @@ func CancelCoordinator(state *FileCacheState) {
 	state.ChunkManager = nil
 	state.Lock.Unlock()
 
+	if GlobalPrehydrationManager != nil {
+		GlobalPrehydrationManager.OnCancelled(key)
+	}
+
 	if GlobalLogBroker != nil {
-		GlobalLogBroker.BroadcastStateUpdate()
+		go GlobalLogBroker.BroadcastStateUpdate()
 	}
 
 	if cancel != nil {
@@ -107,7 +116,7 @@ func CancelCoordinator(state *FileCacheState) {
 	GlobalRegistry.ClearFailedProbe(key)
 
 	if GlobalLogBroker != nil {
-		GlobalLogBroker.BroadcastStateUpdate()
+		go GlobalLogBroker.BroadcastStateUpdate()
 	}
 	runtime.GC()
 	debug.FreeOSMemory()
@@ -128,18 +137,27 @@ type Worker struct {
 	isPrefetchHelper  bool
 }
 
-func runCoordinator(state *FileCacheState, initialHeader http.Header) {
-	log.Printf("[Coord] Starting concurrent background coordinator for cache: %s", state.Key)
+func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint64) {
+	state.coordMu.Lock()
+	defer state.coordMu.Unlock()
 
 	state.Lock.Lock()
+	if state.coordGen != myGen {
+		state.Lock.Unlock()
+		return
+	}
 	shouldMaterializeImmediately := state.IsPrehydrating || FileExists(state.PartPath)
 	state.Lock.Unlock()
+
+	log.Printf("[Coord] Starting concurrent background coordinator for cache: %s", state.Key)
 
 	if shouldMaterializeImmediately {
 		if err := state.MaterializeDiskFile(); err != nil {
 			log.Printf("[Coord] Error materializing part file: %v", err)
 			state.Lock.Lock()
-			state.WriterActive = false
+			if state.coordGen == myGen {
+				state.WriterActive = false
+			}
 			state.Lock.Unlock()
 			return
 		}
@@ -174,7 +192,10 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 	defer func() {
 		parentCancel()
 		state.Lock.Lock()
-		state.Cancel = nil
+		isCurrentGen := state.coordGen == myGen
+		if isCurrentGen {
+			state.Cancel = nil
+		}
 
 		// Wake up any client readers waiting on data
 		for _, ch := range state.Clients {
@@ -204,15 +225,16 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header) {
 			go finalizeAndCommitCache(state, fileToClose, pipelineToClose)
 		} else {
 			var fileToClose *os.File
-			var pipelineToClose StorageSink
-			shouldCleanUpIncomplete := len(state.Clients) == 0
+			pipelineToClose := state.Pipeline
+			state.Pipeline = nil
+			shouldCleanUpIncomplete := isCurrentGen && len(state.Clients) == 0 && !state.IsYielding && !state.IsPrehydrating
 			if shouldCleanUpIncomplete {
 				fileToClose = state.File
 				state.File = nil
-				pipelineToClose = state.Pipeline
-				state.Pipeline = nil
 			}
-			state.WriterActive = false
+			if isCurrentGen {
+				state.WriterActive = false
+			}
 			state.Lock.Unlock()
 
 			if pipelineToClose != nil {
@@ -1421,7 +1443,7 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 			GlobalRegistry.Lock.Unlock()
 
 			if GlobalLogBroker != nil {
-				GlobalLogBroker.BroadcastStateUpdate()
+				go GlobalLogBroker.BroadcastStateUpdate()
 			}
 			log.Printf("[Coord] Cached file finalized and committed to disk: %s", state.Key)
 		} else {
@@ -1441,7 +1463,7 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 		delete(GlobalRegistry.Files, state.Key)
 		GlobalRegistry.Lock.Unlock()
 		if GlobalLogBroker != nil {
-			GlobalLogBroker.BroadcastStateUpdate()
+			go GlobalLogBroker.BroadcastStateUpdate()
 		}
 	}
 

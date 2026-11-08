@@ -107,6 +107,8 @@ type FileCacheState struct {
 	YieldCooldownUntil   time.Time
 	NextURLs             []string
 	DiskMaterialized     bool
+	coordMu              sync.Mutex
+	coordGen             uint64
 }
 
 func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod string, totalSize int64) *FileCacheState {
@@ -229,7 +231,7 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 	}
 
 	s.Lock.Lock()
-	if s.DiskMaterialized || FileExists(s.Path) {
+	if (s.DiskMaterialized && s.File != nil) || FileExists(s.Path) {
 		s.Lock.Unlock()
 		return nil
 	}
@@ -246,7 +248,7 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
 
-	if s.DiskMaterialized || FileExists(s.Path) {
+	if (s.DiskMaterialized && s.File != nil) || FileExists(s.Path) {
 		return nil
 	}
 
@@ -326,17 +328,21 @@ func (r *CacheRegistry) IsProbeActive() bool {
 
 	// 1. Check if any file in memory is currently in unmaterialized probe stage
 	r.Lock.RLock()
+	files := make([]*FileCacheState, 0, len(r.Files))
 	for _, f := range r.Files {
+		files = append(files, f)
+	}
+	r.Lock.RUnlock()
+
+	for _, f := range files {
 		f.Lock.Lock()
 		isMat := f.DiskMaterialized || FileExists(f.PartPath) || FileExists(f.Path)
 		isPre := f.IsPrehydrating
 		f.Lock.Unlock()
 		if !isMat && !isPre {
-			r.Lock.RUnlock()
 			return true
 		}
 	}
-	r.Lock.RUnlock()
 
 	// 2. Also check if a probe occurred within the last 4 seconds so the UI indicator has time to flash visibly
 	last := atomic.LoadInt64(&r.lastProbeTime)
@@ -524,7 +530,7 @@ func (r *CacheRegistry) startSpeedMonitor() {
 		}
 
 		if shouldBroadcast && GlobalLogBroker != nil {
-			GlobalLogBroker.BroadcastStateUpdate()
+			go GlobalLogBroker.BroadcastStateUpdate()
 		}
 	}
 }

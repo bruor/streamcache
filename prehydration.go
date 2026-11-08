@@ -392,6 +392,31 @@ func (pm *PrehydrationManager) ResumeState(state *FileCacheState) {
 	StartCoordinator(state, header)
 }
 
+// OnPriorityUpgrade removes a file from active prehydrations when upgraded to live playback.
+func (pm *PrehydrationManager) OnPriorityUpgrade(key string) {
+	if pm == nil || key == "" {
+		return
+	}
+	pm.mu.Lock()
+	delete(pm.activePrehydrations, key)
+	pm.mu.Unlock()
+}
+
+// OnCancelled removes a file from active prehydrations and releases its slot if manually cancelled.
+func (pm *PrehydrationManager) OnCancelled(key string) {
+	if pm == nil || key == "" {
+		return
+	}
+	pm.mu.Lock()
+	if pm.activePrehydrations[key] {
+		delete(pm.activePrehydrations, key)
+		if pm.prehydrationsStartedSinceLastPoll > 0 {
+			pm.prehydrationsStartedSinceLastPoll--
+		}
+	}
+	pm.mu.Unlock()
+}
+
 // OnCacheHit is invoked immediately when a player requests an episode that is already 100% on disk.
 func (pm *PrehydrationManager) OnCacheHit(currentURL string, nextURLs []string) {
 	if pm == nil || len(nextURLs) == 0 {

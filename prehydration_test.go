@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -1213,21 +1215,9 @@ func TestConcurrentYieldedReactivation(t *testing.T) {
 		CancelCoordinator(fs1)
 		CancelCoordinator(fs2)
 		CancelCoordinator(fs3)
-		deadline := time.Now().Add(500 * time.Millisecond)
-		for time.Now().Before(deadline) {
-			fs1.Lock.Lock()
-			w1 := fs1.WriterActive
-			fs1.Lock.Unlock()
-			fs2.Lock.Lock()
-			w2 := fs2.WriterActive
-			fs2.Lock.Unlock()
-			fs3.Lock.Lock()
-			w3 := fs3.WriterActive
-			fs3.Lock.Unlock()
-			if !w1 && !w2 && !w3 {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
+		for _, fs := range []*FileCacheState{fs1, fs2, fs3} {
+			fs.coordMu.Lock()
+			fs.coordMu.Unlock()
 		}
 		GlobalRegistry.Lock.Lock()
 		delete(GlobalRegistry.Files, fs1.Key)
@@ -1262,6 +1252,238 @@ func TestConcurrentYieldedReactivation(t *testing.T) {
 	}
 	if startedCount != 3 {
 		t.Fatalf("Expected 3 prehydrations started since last poll, got %d", startedCount)
+	}
+}
+
+func TestYieldedCoordinatorPreservesPartFileAndRegistryEntry(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldConfig := GlobalConfig
+	GlobalConfig = &Config{
+		CacheDir:                  tmpDir,
+		TmpDir:                    tmpDir,
+		MaxUpstreamWorkers:        2,
+		EnableEpisodePrehydration: true,
+		WritebackBufferSize:       64 * 1024,
+	}
+	defer func() { GlobalConfig = oldConfig }()
+
+	blockCh := make(chan struct{})
+
+	firstChunkSent := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1048576")
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(bytes.Repeat([]byte("A"), 4096))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case firstChunkSent <- struct{}{}:
+		default:
+		}
+		select {
+		case <-blockCh:
+		case <-r.Context().Done():
+		}
+	}))
+	defer ts.Close()
+	defer close(blockCh)
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+	oldPM := GlobalPrehydrationManager
+	GlobalPrehydrationManager = pm
+	defer func() { GlobalPrehydrationManager = oldPM }()
+
+	key := "yield_preserve.mkv"
+	fs := NewFileCacheState(
+		key,
+		ts.URL+"/yield_preserve.mkv",
+		filepath.Join(tmpDir, key),
+		filepath.Join(tmpDir, key+".part"),
+		filepath.Join(tmpDir, key+".json"),
+		"video/mp4",
+		"",
+		"",
+		1048576,
+	)
+	fs.IsPrehydrating = true
+	pm.activePrehydrations[key] = true
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = fs
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		CancelCoordinator(fs)
+		fs.coordMu.Lock()
+		fs.coordMu.Unlock()
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, key)
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	StartCoordinator(fs, make(http.Header))
+
+	select {
+	case <-firstChunkSent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Timed out waiting for coordinator worker to receive initial chunk")
+	}
+
+	// Give worker a moment to enqueue into WritebackPipeline
+	time.Sleep(30 * time.Millisecond)
+
+	// Yield the prehydrating state
+	pm.YieldState(fs, "test")
+
+	// Wait for runCoordinator to exit completely by locking coordMu
+	fs.coordMu.Lock()
+	fs.coordMu.Unlock()
+
+	// Verify the yielded file was NOT deleted from GlobalRegistry or disk!
+	GlobalRegistry.Lock.RLock()
+	regState, exists := GlobalRegistry.Files[key]
+	GlobalRegistry.Lock.RUnlock()
+	if !exists || regState != fs {
+		t.Fatalf("Expected yielded file %s to remain in GlobalRegistry.Files, got exists=%v", key, exists)
+	}
+	if !FileExists(fs.PartPath) {
+		t.Fatalf("Expected yielded .part file %s to remain on disk after coordinator exit", fs.PartPath)
+	}
+	fs.Lock.Lock()
+	isYielding := fs.IsYielding
+	downloaded := fs.RangeSet.TotalBytes()
+	fs.Lock.Unlock()
+	if !isYielding {
+		t.Fatalf("Expected fs.IsYielding to remain true")
+	}
+	if downloaded < 4096 {
+		t.Fatalf("Expected WritebackPipeline to flush >= 4096 bytes before coordinator exit, got %d", downloaded)
+	}
+}
+
+func TestPriorityUpgradeWhileSSEActiveNoSelfDeadlock(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldConfig := GlobalConfig
+	GlobalConfig = &Config{
+		CacheDir:                  tmpDir,
+		TmpDir:                    tmpDir,
+		MaxUpstreamWorkers:        2,
+		EnableEpisodePrehydration: true,
+		WritebackBufferSize:       64 * 1024,
+	}
+
+	if GlobalLogBroker == nil {
+		InitLogBroker()
+	}
+	sseCh := make(chan SSEEvent, 100)
+	GlobalLogBroker.Register(sseCh)
+
+	payload := bytes.Repeat([]byte("V"), 8192)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	defer ts.Close()
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+	oldPM := GlobalPrehydrationManager
+	GlobalPrehydrationManager = pm
+
+	targetURL := ts.URL + "/priority_upgrade.mkv"
+	key, ext := getCacheKeyAndExt(targetURL)
+	cacheFileName := key + ext
+
+	fs := NewFileCacheState(
+		cacheFileName,
+		targetURL,
+		filepath.Join(tmpDir, cacheFileName),
+		filepath.Join(tmpDir, cacheFileName+".part"),
+		filepath.Join(tmpDir, cacheFileName+".json"),
+		"video/mp4",
+		"",
+		"",
+		int64(len(payload)),
+	)
+	// Simulate a yielded prehydration file (WriterActive == false, IsYielding == true)
+	fs.IsPrehydrating = false
+	fs.IsYielding = true
+	fs.WriterActive = false
+	pm.activePrehydrations[cacheFileName] = true
+	pm.prehydrationsStartedSinceLastPoll = 1
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[cacheFileName] = fs
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		// Wait briefly if committing so finalizeAndCommitCache finishes before restoring globals
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			fs.Lock.Lock()
+			status := fs.UpstreamStatus
+			fs.Lock.Unlock()
+			if status != "Committing" {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		CancelCoordinator(fs)
+		fs.coordMu.Lock()
+		fs.coordMu.Unlock()
+		GlobalLogBroker.Unregister(sseCh)
+		for GlobalLogBroker.broadcasting.Load() != 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, cacheFileName)
+		GlobalRegistry.Lock.Unlock()
+		GlobalPrehydrationManager = oldPM
+		GlobalConfig = oldConfig
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/stream?url="+url.QueryEscape(targetURL), nil)
+	rec := httptest.NewRecorder()
+
+	doneCh := make(chan struct{})
+	go func() {
+		handleMediaStream(rec, req)
+		close(doneCh)
+	}()
+
+	select {
+	case <-doneCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleMediaStream deadlocked during Priority Upgrade of a yielded file!")
+	}
+
+	if rec.Code != http.StatusOK && rec.Code != http.StatusPartialContent {
+		t.Fatalf("Expected status 200 or 206, got %d", rec.Code)
+	}
+	if rec.Body.Len() != len(payload) {
+		t.Fatalf("Expected %d bytes in response body, got %d", len(payload), rec.Body.Len())
+	}
+
+	pm.mu.RLock()
+	stillActive := pm.activePrehydrations[cacheFileName]
+	pm.mu.RUnlock()
+	if stillActive {
+		t.Fatalf("Expected Priority Upgrade to remove %s from activePrehydrations", cacheFileName)
 	}
 }
 
