@@ -1521,29 +1521,30 @@ func TestConnectionTelemetry(t *testing.T) {
 }
 
 func TestCoordinatorObservedCooldown(t *testing.T) {
-	oldCacheDir := GlobalConfig.CacheDir
-	oldTmpDir := GlobalConfig.TmpDir
 	tmpDir, err := os.MkdirTemp("", "sc-test-cooldown-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	GlobalConfig.CacheDir = tmpDir
-	GlobalConfig.TmpDir = tmpDir
-	defer func() {
-		GlobalConfig.CacheDir = oldCacheDir
-		GlobalConfig.TmpDir = oldTmpDir
-	}()
-
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
 	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
 	oldWait := GlobalConfig.ClientHydrationWait
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
 	GlobalConfig.MaxUpstreamWorkers = 1
 	GlobalConfig.ClientHydrationWait = 0
+	GlobalConfig.Unlock()
 
 	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
 		GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers
 		GlobalConfig.ClientHydrationWait = oldWait
+		GlobalConfig.Unlock()
 	}()
 
 	var lock sync.Mutex
