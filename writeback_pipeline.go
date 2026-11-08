@@ -99,17 +99,100 @@ func (lb *LiveBuffer) Put(chunk *pooledChunk) {
 		lb.curBytes -= int64(old.length)
 		old.release()
 		lb.chunks[idx] = chunk
+		lb.curBytes += int64(chunk.length)
+	} else if idx > 0 &&
+		lb.chunks[idx-1].offset+int64(lb.chunks[idx-1].length) == chunk.offset &&
+		lb.chunks[idx-1].length+chunk.length <= len(*lb.chunks[idx-1].bufPtr) &&
+		(idx == len(lb.chunks) || lb.chunks[idx].offset >= chunk.offset+int64(chunk.length)) &&
+		atomic.LoadInt32(&lb.chunks[idx-1].refCount) == 1 &&
+		atomic.LoadInt32(&chunk.refCount) == 1 {
+		// Coalesce contiguous chunk into existing 128KB buffer and return temporary chunk to pool
+		prev := lb.chunks[idx-1]
+		copy((*prev.bufPtr)[prev.length:prev.length+chunk.length], (*chunk.bufPtr)[:chunk.length])
+		prev.length += chunk.length
+		lb.curBytes += int64(chunk.length)
+		atomic.StoreUint64(&prev.seq, seq)
+		chunk.release()
 	} else {
 		// Insert at idx
+		lb.chunks = append(lb.chunks, nil)
+		copy(lb.chunks[idx+1:], lb.chunks[idx:])
+		lb.chunks[idx] = chunk
+		lb.curBytes += int64(chunk.length)
+	}
+
+	lb.evictLocked()
+}
+
+// PutSlice copies data directly into a coalesced 128KB chunk in LiveBuffer when contiguous,
+// avoiding allocating a separate 128KB pooled buffer for small network reads.
+func (lb *LiveBuffer) PutSlice(offset int64, data []byte, pinForWrite bool) writeReq {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	seq := atomic.AddUint64(&lb.seqGen, 1)
+
+	idx := sort.Search(len(lb.chunks), func(i int) bool {
+		return lb.chunks[i].offset >= offset
+	})
+
+	if idx > 0 && (idx == len(lb.chunks) || lb.chunks[idx].offset >= offset+int64(len(data))) {
+		prev := lb.chunks[idx-1]
+		if prev.offset+int64(prev.length) == offset && prev.length+len(data) <= len(*prev.bufPtr) {
+			bufOff := prev.length
+			copy((*prev.bufPtr)[bufOff:bufOff+len(data)], data)
+			prev.length += len(data)
+			lb.curBytes += int64(len(data))
+			atomic.StoreUint64(&prev.seq, seq)
+			if pinForWrite {
+				atomic.AddInt32(&prev.refCount, 1)
+			}
+			lb.evictLocked()
+			return writeReq{
+				offset:    offset,
+				bufOffset: bufOff,
+				length:    len(data),
+				bufPtr:    prev.bufPtr,
+				owner:     prev,
+			}
+		}
+	}
+
+	refCount := int32(1)
+	if pinForWrite {
+		refCount = 2
+	}
+	chunk := newPooledChunk(offset, data, refCount)
+	atomic.StoreUint64(&chunk.seq, seq)
+
+	if idx < len(lb.chunks) && lb.chunks[idx].offset == offset {
+		old := lb.chunks[idx]
+		lb.curBytes -= int64(old.length)
+		old.release()
+		lb.chunks[idx] = chunk
+	} else {
 		lb.chunks = append(lb.chunks, nil)
 		copy(lb.chunks[idx+1:], lb.chunks[idx:])
 		lb.chunks[idx] = chunk
 	}
 	lb.curBytes += int64(chunk.length)
 
-	// Evict least recently used/added chunks if exceeding maxBytes,
+	lb.evictLocked()
+
+	return writeReq{
+		offset:    offset,
+		bufOffset: 0,
+		length:    len(data),
+		bufPtr:    chunk.bufPtr,
+		owner:     chunk,
+	}
+}
+
+func (lb *LiveBuffer) evictLocked() {
+	// Evict least recently used/added chunks if exceeding maxBytes (or max backing buffers),
 	// but never evict a chunk that is still in-flight to disk (refCount > 1).
-	for lb.curBytes > lb.maxBytes && len(lb.chunks) > 0 {
+	maxBackingChunks := int(lb.maxBytes / (DefaultWritebackChunkSize / 2))
+	for len(lb.chunks) > 0 && (lb.curBytes > lb.maxBytes || (maxBackingChunks >= 2 && len(lb.chunks) > maxBackingChunks)) {
 		minIdx := -1
 		var minSeq uint64
 		for i := 0; i < len(lb.chunks); i++ {
@@ -243,6 +326,14 @@ type writeWindow struct {
 	end   int64
 }
 
+type writeReq struct {
+	offset    int64
+	bufOffset int
+	length    int
+	bufPtr    *[]byte
+	owner     *pooledChunk
+}
+
 // WritebackPipeline coordinates decoupled disk writes and continuous writeback pacing
 type WritebackPipeline struct {
 	fileMu     sync.RWMutex
@@ -250,7 +341,7 @@ type WritebackPipeline struct {
 	fd         uintptr
 	state      *FileCacheState
 	liveBuffer *LiveBuffer
-	queue      chan *pooledChunk
+	queue      chan writeReq
 	mu         sync.RWMutex
 	closed     bool
 	wg         sync.WaitGroup
@@ -269,9 +360,12 @@ func NewWritebackPipeline(file *os.File, state *FileCacheState, bufferBytes int6
 		bufferBytes = 64 * 1024 * 1024 // 64MB default
 	}
 
-	queueCap := int(bufferBytes / DefaultWritebackChunkSize)
-	if queueCap < 64 {
-		queueCap = 64
+	queueCap := int(bufferBytes / 8192)
+	if queueCap < 256 {
+		queueCap = 256
+	}
+	if queueCap > 4096 {
+		queueCap = 4096
 	}
 
 	var fd uintptr
@@ -295,7 +389,7 @@ func NewWritebackPipeline(file *os.File, state *FileCacheState, bufferBytes int6
 		file:       file,
 		state:      state,
 		liveBuffer: lb,
-		queue:      make(chan *pooledChunk, queueCap),
+		queue:      make(chan writeReq, queueCap),
 		fd:         fd,
 		windows:    make([]writeWindow, 0, 4),
 	}
@@ -328,25 +422,30 @@ func (wp *WritebackPipeline) WriteChunkContext(ctx context.Context, offset int64
 	}
 	wp.errMu.Unlock()
 
-	refCount := int32(1)
+	var req writeReq
 	if wp.liveBuffer != nil {
-		refCount = 2
+		req = wp.liveBuffer.PutSlice(offset, data, true)
+	} else {
+		chunk := newPooledChunk(offset, data, 1)
+		req = writeReq{
+			offset:    offset,
+			bufOffset: 0,
+			length:    len(data),
+			bufPtr:    chunk.bufPtr,
+			owner:     chunk,
+		}
 	}
-	chunk := newPooledChunk(offset, data, refCount)
 
-	// 1. Immediately store in LiveBuffer for zero-copy client playback
-	if wp.liveBuffer != nil {
-		wp.liveBuffer.Put(chunk)
-	}
-
-	// 2. Queue for asynchronous disk writing & kernel writeback
+	// Queue for asynchronous disk writing & kernel writeback
 	select {
-	case wp.queue <- chunk:
+	case wp.queue <- req:
 		wp.mu.RUnlock()
 		return nil
 	case <-ctx.Done():
 		wp.mu.RUnlock()
-		chunk.release() // release consumer's reference
+		if req.owner != nil {
+			req.owner.release() // release consumer's reference
+		}
 		return ctx.Err()
 	}
 }
@@ -380,15 +479,16 @@ func (wp *WritebackPipeline) AttachFile(file *os.File) error {
 func (wp *WritebackPipeline) storageConsumer() {
 	defer wp.wg.Done()
 
-	for chunk := range wp.queue {
+	flushBatch := func(writeOffset int64, bufPtr *[]byte, bufStart, bufEnd int, owners []*pooledChunk) {
 		wp.fileMu.RLock()
 		file := wp.file
 		wp.fileMu.RUnlock()
 
-		if file != nil && chunk.bufPtr != nil {
-			_, err := file.WriteAt((*chunk.bufPtr)[:chunk.length], chunk.offset)
+		length := bufEnd - bufStart
+		if file != nil && bufPtr != nil && length > 0 {
+			_, err := file.WriteAt((*bufPtr)[bufStart:bufEnd], writeOffset)
 			if err != nil {
-				log.Printf("[WritebackPipeline] WriteAt error at offset %d: %v", chunk.offset, err)
+				log.Printf("[WritebackPipeline] WriteAt error at offset %d: %v", writeOffset, err)
 				wp.errMu.Lock()
 				if wp.lastErr == nil {
 					wp.lastErr = err
@@ -398,10 +498,49 @@ func (wp *WritebackPipeline) storageConsumer() {
 		}
 
 		// Writeback pacing (Linux SyncFileRange + Fadvise)
-		wp.paceWriteback(chunk.offset, int64(chunk.length))
+		if length > 0 {
+			wp.paceWriteback(writeOffset, int64(length))
+		}
 
-		// Release chunk reference for consumer
-		chunk.release()
+		// Release chunk references for consumer
+		for _, owner := range owners {
+			if owner != nil {
+				owner.release()
+			}
+		}
+	}
+
+	for req := range wp.queue {
+		writeOffset := req.offset
+		bufPtr := req.bufPtr
+		bufStart := req.bufOffset
+		bufEnd := req.bufOffset + req.length
+		owners := []*pooledChunk{req.owner}
+
+	coalesceLoop:
+		for {
+			select {
+			case next, ok := <-wp.queue:
+				if !ok {
+					break coalesceLoop
+				}
+				if next.bufPtr == bufPtr && next.bufOffset == bufEnd && next.offset == writeOffset+int64(bufEnd-bufStart) {
+					bufEnd += next.length
+					owners = append(owners, next.owner)
+				} else {
+					flushBatch(writeOffset, bufPtr, bufStart, bufEnd, owners)
+					writeOffset = next.offset
+					bufPtr = next.bufPtr
+					bufStart = next.bufOffset
+					bufEnd = next.bufOffset + next.length
+					owners = []*pooledChunk{next.owner}
+				}
+			default:
+				break coalesceLoop
+			}
+		}
+
+		flushBatch(writeOffset, bufPtr, bufStart, bufEnd, owners)
 	}
 
 	// Final flush on consumer exit

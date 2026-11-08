@@ -231,7 +231,10 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			var fileToClose *os.File
 			pipelineToClose := state.Pipeline
 			state.Pipeline = nil
-			shouldCleanUpIncomplete := isCurrentGen && len(state.Clients) == 0 && !state.IsYielding && !state.IsPrehydrating
+			pm := GlobalPrehydrationManager
+			canSuspendToYield := state.DiskMaterialized && state.UpstreamStatus != "Cancelled" && pm != nil && (GlobalConfig == nil || (GlobalConfig.GetEnableEpisodePrehydration() && !GlobalConfig.GetEvictYieldedParts()))
+			shouldSuspendToYield := isCurrentGen && len(state.Clients) == 0 && !state.IsYielding && (state.IsPrehydrating || canSuspendToYield)
+			shouldCleanUpIncomplete := isCurrentGen && len(state.Clients) == 0 && !state.IsYielding && !state.IsPrehydrating && !shouldSuspendToYield
 			if shouldCleanUpIncomplete {
 				fileToClose = state.File
 				state.File = nil
@@ -248,7 +251,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 				_ = fileToClose.Close()
 			}
 
-			if shouldCleanUpIncomplete {
+			if shouldSuspendToYield && pm != nil {
+				pm.YieldState(state, "Coordinator exited before completion; suspended for retry")
+			} else if shouldCleanUpIncomplete {
 				GlobalRegistry.Lock.Lock()
 				existingState, exists := GlobalRegistry.Files[state.Key]
 				if exists && (existingState == state || existingState == nil) {
@@ -910,14 +915,15 @@ func runDownloadWorker(
 				_ = resp.Body.Close()
 				state.Lock.Lock()
 				isPrehydrating := state.IsPrehydrating
+				isMaterialized := state.DiskMaterialized
 				state.Lock.Unlock()
-				if isPrehydrating && (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests) {
+				if isPrehydrating && (resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusForbidden) {
 					if GlobalPrehydrationManager != nil {
 						GlobalPrehydrationManager.YieldState(state, fmt.Sprintf("HTTP %d upstream backpressure", resp.StatusCode))
 					}
 					return
 				}
-				isPermanent := resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone
+				isPermanent := !isMaterialized && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone)
 				if handleFailure(isPermanent, "[Worker-%d] Upstream returned error status %d", w.id, resp.StatusCode) {
 					return
 				}
@@ -1021,6 +1027,9 @@ func runDownloadWorker(
 
 			// If cumulative downloaded bytes in memory cross 32MB without being materialized yet, materialize to disk
 			if !state.IsDiskMaterialized() && state.RangeSet.TotalBytes() >= 32*1024*1024 {
+				if GlobalRegistry != nil && state.TotalSize > 0 {
+					GlobalRegistry.PreEvict(state.TotalSize)
+				}
 				_ = state.MaterializeDiskFile()
 			}
 

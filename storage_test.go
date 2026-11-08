@@ -347,7 +347,12 @@ func TestS3MultiViewerDisparateOffsets(t *testing.T) {
 	GlobalStorage = backend
 	defer func() { GlobalStorage = oldStorage }()
 
-	InitRegistry()
+	GlobalRegistry = &CacheRegistry{
+		Files:        make(map[string]*FileCacheState),
+		Connections:  make(map[string]*ClientConnection),
+		Sessions:     make(map[string]*ClientSession),
+		FailedProbes: make(map[string]time.Time),
+	}
 
 	tempDir, err := os.MkdirTemp("", "streamcache_multiviewer_*")
 	if err != nil {
@@ -444,7 +449,12 @@ func TestS3RevalidationWithOrigin(t *testing.T) {
 	GlobalStorage = backend
 	defer func() { GlobalStorage = oldStorage }()
 
-	InitRegistry()
+	GlobalRegistry = &CacheRegistry{
+		Files:        make(map[string]*FileCacheState),
+		Connections:  make(map[string]*ClientConnection),
+		Sessions:     make(map[string]*ClientSession),
+		FailedProbes: make(map[string]time.Time),
+	}
 
 	key := "movie_reval.mp4"
 	testData := []byte("hello streamcache s3 revalidation")
@@ -558,7 +568,12 @@ func TestS3ViewerTransitionAcrossRecomposition(t *testing.T) {
 	GlobalStorage = backend
 	defer func() { GlobalStorage = oldStorage }()
 
-	InitRegistry()
+	GlobalRegistry = &CacheRegistry{
+		Files:        make(map[string]*FileCacheState),
+		Connections:  make(map[string]*ClientConnection),
+		Sessions:     make(map[string]*ClientSession),
+		FailedProbes: make(map[string]time.Time),
+	}
 
 	key := "4k_transition_movie.mkv"
 	totalSize := int64(128 * 1024) // 128 KB -> 4 chunks
@@ -771,7 +786,12 @@ func TestS3SmallFileSinglePutObject(t *testing.T) {
 	GlobalStorage = backend
 	defer func() { GlobalStorage = oldStorage }()
 
-	InitRegistry()
+	GlobalRegistry = &CacheRegistry{
+		Files:        make(map[string]*FileCacheState),
+		Connections:  make(map[string]*ClientConnection),
+		Sessions:     make(map[string]*ClientSession),
+		FailedProbes: make(map[string]time.Time),
+	}
 
 	key := "small_sample.mp4"
 	totalSize := int64(2 * 1024 * 1024) // 2 MB (< 5 MB)

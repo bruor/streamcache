@@ -317,6 +317,7 @@ type CacheRegistry struct {
 	TotalCacheSize   int64
 	MaxObservedSpeed int64
 	Evicting         bool
+	pendingEvict     bool
 	lastProbeTime    int64
 }
 
@@ -454,6 +455,10 @@ func startDiskFreeMonitor() {
 		space, err := GetDiskFreeSpace(GlobalConfig.GetCacheDir())
 		if err == nil {
 			atomic.StoreUint64(&GlobalDiskFreeBytes, space)
+			minFree := GlobalConfig.GetMinDiskFreeBytes()
+			if minFree > 0 && space < uint64(minFree) && GlobalRegistry != nil {
+				GlobalRegistry.PreEvict(0)
+			}
 		}
 		if GlobalRegistry != nil {
 			GlobalRegistry.SweepExpiredProbes()
@@ -983,26 +988,55 @@ func (r *CacheRegistry) GetTotalCacheSize() int64 {
 func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 	r.Lock.Lock()
 	if r.Evicting {
+		r.pendingEvict = true
 		r.Lock.Unlock()
 		return
 	}
 
+	r.Evicting = true
+	r.pendingEvict = false
+	files := make([]*FileCacheState, 0, len(r.Files))
+	activeKeys := make(map[string]bool, len(r.Files))
+	for k, f := range r.Files {
+		activeKeys[k] = true
+		if f != nil {
+			files = append(files, f)
+		}
+	}
+	r.Lock.Unlock()
+
+	var unwrittenActiveBytes int64
+	for _, f := range files {
+		f.Lock.Lock()
+		isMat := f.DiskMaterialized
+		isYield := f.IsYielding
+		totalSz := f.TotalSize
+		f.Lock.Unlock()
+		if isMat && !isYield && totalSz > 0 {
+			downloaded := atomic.LoadInt64(&f.TotalBytesDownloaded)
+			if rem := totalSz - downloaded; rem > 0 {
+				unwrittenActiveBytes += rem
+			}
+		}
+	}
+
+	totalPending := incomingSizeBytes + unwrittenActiveBytes
 	currentSize := atomic.LoadInt64(&r.TotalCacheSize)
 	cacheDir := GlobalConfig.GetCacheDir()
 
-	// Calculate how much space we need to free based on cache limit if incoming file is added
+	// Calculate how much space we need to free based on cache limit if incoming + unwritten active bytes are added
 	var cacheBytesToFree int64
 	maxBytes := GlobalConfig.GetCacheMaxBytes()
 	minDiskFree := GlobalConfig.GetMinDiskFreeBytes()
-	if maxBytes > 0 && (currentSize+incomingSizeBytes) > maxBytes {
-		cacheBytesToFree = (currentSize + incomingSizeBytes) - maxBytes
+	if maxBytes > 0 && (currentSize+totalPending) > maxBytes {
+		cacheBytesToFree = (currentSize + totalPending) - maxBytes
 	}
 
 	// Calculate how much space we need to free based on disk space limit
 	var diskBytesToFree int64
 	freeSpace, spaceErr := GetDiskFreeSpace(cacheDir)
 	if spaceErr == nil && minDiskFree > 0 {
-		requiredFree := uint64(incomingSizeBytes) + uint64(minDiskFree)
+		requiredFree := uint64(totalPending) + uint64(minDiskFree)
 		if freeSpace < requiredFree {
 			diskBytesToFree = int64(requiredFree - freeSpace)
 		}
@@ -1014,21 +1048,22 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 	}
 
 	if bytesToFree <= 0 {
+		r.Lock.Lock()
+		reRun := r.pendingEvict
+		r.pendingEvict = false
+		r.Evicting = false
 		r.Lock.Unlock()
+		if reRun {
+			r.PreEvict(0)
+		}
 		return
 	}
-
-	activeKeys := make(map[string]bool, len(r.Files))
-	for k := range r.Files {
-		activeKeys[k] = true
-	}
-	r.Evicting = true
-	r.Lock.Unlock()
 
 	// Fast pre-flight check outside GlobalRegistry.Lock: count total size of available inactive files
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		r.Lock.Lock()
+		r.pendingEvict = false
 		r.Evicting = false
 		r.Lock.Unlock()
 		return
@@ -1051,20 +1086,24 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 			float64(bytesToFree)/(1024*1024), float64(availableFreeable)/(1024*1024))
 	}
 
-	log.Printf("[Evictor] Fast pre-flight check passed. Spawning background evictor for incoming file (%.2f MB). Cache size: %.2f GB (limit: %.2f GB), Free Disk Space: %.2f GB (min: %.2f GB). Need to free %.2f MB.",
+	log.Printf("[Evictor] Fast pre-flight check passed. Spawning background evictor for incoming file (%.2f MB, active unwritten: %.2f MB). Cache size: %.2f GB (limit: %.2f GB), Free Disk Space: %.2f GB (min: %.2f GB). Need to free %.2f MB.",
 		float64(incomingSizeBytes)/(1024*1024),
+		float64(unwrittenActiveBytes)/(1024*1024),
 		float64(currentSize)/(1024*1024*1024), float64(maxBytes)/(1024*1024*1024),
 		float64(freeSpace)/(1024*1024*1024), float64(minDiskFree)/(1024*1024*1024),
 		float64(bytesToFree)/(1024*1024))
 
 	// Launch file deletions asynchronously in a background thread to prevent blocking HTTP handler/stream start
 	go func() {
-		defer func() {
-			r.Lock.Lock()
-			r.Evicting = false
-			r.Lock.Unlock()
-		}()
 		r.evictInactiveFiles(bytesToFree)
+		r.Lock.Lock()
+		reRun := r.pendingEvict
+		r.pendingEvict = false
+		r.Evicting = false
+		r.Lock.Unlock()
+		if reRun {
+			r.PreEvict(0)
+		}
 	}()
 }
 
