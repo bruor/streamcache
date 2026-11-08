@@ -671,6 +671,10 @@ func runDownloadWorker(
 	defer onExit(w)
 	log.Printf("[Worker-%d] Starting background downloader at offset %d", w.id, w.startOffset)
 
+	state.Lock.Lock()
+	cm := state.ChunkManager
+	state.Lock.Unlock()
+
 	consecutiveFailures := 0
 	backoff := 2 * time.Second
 	currentOffset := w.startOffset
@@ -925,8 +929,8 @@ func runDownloadWorker(
 		}
 
 		// Wait if scratch disk budget is exceeded or disk free space is low (TCP socket backpressure)
-		if state.ChunkManager != nil {
-			if berr := state.ChunkManager.WaitScratchBudget(ctx); berr != nil {
+		if cm != nil {
+			if berr := cm.WaitScratchBudget(ctx); berr != nil {
 				closeConnection()
 				return
 			}
@@ -954,9 +958,9 @@ func runDownloadWorker(
 
 			// Add to RangeSet and wake waiting readers immediately!
 			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
-			if state.ChunkManager != nil {
-				state.ChunkManager.AddInFlightBytes(int64(n))
-				state.ChunkManager.CheckAndTriggerUploads()
+			if cm != nil {
+				cm.AddInFlightBytes(int64(n))
+				cm.CheckAndTriggerUploads()
 			}
 
 			state.Lock.Lock()
@@ -1167,6 +1171,10 @@ func runInlineTailPrefetch(
 	atomic.StoreInt64(&w.currentOffset, tailStartOffset)
 	defer atomic.StoreInt32(&w.isPrefetching, 0)
 
+	state.Lock.Lock()
+	cm := state.ChunkManager
+	state.Lock.Unlock()
+
 	log.Printf("[Worker-%d] MaxUpstreamWorkers=1: Executing inline tail pre-fetch (%d bytes) starting at offset %d", w.id, prefetchLength, tailStartOffset)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", state.URL, nil)
@@ -1216,8 +1224,8 @@ func runInlineTailPrefetch(
 			}
 
 			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
-			if state.ChunkManager != nil {
-				state.ChunkManager.CheckAndTriggerUploads()
+			if cm != nil {
+				cm.CheckAndTriggerUploads()
 			}
 			state.Lock.Lock()
 			for _, ch := range state.Clients {
