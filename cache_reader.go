@@ -163,7 +163,8 @@ func (r *CacheReader) recordRead(off int64, n int) {
 
 	totalRead := atomic.LoadInt64(&r.totalBytesRead)
 	isTailSeek := r.state != nil && r.state.TotalSize > 0 && off >= (r.state.TotalSize-2*1024*1024)
-	if totalRead >= minThreshold || (off >= minThreshold && !isTailSeek) {
+	isWholeFile := r.state != nil && r.state.TotalSize > 0 && totalRead >= r.state.TotalSize
+	if totalRead >= minThreshold || (off >= minThreshold && !isTailSeek) || isWholeFile {
 		if r.state != nil && !r.state.IsDiskMaterialized() {
 			if GlobalRegistry != nil && r.state.TotalSize > 0 {
 				GlobalRegistry.PreEvict(r.state.TotalSize)

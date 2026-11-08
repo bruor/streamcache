@@ -480,6 +480,12 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		"probe_active":           probeActive,
 	}
 
+	if GlobalPrehydrationManager != nil {
+		if capReport := GlobalPrehydrationManager.GetLatestCapacity(); capReport != nil {
+			data["provider_capacity"] = capReport
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(data)
 }

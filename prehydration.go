@@ -39,8 +39,8 @@ type ProviderCapacityReport struct {
 	TotalAvailableStreams  int              `json:"total_available_streams"`
 	TargetAvailableStreams int              `json:"target_available_streams"`
 	LiveClients            int              `json:"live_clients"`
-	LiveStreams            int              `json:"live_streams"`
-	VODStreams             int              `json:"vod_streams"`
+	LiveStreams            *int             `json:"live_streams,omitempty"`
+	VODStreams             *int             `json:"vod_streams,omitempty"`
 	Providers              []ProviderDetail `json:"providers"`
 	Error                  string           `json:"error,omitempty"`
 }
