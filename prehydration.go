@@ -115,8 +115,12 @@ func (pm *PrehydrationManager) GetLatestCapacity() *ProviderCapacityReport {
 }
 
 // AutoDiscoverDispatcharrURL extracts Dispatcharr's base URL from incoming /proxy/vod/... paths.
+// If an explicit DISPATCHARR_URL is already configured, auto-discovery is skipped.
 func (pm *PrehydrationManager) AutoDiscoverDispatcharrURL(targetURL string) {
 	if pm == nil || targetURL == "" {
+		return
+	}
+	if GlobalConfig != nil && strings.TrimSpace(GlobalConfig.GetDispatcharrURL()) != "" {
 		return
 	}
 	u, err := url.Parse(targetURL)
