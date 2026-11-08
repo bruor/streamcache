@@ -50,14 +50,15 @@ type PrehydrationTask struct {
 }
 
 type PrehydrationManager struct {
-	mu                       sync.RWMutex
-	latestCapacity           *ProviderCapacityReport
-	lastPollTime             time.Time
-	discoveredDispatcharrURL string
-	queue                    []*PrehydrationTask
-	activePrehydrations      map[string]bool // Set of canonical cacheFileNames actively running prehydration
-	stopCh                   chan struct{}
-	notifyCh                 chan struct{}
+	mu                                sync.RWMutex
+	latestCapacity                    *ProviderCapacityReport
+	lastPollTime                      time.Time
+	discoveredDispatcharrURL          string
+	queue                             []*PrehydrationTask
+	activePrehydrations               map[string]bool // Set of canonical cacheFileNames actively running prehydration
+	prehydrationsStartedSinceLastPoll int             // Tracks prehydrations started/resumed since the last capacity poll
+	stopCh                            chan struct{}
+	notifyCh                          chan struct{}
 }
 
 var GlobalPrehydrationManager *PrehydrationManager
@@ -179,6 +180,7 @@ func (pm *PrehydrationManager) pollCapacityOnce() {
 	pm.mu.Lock()
 	pm.latestCapacity = &report
 	pm.lastPollTime = time.Now()
+	pm.prehydrationsStartedSinceLastPoll = 0
 	pm.mu.Unlock()
 
 	// Check if active prehydrations need to yield due to live streams taking reserved slots
@@ -209,7 +211,7 @@ func (pm *PrehydrationManager) pollLoop() {
 }
 
 // CanStartPrehydration determines if spare capacity exists to launch a new prehydration worker.
-// Requires available_streams >= PREHYDRATE_CAPACITY_RESERVATION + 1 so that after claiming 1 slot,
+// Requires effective available streams >= PREHYDRATE_CAPACITY_RESERVATION + 1 so that after claiming 1 slot,
 // at least PREHYDRATE_CAPACITY_RESERVATION slots remain free for live viewers.
 func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
 	if GlobalConfig != nil && !GlobalConfig.GetEnableEpisodePrehydration() {
@@ -223,6 +225,7 @@ func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
 
 	pm.mu.RLock()
 	report := pm.latestCapacity
+	startedSincePoll := pm.prehydrationsStartedSinceLastPoll
 	pm.mu.RUnlock()
 
 	// If Stasharr capacity is unavailable or unconfigured, fallback to reactive mode:
@@ -240,8 +243,13 @@ func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
 		available = report.TargetAvailableStreams
 	}
 
-	// Starting threshold: available >= reservation + 1
-	return available >= (reservation + 1)
+	effectiveAvailable := available - startedSincePoll
+	if effectiveAvailable < 0 {
+		effectiveAvailable = 0
+	}
+
+	// Starting threshold: effectiveAvailable >= reservation + 1
+	return effectiveAvailable >= (reservation + 1)
 }
 
 // ShouldYieldPrehydration checks if live streams have encroached on the capacity reservation.
@@ -306,10 +314,16 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 		fs.Lock.Unlock()
 	}
 
+	neededToYield := reservation - available
+	yieldedCount := 0
 	for _, fs := range prehydratingFiles {
+		if yieldedCount >= neededToYield {
+			break
+		}
 		log.Printf("[Prehydration] Provider capacity tight (Available: %d, Reserved: %d). Yielding prehydration: %s",
 			available, reservation, fs.Key)
 		pm.YieldState(fs, "Live stream capacity reservation")
+		yieldedCount++
 	}
 }
 
@@ -339,13 +353,16 @@ func (pm *PrehydrationManager) YieldState(state *FileCacheState, reason string) 
 
 	pm.mu.Lock()
 	delete(pm.activePrehydrations, state.Key)
+	if pm.prehydrationsStartedSinceLastPoll > 0 {
+		pm.prehydrationsStartedSinceLastPoll--
+	}
 	pm.mu.Unlock()
 
 	log.Printf("[Prehydration] File %s transitioned to Yielding (%s). Upstream socket closed; .part blocks preserved.",
 		state.Key, reason)
 
 	if GlobalLogBroker != nil {
-		GlobalLogBroker.BroadcastStateUpdate()
+		go GlobalLogBroker.BroadcastStateUpdate()
 	}
 }
 
@@ -366,6 +383,7 @@ func (pm *PrehydrationManager) ResumeState(state *FileCacheState) {
 
 	pm.mu.Lock()
 	pm.activePrehydrations[state.Key] = true
+	pm.prehydrationsStartedSinceLastPoll++
 	pm.mu.Unlock()
 
 	log.Printf("[Prehydration] Resuming yielded file: %s at offset %d", state.Key, state.RangeSet.TotalBytes())
@@ -396,6 +414,9 @@ func (pm *PrehydrationManager) OnHydrationCompleted(state *FileCacheState) {
 
 	pm.mu.Lock()
 	delete(pm.activePrehydrations, key)
+	if pm.prehydrationsStartedSinceLastPoll > 0 {
+		pm.prehydrationsStartedSinceLastPoll--
+	}
 	pm.mu.Unlock()
 
 	if len(next) > 0 {
@@ -427,6 +448,7 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 	} else {
 		pm.mu.Lock()
 		pm.activePrehydrations[key] = true
+		pm.prehydrationsStartedSinceLastPoll++
 		pm.mu.Unlock()
 		state.SetUpstreamStatus("Prehydrating")
 	}
@@ -512,32 +534,34 @@ func (pm *PrehydrationManager) processNextTask() {
 	}
 
 	for _, fs := range yieldedCandidates {
-		if pm.CanStartPrehydration(fs.URL) {
-			pm.ResumeState(fs)
-			return
+		if !pm.CanStartPrehydration(fs.URL) {
+			break
 		}
+		pm.ResumeState(fs)
 	}
 
-	// 2. Pop next queued task if capacity permits
-	pm.mu.Lock()
-	if len(pm.queue) == 0 {
+	// 2. Pop next queued tasks as long as capacity permits
+	for {
+		pm.mu.Lock()
+		if len(pm.queue) == 0 {
+			pm.mu.Unlock()
+			break
+		}
+		task := pm.queue[0]
 		pm.mu.Unlock()
-		return
-	}
-	task := pm.queue[0]
-	pm.mu.Unlock()
 
-	if !pm.CanStartPrehydration(task.TargetURL) {
-		return
-	}
+		if !pm.CanStartPrehydration(task.TargetURL) {
+			break
+		}
 
-	pm.mu.Lock()
-	if len(pm.queue) > 0 && pm.queue[0] == task {
-		pm.queue = pm.queue[1:]
-	}
-	pm.mu.Unlock()
+		pm.mu.Lock()
+		if len(pm.queue) > 0 && pm.queue[0] == task {
+			pm.queue = pm.queue[1:]
+		}
+		pm.mu.Unlock()
 
-	pm.executePrehydration(task)
+		pm.executePrehydration(task)
+	}
 }
 
 func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
@@ -569,8 +593,13 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 	}
 	GlobalRegistry.Lock.Unlock()
 
-	// Probe upstream for headers
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Tentatively record prehydration slot to protect provider capacity during probe
+	pm.mu.Lock()
+	pm.prehydrationsStartedSinceLastPoll++
+	pm.mu.Unlock()
+
+	// Probe upstream for headers (with 5s timeout to avoid tying up workers if provider is at capacity)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	header := make(http.Header)
@@ -579,6 +608,12 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 	log.Printf("[Prehydration] Probing upstream for upcoming episode: %s", targetURL)
 	totalSize, contentType, etag, lastMod, _, err := probeUpstream(ctx, targetURL, header, nil)
 	if err != nil {
+		pm.mu.Lock()
+		if pm.prehydrationsStartedSinceLastPoll > 0 {
+			pm.prehydrationsStartedSinceLastPoll--
+		}
+		pm.mu.Unlock()
+
 		log.Printf("[Prehydration] Probe error for %s: %v. Placing into Yielding state without blocking live clients.", targetURL, err)
 		// Do NOT record FailedProbe tombstone on prehydration failure!
 		// Instead create state in Yielding mode so live clients can still stream or resume.
@@ -622,6 +657,6 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 	pm.activePrehydrations[cacheFileName] = true
 	pm.mu.Unlock()
 
-	log.Printf("[Prehydration] Starting background prehydration worker for %s (1 sequential worker, no TailPrefetch)", cacheFileName)
+	log.Printf("[Prehydration] Starting background prehydration worker for %s (dynamic capacity pacing, no TailPrefetch)", cacheFileName)
 	StartCoordinator(state, header)
 }
