@@ -2172,12 +2172,12 @@
 
                     if (data.provider_capacity && data.provider_capacity.status === 'ok') {
                         const cap = data.provider_capacity;
-                        if (cap.vod_streams !== undefined && cap.vod_streams !== null && cap.vod_streams > vodUpstream) {
-                            vodUpstream = cap.vod_streams;
+                        if (cap.vod_streams !== undefined && cap.vod_streams !== null) {
+                            vodUpstream = Math.max(localVodUpstream, cap.vod_streams);
                         }
-                        const liveUpstream = (cap.live_streams !== undefined && cap.live_streams !== null && cap.live_streams > 0)
+                        const liveUpstream = (cap.live_streams !== undefined && cap.live_streams !== null)
                             ? cap.live_streams
-                            : Math.max(0, (cap.total_active_streams || 0) - vodUpstream);
+                            : Math.max(0, (cap.total_active_streams || 0) - (cap.vod_streams || 0));
                         const liveClients = (cap.live_clients !== undefined && cap.live_clients !== null) ? cap.live_clients : 0;
 
                         liveUpstreamText = String(liveUpstream);
