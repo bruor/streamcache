@@ -123,15 +123,21 @@ func (r *CacheReader) upgradeFromPrehydration() {
 	}
 	r.state.Lock.Lock()
 	wasPrehydrating := r.state.IsPrehydrating || r.state.IsYielding
-	if !wasPrehydrating {
+	wasProbe := r.state.IsProbe
+	if !wasPrehydrating && !wasProbe {
 		r.state.Lock.Unlock()
 		return
 	}
 	r.state.IsPrehydrating = false
 	r.state.IsYielding = false
+	r.state.IsProbe = false
 	key := r.state.Key
 	isWriterActive := r.state.WriterActive
 	r.state.Lock.Unlock()
+
+	if wasProbe && GlobalRegistry != nil {
+		GlobalRegistry.UnregisterProbeBuffer(key)
+	}
 
 	log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", key)
 	if GlobalPrehydrationManager != nil {
@@ -208,7 +214,8 @@ func (r *CacheReader) Close() error {
 	totalRead := atomic.LoadInt64(&r.totalBytesRead)
 	maxOffset := atomic.LoadInt64(&r.maxReadOffset)
 	isPrehydrating := r.state.IsPrehydrating || r.state.IsYielding
-	isProbe := !isCompleted && !r.state.DiskMaterialized && !isPrehydrating && totalRead < minThreshold && maxOffset < minThreshold
+	isDiskMat := r.state.DiskMaterialized || FileExists(r.state.PartPath)
+	isProbe := !isCompleted && !isDiskMat && totalRead < minThreshold && maxOffset < minThreshold
 
 	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
 	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
@@ -224,15 +231,16 @@ func (r *CacheReader) Close() error {
 		cancelFunc = r.state.Cancel
 		r.state.Cancel = nil
 		r.state.WriterActive = false
-		r.state.NextURLs = nil
+		r.state.IsProbe = true
+		r.state.IsYielding = true
+		r.state.IsPrehydrating = true
+		r.state.UpstreamStatus = "Probed (Idle)"
+		atomic.StoreInt64(&r.state.LastProgressTimeNano, time.Now().UnixNano())
+
 		fileToClose = r.state.File
 		r.state.File = nil
 		pipelineToClose = r.state.Pipeline
 		r.state.Pipeline = nil
-		if r.state.LiveBuffer != nil {
-			r.state.LiveBuffer.Clear()
-			r.state.LiveBuffer = nil
-		}
 	} else if remainingClients == 0 && !r.state.WriterActive && !shouldFinalize && shouldCleanUpIncomplete {
 		fileToClose = r.state.File
 		r.state.File = nil
@@ -244,7 +252,7 @@ func (r *CacheReader) Close() error {
 	GlobalRegistry.UnregisterConnection(r.clientID)
 
 	if isProbe && remainingClients == 0 {
-		log.Printf("[Reader] Client %s closed probe (%d bytes read, below %d threshold). Aborted without disk write or downshift for %s", r.clientID, totalRead, minThreshold, r.state.Key)
+		log.Printf("[Reader] Client %s closed probe (%d bytes read). Retaining in-memory probe buffer for %s (status: Probed (Idle))", r.clientID, totalRead, r.state.Key)
 		if cancelFunc != nil {
 			cancelFunc()
 		}
@@ -254,21 +262,12 @@ func (r *CacheReader) Close() error {
 		if fileToClose != nil {
 			_ = fileToClose.Close()
 		}
-		_ = os.Remove(r.state.PartPath)
-		_ = os.Remove(r.state.MetaPath)
-
-		accounted := atomic.SwapInt64(&r.state.TotalBytesDownloaded, 0)
-		if accounted > 0 && GlobalRegistry != nil {
-			GlobalRegistry.UpdateSize(-accounted)
+		if GlobalRegistry != nil {
+			GlobalRegistry.RegisterProbeBuffer(r.state.Key)
 		}
-
-		GlobalRegistry.Lock.Lock()
-		if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
-			delete(GlobalRegistry.Files, r.state.Key)
+		if GlobalLogBroker != nil {
+			go GlobalLogBroker.BroadcastStateUpdate()
 		}
-		GlobalRegistry.Lock.Unlock()
-
-		debug.FreeOSMemory()
 		return nil
 	}
 
@@ -432,14 +431,20 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		if !r.state.WriterActive {
 			wasYielding := r.state.IsYielding
 			wasPrehydrating := r.state.IsPrehydrating
-			if wasYielding || wasPrehydrating {
+			wasProbe := r.state.IsProbe
+			if wasYielding || wasPrehydrating || wasProbe {
 				r.state.IsYielding = false
 				r.state.IsPrehydrating = false
+				r.state.IsProbe = false
 			}
 			key := r.state.Key
 			r.state.Lock.Unlock()
 
-			if wasYielding || wasPrehydrating {
+			if wasProbe && GlobalRegistry != nil {
+				GlobalRegistry.UnregisterProbeBuffer(key)
+			}
+
+			if wasYielding || wasPrehydrating || wasProbe {
 				log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", key)
 				if GlobalPrehydrationManager != nil {
 					GlobalPrehydrationManager.OnPriorityUpgrade(key)

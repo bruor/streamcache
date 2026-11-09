@@ -103,6 +103,7 @@ type FileCacheState struct {
 	Pipeline             StorageSink
 	IsPrehydrating       bool
 	IsYielding           bool
+	IsProbe              bool
 	YieldCooldownUntil   time.Time
 	YieldCount           int
 	LastYieldTime        time.Time
@@ -211,7 +212,9 @@ func (s *FileCacheState) SetUpstreamStatus(status string) {
 		return
 	}
 
-	if s.IsYielding && status != "Committing" && status != "Completed" && status != "Cancelled" {
+	if s.IsProbe && len(s.Clients) == 0 {
+		targetStatus = "Probed (Idle)"
+	} else if s.IsYielding && status != "Committing" && status != "Completed" && status != "Cancelled" {
 		targetStatus = "Yielding"
 	} else if s.IsPrehydrating && targetStatus == "Downloading" && len(s.Clients) == 0 {
 		targetStatus = "Prehydrating"
@@ -344,6 +347,7 @@ type CacheRegistry struct {
 	Connections      map[string]*ClientConnection
 	Sessions         map[string]*ClientSession
 	FailedProbes     map[string]time.Time
+	probeLRU         []string
 	TotalCacheSize   int64
 	MaxObservedSpeed int64
 	Evicting         bool
@@ -401,6 +405,7 @@ func InitRegistry() {
 		Connections:  make(map[string]*ClientConnection),
 		Sessions:     make(map[string]*ClientSession),
 		FailedProbes: make(map[string]time.Time),
+		probeLRU:     make([]string, 0, 128),
 	}
 
 	GlobalRegistry.LoadExistingCache()
@@ -411,6 +416,79 @@ func InitRegistry() {
 	go startDiskFreeMonitor()
 
 	go GlobalRegistry.startSpeedMonitor()
+}
+
+func (r *CacheRegistry) RegisterProbeBuffer(key string) {
+	if r == nil || key == "" {
+		return
+	}
+	maxProbes := 128
+	if GlobalConfig != nil {
+		maxProbes = GlobalConfig.GetMaxProbeBuffers()
+	}
+
+	r.Lock.Lock()
+	for i, k := range r.probeLRU {
+		if k == key {
+			r.probeLRU = append(r.probeLRU[:i], r.probeLRU[i+1:]...)
+			break
+		}
+	}
+	r.probeLRU = append(r.probeLRU, key)
+
+	var toEvict []*FileCacheState
+	var evictKeys []string
+
+	for len(r.probeLRU) > maxProbes {
+		oldestKey := r.probeLRU[0]
+		r.probeLRU = r.probeLRU[1:]
+		if state, exists := r.Files[oldestKey]; exists && state != nil {
+			delete(r.Files, oldestKey)
+			toEvict = append(toEvict, state)
+			evictKeys = append(evictKeys, oldestKey)
+		}
+	}
+	r.Lock.Unlock()
+
+	for i, state := range toEvict {
+		state.Lock.Lock()
+		state.NextURLs = nil
+		cancel := state.Cancel
+		state.Cancel = nil
+		state.WriterActive = false
+		if state.LiveBuffer != nil {
+			state.LiveBuffer.Clear()
+			state.LiveBuffer = nil
+		}
+		partPath := state.PartPath
+		metaPath := state.MetaPath
+		state.Lock.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+		_ = os.Remove(partPath)
+		_ = os.Remove(metaPath)
+		log.Printf("[Probe] Evicted oldest probe buffer %s (capacity %d exceeded)", evictKeys[i], maxProbes)
+	}
+
+	if len(toEvict) > 0 && GlobalLogBroker != nil {
+		go GlobalLogBroker.BroadcastStateUpdate()
+	}
+}
+
+func (r *CacheRegistry) UnregisterProbeBuffer(key string) {
+	if r == nil || key == "" {
+		return
+	}
+	r.Lock.Lock()
+	defer r.Lock.Unlock()
+	for i, k := range r.probeLRU {
+		if k == key {
+			r.probeLRU = append(r.probeLRU[:i], r.probeLRU[i+1:]...)
+			break
+		}
+	}
 }
 
 func (r *CacheRegistry) HasActiveActivity() bool {

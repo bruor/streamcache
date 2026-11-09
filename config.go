@@ -38,6 +38,7 @@ type Config struct {
 	EvictYieldedParts             bool
 	EnableEpisodePrehydration     bool
 	MinReadThresholdBytes         int64
+	MaxProbeBuffers               int
 }
 
 func (c *Config) Lock() {
@@ -412,6 +413,27 @@ func (c *Config) SetMinReadThresholdBytes(val int64) {
 	c.MinReadThresholdBytes = val
 }
 
+func (c *Config) GetMaxProbeBuffers() int {
+	if c == nil {
+		return 128
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.MaxProbeBuffers <= 0 {
+		return 128
+	}
+	return c.MaxProbeBuffers
+}
+
+func (c *Config) SetMaxProbeBuffers(val int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.MaxProbeBuffers = val
+}
+
 var GlobalConfig *Config
 
 func parseConfigFromEnv() *Config {
@@ -442,6 +464,7 @@ func parseConfigFromEnv() *Config {
 		EvictYieldedParts:             getEnvBool("EVICT_YIELDED_PARTS", false),
 		EnableEpisodePrehydration:     getEnvBool("ENABLE_EPISODE_PREHYDRATION", true),
 		MinReadThresholdBytes:         getEnvSize("MIN_READ_THRESHOLD_BYTES", 5*1024*1024), // 5MB
+		MaxProbeBuffers:               getEnvInt("MAX_PROBE_BUFFERS", 128),
 	}
 
 	// Format port if missing colon
@@ -466,7 +489,7 @@ func parseConfigFromEnv() *Config {
 func LoadConfig() {
 	cfg := parseConfigFromEnv()
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, DispatcharrURL=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, DispatcharrURL=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.GetDispatcharrURL(),
@@ -482,6 +505,7 @@ func LoadConfig() {
 		cfg.GetUpstreamUserAgent(),
 		cfg.GetUpstreamUserAgentMode(),
 		cfg.GetMinReadThresholdBytes()/(1024*1024),
+		cfg.GetMaxProbeBuffers(),
 	)
 }
 

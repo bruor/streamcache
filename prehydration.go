@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -458,6 +459,61 @@ func (pm *PrehydrationManager) checkZeroProgressSuspension() {
 
 	for _, fs := range files {
 		fs.Lock.Lock()
+		if fs.IsProbe {
+			if len(fs.Clients) > 0 {
+				fs.Lock.Unlock()
+				continue
+			}
+			lastProg := atomic.LoadInt64(&fs.LastProgressTimeNano)
+			if lastProg == 0 {
+				atomic.StoreInt64(&fs.LastProgressTimeNano, nowNano)
+				fs.Lock.Unlock()
+				continue
+			}
+			stallDuration := time.Duration(nowNano - lastProg)
+			if stallDuration < timeout {
+				fs.Lock.Unlock()
+				continue
+			}
+
+			// Probe buffer expired after 15m without playback!
+			log.Printf("[Probe] Probe buffer %s made ZERO progress for %s (>= %s). Evicting probe and cancelling chain.",
+				fs.Key, stallDuration.Round(time.Second), timeout)
+
+			fs.NextURLs = nil
+			key := fs.Key
+			cancel := fs.Cancel
+			fs.Cancel = nil
+			fs.WriterActive = false
+			if fs.LiveBuffer != nil {
+				fs.LiveBuffer.Clear()
+				fs.LiveBuffer = nil
+			}
+			partPath := fs.PartPath
+			metaPath := fs.MetaPath
+			fs.Lock.Unlock()
+
+			if cancel != nil {
+				cancel()
+			}
+			_ = os.Remove(partPath)
+			_ = os.Remove(metaPath)
+
+			if GlobalRegistry != nil {
+				GlobalRegistry.UnregisterProbeBuffer(key)
+				GlobalRegistry.Lock.Lock()
+				if existingState, exists := GlobalRegistry.Files[key]; exists && existingState == fs {
+					delete(GlobalRegistry.Files, key)
+				}
+				GlobalRegistry.Lock.Unlock()
+			}
+
+			if GlobalLogBroker != nil {
+				go GlobalLogBroker.BroadcastStateUpdate()
+			}
+			continue
+		}
+
 		if !fs.IsPrehydrating || len(fs.Clients) > 0 || fs.IsYielding || !fs.WriterActive {
 			fs.Lock.Unlock()
 			continue
@@ -794,7 +850,7 @@ func (pm *PrehydrationManager) processNextTask() {
 	var yieldedCandidates []*FileCacheState
 	for _, fs := range files {
 		fs.Lock.Lock()
-		if fs.IsYielding && len(fs.Clients) == 0 && time.Now().After(fs.YieldCooldownUntil) {
+		if !fs.IsProbe && fs.IsYielding && len(fs.Clients) == 0 && time.Now().After(fs.YieldCooldownUntil) {
 			yieldedCandidates = append(yieldedCandidates, fs)
 		}
 		fs.Lock.Unlock()

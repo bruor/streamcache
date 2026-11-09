@@ -122,6 +122,7 @@ func CancelCoordinator(state *FileCacheState) {
 	state.UpstreamStatus = "Cancelled"
 	state.IsPrehydrating = false
 	state.IsYielding = false
+	state.IsProbe = false
 	state.coordGen++
 	clientsCount := len(state.Clients)
 	fileToClose := state.File
@@ -137,6 +138,10 @@ func CancelCoordinator(state *FileCacheState) {
 		state.LiveBuffer = nil
 	}
 	state.Lock.Unlock()
+
+	if GlobalRegistry != nil {
+		GlobalRegistry.UnregisterProbeBuffer(key)
+	}
 
 	if GlobalPrehydrationManager != nil {
 		GlobalPrehydrationManager.OnCancelled(key)

@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -488,14 +490,25 @@ func TestGlobalRegistryAndFileStateNoLockInversionDeadlock(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	oldConfig := GlobalConfig
-	GlobalConfig = &Config{
-		CacheDir:                  tmpDir,
-		TmpDir:                    tmpDir,
-		MaxUpstreamWorkers:        2,
-		EnableEpisodePrehydration: true,
-	}
-	defer func() { GlobalConfig = oldConfig }()
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	oldWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldPrehydrate := GlobalConfig.EnableEpisodePrehydration
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	GlobalConfig.MaxUpstreamWorkers = 2
+	GlobalConfig.EnableEpisodePrehydration = true
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.MaxUpstreamWorkers = oldWorkers
+		GlobalConfig.EnableEpisodePrehydration = oldPrehydrate
+		GlobalConfig.Unlock()
+	}()
 
 	pm := &PrehydrationManager{
 		activePrehydrations: make(map[string]bool),
@@ -623,14 +636,25 @@ func TestHeadRequestSkipsPrehydrationAndHydration(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	oldConfig := GlobalConfig
-	GlobalConfig = &Config{
-		CacheDir:                  tmpDir,
-		TmpDir:                    tmpDir,
-		MaxUpstreamWorkers:        2,
-		EnableEpisodePrehydration: true,
-	}
-	defer func() { GlobalConfig = oldConfig }()
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	oldWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldPrehydrate := GlobalConfig.EnableEpisodePrehydration
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	GlobalConfig.MaxUpstreamWorkers = 2
+	GlobalConfig.EnableEpisodePrehydration = true
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.MaxUpstreamWorkers = oldWorkers
+		GlobalConfig.EnableEpisodePrehydration = oldPrehydrate
+		GlobalConfig.Unlock()
+	}()
 
 	oldPM := GlobalPrehydrationManager
 	defer func() { GlobalPrehydrationManager = oldPM }()
@@ -850,13 +874,18 @@ func TestDeferredPartFileCreationAndProbeBypass(t *testing.T) {
 	}
 	mockPM.mu.Unlock()
 
-	// Verify state removed from GlobalRegistry
+	// Verify state retained in GlobalRegistry as Probed (Idle) in-memory buffer
 	GlobalRegistry.Lock.RLock()
-	_, exists := GlobalRegistry.Files[cacheFileName]
+	probeState, exists := GlobalRegistry.Files[cacheFileName]
 	GlobalRegistry.Lock.RUnlock()
-	if exists {
-		t.Fatalf("Expected FileCacheState to be deleted from registry on probe exit")
+	if !exists || probeState == nil {
+		t.Fatalf("Expected FileCacheState to be retained in registry as in-memory probe buffer on probe exit")
 	}
+	probeState.Lock.Lock()
+	if !probeState.IsProbe || probeState.UpstreamStatus != "Probed (Idle)" {
+		t.Fatalf("Expected probe state to have IsProbe=true and status 'Probed (Idle)', got IsProbe=%v, status=%s", probeState.IsProbe, probeState.UpstreamStatus)
+	}
+	probeState.Lock.Unlock()
 
 	// Unblock upstream server for Phase 2 (real playback)
 	blockMu.Lock()
@@ -2210,6 +2239,391 @@ func TestPlayerPlaybackAdoptsChainAndPrunesPredecessor(t *testing.T) {
 	fsEp1.Lock.Unlock()
 	if len(ep1Chain) != 0 {
 		t.Fatalf("Expected ep1 NextURLs to be cleared, got %v", ep1Chain)
+	}
+}
+
+func TestProbeBufferHoldAndGraduation(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "probe_hold_test_*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	GlobalConfig.Lock()
+	oldCacheDir := GlobalConfig.CacheDir
+	oldTmpDir := GlobalConfig.TmpDir
+	oldWorkers := GlobalConfig.MaxUpstreamWorkers
+	oldThreshold := GlobalConfig.MinReadThresholdBytes
+	GlobalConfig.CacheDir = tmpDir
+	GlobalConfig.TmpDir = tmpDir
+	GlobalConfig.MaxUpstreamWorkers = 1
+	GlobalConfig.MinReadThresholdBytes = 256 * 1024
+	GlobalConfig.Unlock()
+
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.CacheDir = oldCacheDir
+		GlobalConfig.TmpDir = oldTmpDir
+		GlobalConfig.MaxUpstreamWorkers = oldWorkers
+		GlobalConfig.MinReadThresholdBytes = oldThreshold
+		GlobalConfig.Unlock()
+	}()
+
+	mockPM := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 100),
+	}
+	oldPM := GlobalPrehydrationManager
+	GlobalPrehydrationManager = mockPM
+	defer func() { GlobalPrehydrationManager = oldPM }()
+
+	payload := make([]byte, 10*1024*1024)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	var blockMu sync.Mutex
+	blockUpstream := true
+	unblockCh := make(chan struct{})
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		end = int64(len(payload)) - 1
+		if rangeHdr != "" {
+			_, _ = fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+			if end >= int64(len(payload)) {
+				end = int64(len(payload)) - 1
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+			w.WriteHeader(http.StatusPartialContent)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+
+		blockMu.Lock()
+		shouldBlock := blockUpstream
+		blockMu.Unlock()
+
+		if shouldBlock {
+			chunkSize := int64(64 * 1024)
+			if start+chunkSize > end {
+				chunkSize = end - start + 1
+			}
+			_, _ = w.Write(payload[start : start+chunkSize])
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			select {
+			case <-unblockCh:
+			case <-r.Context().Done():
+				return
+			}
+			start += chunkSize
+		}
+
+		if start <= end {
+			_, _ = w.Write(payload[start : end+1])
+		}
+	}))
+	defer upstreamServer.Close()
+
+	streamURL := upstreamServer.URL + "/movie.mp4"
+	key, ext := getCacheKeyAndExt(streamURL)
+	cacheFileName := key + ext
+	partPath := filepath.Join(tmpDir, cacheFileName+".part")
+
+	// Phase 1: Client simulates ffprobe metadata check (reads 64KB < 256KB threshold, then disconnects)
+	req1 := httptest.NewRequest("GET", fmt.Sprintf("/stream?url=%s&next_url=%s", streamURL, upstreamServer.URL+"/movie_ep2.mp4"), nil)
+	rec1 := httptest.NewRecorder()
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	req1 = req1.WithContext(ctx1)
+
+	doneCh1 := make(chan struct{})
+	go func() {
+		defer close(doneCh1)
+		handleMediaStream(rec1, req1)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	GlobalRegistry.Lock.RLock()
+	state1 := GlobalRegistry.Files[cacheFileName]
+	GlobalRegistry.Lock.RUnlock()
+
+	if state1 != nil {
+		reader1 := NewCacheReader(ctx1, state1, req1)
+		buf1 := make([]byte, 64*1024)
+		_, _ = reader1.ReadAt(buf1, 0)
+		_ = reader1.Close()
+	}
+
+	cancel1()
+	<-doneCh1
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify Probe Retention:
+	// 1. Part file NOT materialized on disk
+	if FileExists(partPath) {
+		t.Fatalf("Expected part file %s NOT to be materialized on disk during probe", partPath)
+	}
+
+	// 2. State remains in GlobalRegistry as Probed (Idle)
+	GlobalRegistry.Lock.RLock()
+	probeState, exists := GlobalRegistry.Files[cacheFileName]
+	GlobalRegistry.Lock.RUnlock()
+	if !exists || probeState == nil {
+		t.Fatalf("Expected FileCacheState to be retained in GlobalRegistry on probe exit")
+	}
+
+	probeState.Lock.Lock()
+	if !probeState.IsProbe {
+		t.Fatalf("Expected probeState.IsProbe = true, got false")
+	}
+	if probeState.UpstreamStatus != "Probed (Idle)" {
+		t.Fatalf("Expected status 'Probed (Idle)', got %s", probeState.UpstreamStatus)
+	}
+	if probeState.WriterActive {
+		t.Fatalf("Expected WriterActive = false (0 active workers)")
+	}
+	if probeState.LiveBuffer == nil || probeState.LiveBuffer.GetCurBytes() == 0 {
+		t.Fatalf("Expected LiveBuffer to retain probed chunks in RAM")
+	}
+	if len(probeState.NextURLs) == 0 {
+		t.Fatalf("Expected NextURLs to be retained on probeState")
+	}
+	probeState.Lock.Unlock()
+
+	// Unblock upstream server for Phase 2 (real playback)
+	blockMu.Lock()
+	blockUpstream = false
+	blockMu.Unlock()
+	close(unblockCh)
+
+	// Phase 2: Client starts real playback (ffmpeg connects to stream)
+	req2 := httptest.NewRequest("GET", fmt.Sprintf("/stream?url=%s&next_url=%s", streamURL, upstreamServer.URL+"/movie_ep2.mp4"), nil)
+	rec2 := httptest.NewRecorder()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	req2 = req2.WithContext(ctx2)
+
+	doneCh2 := make(chan struct{})
+	go func() {
+		defer close(doneCh2)
+		handleMediaStream(rec2, req2)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Read past 256KB threshold to trigger graduation and disk materialization
+	if probeState != nil {
+		reader2 := NewCacheReader(ctx2, probeState, req2)
+		buf2 := make([]byte, 512*1024)
+		n, err := reader2.ReadAt(buf2, 0)
+		if err != nil && err != io.EOF {
+			t.Fatalf("Reader ReadAt error: %v", err)
+		}
+		if n < 512*1024 {
+			t.Fatalf("Expected to read 512KB, read %d", n)
+		}
+		_ = reader2.Close()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify Graduation:
+	probeState.Lock.Lock()
+	if probeState.IsProbe {
+		t.Fatalf("Expected probeState.IsProbe to be false after graduation, got true")
+	}
+	probeState.Lock.Unlock()
+
+	cachedFile := filepath.Join(tmpDir, cacheFileName)
+	if !FileExists(partPath) && !FileExists(cachedFile) {
+		t.Fatalf("Expected part file %s or cached file %s to be materialized after graduation", partPath, cachedFile)
+	}
+
+	cancel2()
+	<-doneCh2
+	CancelCoordinator(probeState)
+}
+
+func TestProbeBufferLRUEviction(t *testing.T) {
+	GlobalConfig.Lock()
+	oldMax := GlobalConfig.MaxProbeBuffers
+	GlobalConfig.MaxProbeBuffers = 3
+	GlobalConfig.Unlock()
+	defer func() {
+		GlobalConfig.Lock()
+		GlobalConfig.MaxProbeBuffers = oldMax
+		GlobalConfig.Unlock()
+	}()
+
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	oldLRU := GlobalRegistry.probeLRU
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	GlobalRegistry.probeLRU = make([]string, 0, 10)
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.probeLRU = oldLRU
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// Register 4 probe states
+	for i := 1; i <= 4; i++ {
+		key := fmt.Sprintf("probe_%d.mkv", i)
+		fs := NewFileCacheState(key, "http://example.com/"+key, "/tmp/"+key, "/tmp/"+key+".part", "/tmp/"+key+".json", "video/mp4", "", "", 1000)
+		fs.IsProbe = true
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files[key] = fs
+		GlobalRegistry.Lock.Unlock()
+		GlobalRegistry.RegisterProbeBuffer(key)
+	}
+
+	GlobalRegistry.Lock.RLock()
+	defer GlobalRegistry.Lock.RUnlock()
+
+	// With capacity 3, probe_1.mkv must have been evicted by probe_4.mkv
+	if _, exists := GlobalRegistry.Files["probe_1.mkv"]; exists {
+		t.Fatalf("Expected probe_1.mkv to be evicted by LRU capacity limit of 3")
+	}
+	if _, exists := GlobalRegistry.Files["probe_2.mkv"]; !exists {
+		t.Fatalf("Expected probe_2.mkv to exist in registry")
+	}
+	if _, exists := GlobalRegistry.Files["probe_3.mkv"]; !exists {
+		t.Fatalf("Expected probe_3.mkv to exist in registry")
+	}
+	if _, exists := GlobalRegistry.Files["probe_4.mkv"]; !exists {
+		t.Fatalf("Expected probe_4.mkv to exist in registry")
+	}
+	if len(GlobalRegistry.probeLRU) != 3 {
+		t.Fatalf("Expected probeLRU length 3, got %d", len(GlobalRegistry.probeLRU))
+	}
+}
+
+func TestProbeBufferExpirationWithoutGraduationCancelsChain(t *testing.T) {
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		queue:               make([]*PrehydrationTask, 0),
+	}
+
+	key := "expired_probe.mkv"
+	fs := NewFileCacheState(key, "http://upstream/ep1.mp4", "/tmp/ep1.mp4", "/tmp/ep1.part", "/tmp/ep1.json", "video/mp4", "", "", 1000)
+	fs.IsProbe = true
+	fs.IsYielding = true
+	fs.IsPrehydrating = true
+	fs.WriterActive = false
+	fs.NextURLs = []string{"http://upstream/ep2.mp4"}
+	// Stalled for 16 minutes (> 15m timeout)
+	fs.LastProgressTimeNano = time.Now().Add(-16 * time.Minute).UnixNano()
+
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	GlobalRegistry.Files[key] = fs
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	GlobalRegistry.RegisterProbeBuffer(key)
+
+	// Run zero-progress suspension check
+	pm.checkZeroProgressSuspension()
+
+	// Verify:
+	// 1. NextURLs was cleared (chain cancelled)
+	fs.Lock.Lock()
+	urls := fs.NextURLs
+	fs.Lock.Unlock()
+	if len(urls) != 0 {
+		t.Fatalf("Expected NextURLs to be cleared, got %v", urls)
+	}
+
+	// 2. Ep2 was NOT enqueued in prehydration queue
+	pm.mu.Lock()
+	qLen := len(pm.queue)
+	pm.mu.Unlock()
+	if qLen != 0 {
+		t.Fatalf("Expected prehydration queue to remain empty (no baton handoff for probes), got %d items", qLen)
+	}
+
+	// 3. File removed from GlobalRegistry.Files and probeLRU
+	GlobalRegistry.Lock.RLock()
+	_, inFiles := GlobalRegistry.Files[key]
+	inLRU := false
+	for _, k := range GlobalRegistry.probeLRU {
+		if k == key {
+			inLRU = true
+			break
+		}
+	}
+	GlobalRegistry.Lock.RUnlock()
+
+	if inFiles {
+		t.Fatalf("Expected expired probe to be removed from GlobalRegistry.Files")
+	}
+	if inLRU {
+		t.Fatalf("Expected expired probe to be removed from GlobalRegistry.probeLRU")
+	}
+}
+
+func TestDashboardStatePayloadIncludesProbeBuffers(t *testing.T) {
+	key := "probe_dash.mkv"
+	fs := NewFileCacheState(key, "http://upstream/dash.mp4", "/tmp/dash.mp4", "/tmp/dash.part", "/tmp/dash.json", "video/mp4", "", "", 5000000)
+	fs.IsProbe = true
+	fs.UpstreamStatus = "Probed (Idle)"
+
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	GlobalRegistry.Files[key] = fs
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	payload, err := buildStatePayload()
+	if err != nil {
+		t.Fatalf("buildStatePayload failed: %v", err)
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	probesRaw, ok := data["probe_buffers"]
+	if !ok {
+		t.Fatalf("Expected probe_buffers in dashboard payload")
+	}
+	probesList, ok := probesRaw.([]interface{})
+	if !ok || len(probesList) != 1 {
+		t.Fatalf("Expected 1 probe buffer in payload, got %d", len(probesList))
+	}
+
+	probeMap := probesList[0].(map[string]interface{})
+	if probeMap["key"] != key {
+		t.Fatalf("Expected probe key %s, got %v", key, probeMap["key"])
+	}
+	if probeMap["upstream_status"] != "Probed (Idle)" {
+		t.Fatalf("Expected upstream_status 'Probed (Idle)', got %v", probeMap["upstream_status"])
 	}
 }
 
