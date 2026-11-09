@@ -256,6 +256,14 @@ func buildStatePayload() ([]byte, error) {
 				IdleSeconds:    idleSec,
 				NextURLs:       append([]string(nil), fileState.NextURLs...),
 			})
+			fileActiveConns := 0
+			for _, conn := range fileState.RecentConnections {
+				if conn.Closed.IsZero() {
+					fileActiveConns++
+				}
+			}
+			activeVODUpstream += fileActiveConns
+			activeVODProbes += fileActiveConns
 			fileState.Lock.Unlock()
 			continue
 		}

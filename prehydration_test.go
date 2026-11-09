@@ -2627,6 +2627,134 @@ func TestDashboardStatePayloadIncludesProbeBuffers(t *testing.T) {
 	}
 }
 
+func TestDashboardPayloadUpstreamAndCapacityAccounting(t *testing.T) {
+	if GlobalRegistry == nil {
+		GlobalRegistry = &CacheRegistry{
+			Files: make(map[string]*FileCacheState),
+		}
+	}
+
+	key1 := "test-cached-media"
+	fs1 := &FileCacheState{
+		Key:               key1,
+		URL:               "http://example.com/movie1.mp4",
+		TotalSize:         1000000,
+		RangeSet:          NewRangeSet(),
+		RecentConnections: make(map[string]*ConnectionInfo),
+		DiskMaterialized:  true,
+	}
+	// Closed connection (cached / idle)
+	fs1.RecentConnections["w1"] = &ConnectionInfo{
+		Closed: time.Now().Add(-5 * time.Second),
+	}
+
+	key2 := "test-downloading-media"
+	fs2 := &FileCacheState{
+		Key:               key2,
+		URL:               "http://example.com/movie2.mp4",
+		TotalSize:         2000000,
+		RangeSet:          NewRangeSet(),
+		RecentConnections: make(map[string]*ConnectionInfo),
+		DiskMaterialized:  true,
+		WriterActive:      true,
+	}
+	// Active open worker connection
+	fs2.RecentConnections["w2"] = &ConnectionInfo{
+		Closed: time.Time{},
+	}
+
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	GlobalRegistry.Files = map[string]*FileCacheState{
+		key1: fs1,
+		key2: fs2,
+	}
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Files = oldFiles
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// 1. Without provider capacity report (Standalone)
+	oldPM := GlobalPrehydrationManager
+	GlobalPrehydrationManager = nil
+	defer func() {
+		GlobalPrehydrationManager = oldPM
+	}()
+
+	payload, err := buildStatePayload()
+	if err != nil {
+		t.Fatalf("buildStatePayload failed: %v", err)
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(payload, &data); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	// Active upstream should be exactly 1 (from fs2's open connection; fs1's closed connection is 0)
+	if up, ok := data["active_vod_upstream"].(float64); !ok || int(up) != 1 {
+		t.Fatalf("Expected active_vod_upstream == 1, got %v", data["active_vod_upstream"])
+	}
+
+	// 2. With in-flight probe
+	GlobalInFlightProbes.Add(1)
+	defer GlobalInFlightProbes.Add(-1)
+
+	payloadWithProbe, err := buildStatePayload()
+	if err != nil {
+		t.Fatalf("buildStatePayload failed: %v", err)
+	}
+	var dataWithProbe map[string]interface{}
+	if err := json.Unmarshal(payloadWithProbe, &dataWithProbe); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if up, ok := dataWithProbe["active_vod_upstream"].(float64); !ok || int(up) != 2 {
+		t.Fatalf("Expected active_vod_upstream == 2 (1 worker + 1 probe), got %v", dataWithProbe["active_vod_upstream"])
+	}
+
+	// 3. With Stasharr capacity report
+	vodStreams := 0
+	vodClients := 3
+	liveStreams := 1
+	GlobalPrehydrationManager = &PrehydrationManager{
+		latestCapacity: &ProviderCapacityReport{
+			Status:             "ok",
+			TotalMaxStreams:    5,
+			TotalActiveStreams: 1,
+			LiveClients:        2,
+			LiveStreams:        &liveStreams,
+			VODStreams:         &vodStreams,
+			VODClients:         &vodClients,
+		},
+	}
+
+	payloadWithCap, err := buildStatePayload()
+	if err != nil {
+		t.Fatalf("buildStatePayload failed: %v", err)
+	}
+	var dataWithCap map[string]interface{}
+	if err := json.Unmarshal(payloadWithCap, &dataWithCap); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	capRaw, ok := dataWithCap["provider_capacity"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected provider_capacity in dashboard payload")
+	}
+	if capRaw["vod_streams"] != float64(0) {
+		t.Fatalf("Expected vod_streams == 0, got %v", capRaw["vod_streams"])
+	}
+	if capRaw["vod_clients"] != float64(3) {
+		t.Fatalf("Expected vod_clients == 3, got %v", capRaw["vod_clients"])
+	}
+	if capRaw["live_streams"] != float64(1) {
+		t.Fatalf("Expected live_streams == 1, got %v", capRaw["live_streams"])
+	}
+}
+
 
 
 

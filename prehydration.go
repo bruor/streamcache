@@ -46,6 +46,7 @@ type ProviderCapacityReport struct {
 	LiveClients            int              `json:"live_clients"`
 	LiveStreams            *int             `json:"live_streams,omitempty"`
 	VODStreams             *int             `json:"vod_streams,omitempty"`
+	VODClients             *int             `json:"vod_clients,omitempty"`
 	Providers              []ProviderDetail `json:"providers"`
 	Error                  string           `json:"error,omitempty"`
 }
