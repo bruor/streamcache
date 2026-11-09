@@ -1868,6 +1868,164 @@ func TestProbeDisconnectDoesNotAbortMaterializedPrehydration(t *testing.T) {
 	}
 }
 
+func TestYieldOnlyForActivePlayback(t *testing.T) {
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		queue:               make([]*PrehydrationTask, 0),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+
+	fsPre := &FileCacheState{
+		Key:            "pre.mkv",
+		IsPrehydrating: true,
+		WriterActive:   true,
+		Clients:        make(map[string]chan struct{}),
+		RangeSet:       NewRangeSet(),
+		TotalSize:      10000,
+	}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files["pre.mkv"] = fsPre
+	GlobalRegistry.Lock.Unlock()
+
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, "pre.mkv")
+		delete(GlobalRegistry.Files, "vod_live.mkv")
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	zero := 0
+	one := 1
+
+	// Scenario 1: Available=0, but LiveStreams=0, LiveClients=0, Active VOD Clients=0.
+	// Prehydration should NOT yield to itself!
+	pm.latestCapacity = &ProviderCapacityReport{
+		Status:                "ok",
+		TotalMaxStreams:       2,
+		TotalActiveStreams:    2,
+		TotalAvailableStreams: 0,
+		LiveStreams:           &zero,
+		LiveClients:           0,
+	}
+	pm.checkYieldConditions()
+
+	fsPre.Lock.Lock()
+	if fsPre.IsYielding {
+		fsPre.Lock.Unlock()
+		t.Fatalf("Expected prehydration NOT to yield when LiveStreams=0 and no active VOD clients!")
+	}
+	fsPre.Lock.Unlock()
+
+	// Scenario 2: Available=0, LiveStreams=1. Someone is watching Live TV!
+	// Prehydration MUST yield to protect live TV!
+	pm.latestCapacity = &ProviderCapacityReport{
+		Status:                "ok",
+		TotalMaxStreams:       2,
+		TotalActiveStreams:    2,
+		TotalAvailableStreams: 0,
+		LiveStreams:           &one,
+		LiveClients:           1,
+	}
+	pm.checkYieldConditions()
+
+	fsPre.Lock.Lock()
+	if !fsPre.IsYielding {
+		fsPre.Lock.Unlock()
+		t.Fatalf("Expected prehydration to yield when LiveStreams=1!")
+	}
+	fsPre.IsYielding = false // Reset
+	fsPre.WriterActive = true
+	fsPre.Lock.Unlock()
+
+	// Scenario 3: Available=0, LiveStreams=0, but an active VOD playback client is connected in Streamcache.
+	// Prehydration MUST yield to protect active VOD client!
+	fsVOD := &FileCacheState{
+		Key:            "vod_live.mkv",
+		IsPrehydrating: false,
+		Clients:        map[string]chan struct{}{"client-1": make(chan struct{})},
+		RangeSet:       NewRangeSet(),
+		TotalSize:      10000,
+	}
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files["vod_live.mkv"] = fsVOD
+	GlobalRegistry.Lock.Unlock()
+
+	pm.latestCapacity = &ProviderCapacityReport{
+		Status:                "ok",
+		TotalMaxStreams:       2,
+		TotalActiveStreams:    2,
+		TotalAvailableStreams: 0,
+		LiveStreams:           &zero,
+		LiveClients:           0,
+	}
+	pm.checkYieldConditions()
+
+	fsPre.Lock.Lock()
+	if !fsPre.IsYielding {
+		fsPre.Lock.Unlock()
+		t.Fatalf("Expected prehydration to yield when active VOD client is playing!")
+	}
+	fsPre.Lock.Unlock()
+}
+
+func TestYieldProgressiveBackoff(t *testing.T) {
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		queue:               make([]*PrehydrationTask, 0),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+
+	state := &FileCacheState{
+		Key:            "channel_surf.mkv",
+		IsPrehydrating: true,
+		Clients:        make(map[string]chan struct{}),
+		RangeSet:       NewRangeSet(),
+		TotalSize:      10000,
+	}
+
+	// First yield: 30s base backoff
+	pm.YieldState(state, "flip 1")
+	state.Lock.Lock()
+	if state.YieldCount != 1 {
+		t.Fatalf("Expected YieldCount=1, got %d", state.YieldCount)
+	}
+	firstCooldown := state.YieldCooldownUntil
+	state.Lock.Unlock()
+
+	if time.Until(firstCooldown) < 25*time.Second || time.Until(firstCooldown) > 35*time.Second {
+		t.Fatalf("Expected first cooldown ~30s, got %v", time.Until(firstCooldown))
+	}
+
+	// Second yield immediately (within 60s): progressive backoff scales to 60s
+	pm.YieldState(state, "flip 2")
+	state.Lock.Lock()
+	if state.YieldCount != 2 {
+		t.Fatalf("Expected YieldCount=2, got %d", state.YieldCount)
+	}
+	secondCooldown := state.YieldCooldownUntil
+	state.Lock.Unlock()
+
+	if time.Until(secondCooldown) < 55*time.Second || time.Until(secondCooldown) > 65*time.Second {
+		t.Fatalf("Expected second cooldown ~60s, got %v", time.Until(secondCooldown))
+	}
+
+	// Third yield: scales to 120s
+	pm.YieldState(state, "flip 3")
+	state.Lock.Lock()
+	if state.YieldCount != 3 {
+		t.Fatalf("Expected YieldCount=3, got %d", state.YieldCount)
+	}
+	thirdCooldown := state.YieldCooldownUntil
+	state.Lock.Unlock()
+
+	if time.Until(thirdCooldown) < 115*time.Second || time.Until(thirdCooldown) > 125*time.Second {
+		t.Fatalf("Expected third cooldown ~120s, got %v", time.Until(thirdCooldown))
+	}
+}
+
 
 
 

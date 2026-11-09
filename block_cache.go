@@ -105,6 +105,8 @@ type FileCacheState struct {
 	IsPrehydrating       bool
 	IsYielding           bool
 	YieldCooldownUntil   time.Time
+	YieldCount           int
+	LastYieldTime        time.Time
 	NextURLs             []string
 	DiskMaterialized     bool
 	coordMu              sync.Mutex

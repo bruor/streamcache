@@ -28,6 +28,7 @@ type Config struct {
 	UpstreamUserAgentMode   string
 	MaxUpstreamRetries      int
 	StarvationStallTimeout        time.Duration
+	StallTeardownCooldown         time.Duration
 	LogVerbose                    bool
 	WritebackBufferSize           int64
 	StorageBackend                string
@@ -156,14 +157,26 @@ func (c *Config) GetMaxUpstreamRetries() int {
 
 func (c *Config) GetStarvationStallTimeout() time.Duration {
 	if c == nil {
-		return 30 * time.Second
+		return 35 * time.Second
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.StarvationStallTimeout <= 0 {
-		return 30 * time.Second
+		return 35 * time.Second
 	}
 	return c.StarvationStallTimeout
+}
+
+func (c *Config) GetStallTeardownCooldown() time.Duration {
+	if c == nil {
+		return 5 * time.Second
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.StallTeardownCooldown <= 0 {
+		return 5 * time.Second
+	}
+	return c.StallTeardownCooldown
 }
 
 func (c *Config) GetCacheMaxBytes() int64 {
@@ -474,7 +487,8 @@ func parseConfigFromEnv() *Config {
 		UpstreamUserAgent:       getEnv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 		UpstreamUserAgentMode:   getEnv("UPSTREAM_USER_AGENT_MODE", "smart"),
 		MaxUpstreamRetries:      getEnvInt("MAX_UPSTREAM_RETRIES", 0),
-		StarvationStallTimeout:  getEnvDuration("STARVATION_STALL_TIMEOUT", 30*time.Second),
+		StarvationStallTimeout:  getEnvDuration("STARVATION_STALL_TIMEOUT", 35*time.Second),
+		StallTeardownCooldown:   getEnvDuration("STALL_TEARDOWN_COOLDOWN", 5*time.Second),
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
 		StorageBackend:         getEnv("STORAGE_BACKEND", "local"),
