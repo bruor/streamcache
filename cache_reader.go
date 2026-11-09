@@ -461,8 +461,8 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			break
 		}
 
-		// Check if off falls within an unreadable dead zone; if so, synthesize zeroes immediately!
-		if gapEnd := r.state.CheckStalledGap(off); gapEnd > off {
+		// Check if off falls within an unreadable dead zone (capped at MaxDeadZoneSkip = 16MB); if so, synthesize zeroes immediately!
+		if gapEnd := r.state.CheckStalledGap(off); gapEnd > off && (gapEnd-off) <= MaxDeadZoneSkip {
 			toZero := int64(len(p))
 			if toZero > (gapEnd - off) {
 				toZero = gapEnd - off
