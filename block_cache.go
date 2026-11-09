@@ -109,6 +109,8 @@ type FileCacheState struct {
 	LastYieldTime        time.Time
 	NextURLs             []string
 	DiskMaterialized     bool
+	LastProgressTimeNano int64            // Unix nano timestamp of last net-new unique byte added to RangeSet (atomic)
+	StalledGaps          map[int64]int64  // Map of [corruptStartOffset]readableGoodOffset for zero-fill synthesis
 	coordMu              sync.Mutex
 	coordGen             uint64
 }
@@ -138,6 +140,8 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		UpstreamStatus:            "Idle",
 		PendingTailPrefetchOffset: -1,
 		LiveBuffer:                NewLiveBuffer(bufSize),
+		LastProgressTimeNano:      time.Now().UnixNano(),
+		StalledGaps:               make(map[int64]int64),
 	}
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
 		chunkSize := int64(64 * 1024 * 1024)
@@ -148,6 +152,32 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 	}
 	s.Cond = sync.NewCond(&s.Lock)
 	return s
+}
+
+// CheckStalledGap checks if offset falls within any recorded dead zone [gapStart, gapEnd).
+// Returns the gapEnd offset if true, or 0 if not stalled.
+func (s *FileCacheState) CheckStalledGap(offset int64) int64 {
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	for gStart, gEnd := range s.StalledGaps {
+		if offset >= gStart && offset < gEnd {
+			return gEnd
+		}
+	}
+	return 0
+}
+
+// RecordStalledGap records an unreadable sector [start, end)
+func (s *FileCacheState) RecordStalledGap(start, end int64) {
+	if start >= end {
+		return
+	}
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	if s.StalledGaps == nil {
+		s.StalledGaps = make(map[int64]int64)
+	}
+	s.StalledGaps[start] = end
 }
 
 type ConnectionInfo struct {
