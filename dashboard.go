@@ -221,11 +221,45 @@ func buildStatePayload() ([]byte, error) {
 		NextURLs           []string       `json:"next_urls,omitempty"`
 	}
 
+	type sseProbeBuffer struct {
+		Key            string   `json:"key"`
+		URL            string   `json:"url"`
+		TotalSize      int64    `json:"total_size"`
+		RAMBytes       int64    `json:"ram_bytes"`
+		UpstreamStatus string   `json:"upstream_status"`
+		IdleSeconds    int      `json:"idle_seconds"`
+		NextURLs       []string `json:"next_urls,omitempty"`
+	}
+
 	var activeFiles []sseFile
+	var probeBuffers []sseProbeBuffer
 	activeVODUpstream := 0
 	activeVODProbes := 0
 	for _, fileState := range files {
 		fileState.Lock.Lock()
+		if fileState.IsProbe {
+			ramBytes := int64(0)
+			if fileState.LiveBuffer != nil {
+				ramBytes = fileState.LiveBuffer.GetCurBytes()
+			}
+			lastProg := atomic.LoadInt64(&fileState.LastProgressTimeNano)
+			idleSec := 0
+			if lastProg > 0 {
+				idleSec = int(time.Since(time.Unix(0, lastProg)).Seconds())
+			}
+			probeBuffers = append(probeBuffers, sseProbeBuffer{
+				Key:            fileState.Key,
+				URL:            fileState.URL,
+				TotalSize:      fileState.TotalSize,
+				RAMBytes:       ramBytes,
+				UpstreamStatus: fileState.UpstreamStatus,
+				IdleSeconds:    idleSec,
+				NextURLs:       append([]string(nil), fileState.NextURLs...),
+			})
+			fileState.Lock.Unlock()
+			continue
+		}
+
 		isDiskMat := fileState.DiskMaterialized
 		isProbeFile := !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing"
 		fileActiveConns := 0
@@ -392,6 +426,7 @@ func buildStatePayload() ([]byte, error) {
 		"active_vod_upstream":    activeVODUpstream,
 		"active_vod_probes":      activeVODProbes,
 		"probe_active":           probeActive,
+		"probe_buffers":          probeBuffers,
 	}
 
 	if GlobalPrehydrationManager != nil {

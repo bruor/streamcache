@@ -277,6 +277,16 @@ func (lb *LiveBuffer) ReadAt(p []byte, off int64) (int, bool) {
 	return 0, false
 }
 
+// GetCurBytes returns the total bytes currently retained in LiveBuffer
+func (lb *LiveBuffer) GetCurBytes() int64 {
+	if lb == nil {
+		return 0
+	}
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+	return lb.curBytes
+}
+
 // Clear releases all chunks currently retained in LiveBuffer
 func (lb *LiveBuffer) Clear() {
 	if lb == nil {
@@ -645,7 +655,17 @@ func (wp *WritebackPipeline) FlushAndClose() error {
 	wp.wg.Wait()
 
 	if wp.liveBuffer != nil {
-		wp.liveBuffer.Clear()
+		shouldClear := true
+		if wp.state != nil {
+			wp.state.Lock.Lock()
+			if wp.state.IsProbe {
+				shouldClear = false
+			}
+			wp.state.Lock.Unlock()
+		}
+		if shouldClear {
+			wp.liveBuffer.Clear()
+		}
 	}
 
 	wp.errMu.Lock()

@@ -1279,6 +1279,24 @@
             </div>
 
             <div class="card">
+                <div class="card-title" style="margin-bottom: 0.8rem;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span>In-Memory Probe Buffers</span>
+                        <span style="font-size: 0.85rem; color: var(--text-sub);" id="probes-count">0 Buffers</span>
+                    </div>
+                    <button id="probes-toggle-btn" class="collapsible-header-btn" onclick="toggleProbesPanel()" title="Toggle In-Memory Probe Buffers visibility">
+                        <span id="probes-toggle-icon">▶</span>
+                        <span id="probes-toggle-text">Show Buffers</span>
+                    </button>
+                </div>
+                <div id="probes-collapsible" class="collapsible-content collapsed">
+                    <div id="probes-container">
+                        <div class="empty-state">No in-memory probe buffers.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
                 <div class="console-header card-title" style="margin-bottom: 0.5rem; border-bottom: none;">
                     <div style="display: flex; align-items: center; gap: 8px;">
                         <span>System Console & Event Logs</span>
@@ -1388,6 +1406,8 @@
         const connectionText = document.getElementById('connection-status-text');
         const connectionsContainer = document.getElementById('connections-container');
         const connectionsCountEl = document.getElementById('connections-count');
+        const probesContainer = document.getElementById('probes-container');
+        const probesCountEl = document.getElementById('probes-count');
 
         function appendLog(text) {
             if (consoleEl.childNodes.length === 1 && consoleEl.firstChild.nodeType === Node.TEXT_NODE && consoleEl.firstChild.textContent.startsWith("Initializing")) {
@@ -1459,6 +1479,23 @@
                 if (collapsible) collapsible.classList.add('collapsed');
                 if (icon) icon.innerText = '▶';
                 if (text) text.innerText = 'Show Sessions';
+            }
+        }
+
+        let isProbesExpanded = false;
+        function toggleProbesPanel() {
+            isProbesExpanded = !isProbesExpanded;
+            const collapsible = document.getElementById('probes-collapsible');
+            const icon = document.getElementById('probes-toggle-icon');
+            const text = document.getElementById('probes-toggle-text');
+            if (isProbesExpanded) {
+                if (collapsible) collapsible.classList.remove('collapsed');
+                if (icon) icon.innerText = '▼';
+                if (text) text.innerText = 'Hide Buffers';
+            } else {
+                if (collapsible) collapsible.classList.add('collapsed');
+                if (icon) icon.innerText = '▶';
+                if (text) text.innerText = 'Show Buffers';
             }
         }
 
@@ -1950,6 +1987,83 @@
             });
         }
 
+        function updateProbeBuffersDOM(probeBuffers) {
+            if (!probesContainer || !probesCountEl) return;
+            const totalRAM = (probeBuffers || []).reduce((acc, p) => acc + (p.ram_bytes || 0), 0);
+            const ramText = totalRAM > 0 ? ` (${formatBytes(totalRAM)} RAM)` : '';
+            probesCountEl.innerText = `${(probeBuffers || []).length} Buffers${ramText}`;
+
+            if (!probeBuffers || probeBuffers.length === 0) {
+                probesContainer.innerHTML = `<div class="empty-state">No in-memory probe buffers.</div>`;
+                return;
+            }
+
+            if (probesContainer.querySelector('.empty-state')) {
+                probesContainer.innerHTML = '';
+            }
+
+            const probeKeys = new Set(probeBuffers.map(p => p.key));
+            Array.from(probesContainer.children).forEach(child => {
+                if (child.id && child.id.startsWith('probe-card-') && !probeKeys.has(child.id.replace('probe-card-', ''))) {
+                    child.remove();
+                }
+            });
+
+            probeBuffers.forEach(probe => {
+                const cardId = `probe-card-${probe.key}`;
+                let card = document.getElementById(cardId);
+                const idleMins = Math.floor((probe.idle_seconds || 0) / 60);
+                const idleSecs = (probe.idle_seconds || 0) % 60;
+                const idleStr = idleMins > 0 ? `${idleMins}m ${idleSecs}s` : `${idleSecs}s`;
+                const chainedCount = probe.next_urls ? probe.next_urls.length : 0;
+                const chainedBadge = chainedCount > 0 ? `<span style="font-size: 0.75rem; background: rgba(59, 130, 246, 0.2); color: var(--accent-cyan); padding: 2px 6px; border-radius: 4px; font-weight: 600;">Chained: ${chainedCount}</span>` : '';
+
+                const cardHTML = `
+                    <div class="connection-header">
+                        <div style="display: flex; align-items: center; gap: 8px; overflow: hidden;">
+                            <span class="connection-client-id" style="color: var(--accent-cyan); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${probe.key}">${probe.key}</span>
+                            ${chainedBadge}
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+                            <span class="status-pill" style="font-size: 0.75rem; padding: 2px 8px; border-radius: 4px; background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3);">Probed (Idle)</span>
+                        </div>
+                    </div>
+                    <div class="connection-grid">
+                        <div class="connection-metric-card">
+                            <span class="connection-metric-label">RAM Buffer</span>
+                            <span class="connection-metric-value" style="color: var(--accent-green); font-weight: 600;">${formatBytes(probe.ram_bytes || 0)}</span>
+                        </div>
+                        <div class="connection-metric-card">
+                            <span class="connection-metric-label">Total Media Size</span>
+                            <span class="connection-metric-value">${formatBytes(probe.total_size || 0)}</span>
+                        </div>
+                        <div class="connection-metric-card">
+                            <span class="connection-metric-label">Idle Inactivity</span>
+                            <span class="connection-metric-value">${idleStr} (15m exp)</span>
+                        </div>
+                        <div class="connection-metric-card">
+                            <span class="connection-metric-label">Upstream Workers</span>
+                            <span class="connection-metric-value" style="color: var(--text-sub);">0 (Standby)</span>
+                        </div>
+                    </div>
+                    <div class="connection-url-card">
+                        <span class="connection-metric-label">Target Media URL</span>
+                        <span class="connection-url-value" title="${probe.url}">${probe.url}</span>
+                    </div>
+                `;
+
+                if (!card) {
+                    card = document.createElement('div');
+                    card.className = 'connection-item';
+                    card.id = cardId;
+                    card.innerHTML = cardHTML;
+                    probesContainer.appendChild(card);
+                } else {
+                    card.innerHTML = cardHTML;
+                }
+            });
+        }
+
         let currentServerInstanceId = null;
 
         function triggerAutoReload(newVersion) {
@@ -2175,6 +2289,7 @@
 
                 updateActiveDownloadsDOM(data.active_downloads || []);
                 updateActiveConnectionsDOM(data.active_connections || []);
+                updateProbeBuffersDOM(data.probe_buffers || []);
             });
         }
 
