@@ -160,3 +160,64 @@ func TestRangeSetConcurrentAccess(t *testing.T) {
 			rs.TotalBytes(), rs.ToSlices())
 	}
 }
+
+func TestRangeSetAddAndCount(t *testing.T) {
+	rs := NewRangeSet()
+
+	// 1. Initial fresh write: [0, 100) -> +100
+	n := rs.AddAndCount(0, 100)
+	if n != 100 {
+		t.Fatalf("Expected 100 new bytes, got %d", n)
+	}
+	if rs.TotalBytes() != 100 {
+		t.Fatalf("Expected total 100, got %d", rs.TotalBytes())
+	}
+
+	// 2. Exact duplicate retry (e.g. reconnect): [0, 100) -> +0
+	n = rs.AddAndCount(0, 100)
+	if n != 0 {
+		t.Fatalf("Expected 0 new bytes on exact duplicate retry, got %d", n)
+	}
+
+	// 3. Inner subset (e.g. retry overlap): [20, 80) -> +0
+	n = rs.AddAndCount(20, 80)
+	if n != 0 {
+		t.Fatalf("Expected 0 new bytes on inner subset retry, got %d", n)
+	}
+
+	// 4. Forward overlap extension: [80, 150) -> +50 new bytes
+	n = rs.AddAndCount(80, 150)
+	if n != 50 {
+		t.Fatalf("Expected 50 new bytes on forward extension, got %d", n)
+	}
+	if rs.TotalBytes() != 150 {
+		t.Fatalf("Expected total 150, got %d", rs.TotalBytes())
+	}
+
+	// 5. Disjoint block downstream: [500, 600) -> +100 new bytes
+	n = rs.AddAndCount(500, 600)
+	if n != 100 {
+		t.Fatalf("Expected 100 new bytes on disjoint block, got %d", n)
+	}
+	if rs.TotalBytes() != 250 {
+		t.Fatalf("Expected total 250, got %d", rs.TotalBytes())
+	}
+
+	// 6. Bridging block spanning [100, 550) -> previous was [0, 150) and [500, 600)
+	// New coverage will be [0, 600) = 600 total. Previous total was 250. Delta = 350.
+	n = rs.AddAndCount(100, 550)
+	if n != 350 {
+		t.Fatalf("Expected 350 new bytes on bridge merge, got %d", n)
+	}
+	if rs.TotalBytes() != 600 {
+		t.Fatalf("Expected total 600, got %d", rs.TotalBytes())
+	}
+
+	// 7. Invalid ranges (start >= end) -> 0
+	if rs.AddAndCount(50, 50) != 0 {
+		t.Fatalf("Expected 0 new bytes for zero-length range")
+	}
+	if rs.AddAndCount(100, 50) != 0 {
+		t.Fatalf("Expected 0 new bytes for inverted range")
+	}
+}

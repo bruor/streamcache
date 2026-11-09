@@ -33,8 +33,14 @@ func NewRangeSet() *RangeSet {
 
 // Add inserts a byte range [start, end) and merges overlapping or adjacent intervals.
 func (rs *RangeSet) Add(start, end int64) {
+	rs.AddAndCount(start, end)
+}
+
+// AddAndCount inserts a byte range [start, end), merges overlapping intervals,
+// and returns the exact number of net-new bytes added to the RangeSet.
+func (rs *RangeSet) AddAndCount(start, end int64) int64 {
 	if start >= end {
-		return
+		return 0
 	}
 	if start < 0 {
 		start = 0
@@ -43,10 +49,15 @@ func (rs *RangeSet) Add(start, end int64) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
+	var prevTotal int64
+	for _, r := range rs.ranges {
+		prevTotal += (r.End - r.Start)
+	}
+
 	newRange := ByteRange{Start: start, End: end}
 	if len(rs.ranges) == 0 {
 		rs.ranges = append(rs.ranges, newRange)
-		return
+		return newRange.End - newRange.Start
 	}
 
 	// Insert and merge with existing ranges
@@ -99,6 +110,17 @@ func (rs *RangeSet) Add(start, end int64) {
 	}
 
 	rs.ranges = finalRanges
+
+	var newTotal int64
+	for _, r := range finalRanges {
+		newTotal += (r.End - r.Start)
+	}
+
+	delta := newTotal - prevTotal
+	if delta < 0 {
+		return 0
+	}
+	return delta
 }
 
 // Contains returns true if the specified byte offset is covered by any range

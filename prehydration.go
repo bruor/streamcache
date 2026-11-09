@@ -9,10 +9,14 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+var zeroProgressSuspensionTimeout = 15 * time.Minute
 
 type ProviderProfileDetail struct {
 	ProfileID        int    `json:"profile_id"`
@@ -397,6 +401,31 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 		return
 	}
 
+	// Yield Prioritization:
+	// 1. Files that haven't received bytes in the longest time yield first (LastProgressTimeNano ASC)
+	// 2. Tie-breaker: lowest completion % yields first
+	sort.Slice(prehydratingFiles, func(i, j int) bool {
+		progI := atomic.LoadInt64(&prehydratingFiles[i].LastProgressTimeNano)
+		progJ := atomic.LoadInt64(&prehydratingFiles[j].LastProgressTimeNano)
+
+		diff := progI - progJ
+		if diff < -int64(3*time.Second) {
+			return true // i has older progress -> yields first
+		}
+		if diff > int64(3*time.Second) {
+			return false // j has older progress -> yields first
+		}
+
+		var pctI, pctJ float64
+		if prehydratingFiles[i].TotalSize > 0 {
+			pctI = float64(prehydratingFiles[i].RangeSet.TotalBytes()) / float64(prehydratingFiles[i].TotalSize)
+		}
+		if prehydratingFiles[j].TotalSize > 0 {
+			pctJ = float64(prehydratingFiles[j].RangeSet.TotalBytes()) / float64(prehydratingFiles[j].TotalSize)
+		}
+		return pctI < pctJ
+	})
+
 	neededToYield := reservation - available
 	yieldedCount := 0
 	for _, fs := range prehydratingFiles {
@@ -407,6 +436,67 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 			available, reservation, liveStreams, hasActiveVODPlayback, fs.Key)
 		pm.YieldState(fs, "Live stream capacity reservation")
 		yieldedCount++
+	}
+}
+
+// checkZeroProgressSuspension inspects active prehydrations that have 0 connected clients.
+// If an active prehydration has made 0 net-new media bytes progress for >= zeroProgressSuspensionTimeout (default 15m):
+// 1. Suspend upstream coordinator/workers (state.WriterActive = false) to free provider connections.
+// 2. Preserve .part file on disk for future playback deduplication & sector healing.
+// 3. Pass the chaining baton: if state.NextURLs has queued episodes, pop NextURLs[0],
+//    enqueue it for prehydration, and clear state.NextURLs so bingewatching continues!
+func (pm *PrehydrationManager) checkZeroProgressSuspension() {
+	GlobalRegistry.Lock.RLock()
+	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
+	for _, fs := range GlobalRegistry.Files {
+		files = append(files, fs)
+	}
+	GlobalRegistry.Lock.RUnlock()
+
+	timeout := zeroProgressSuspensionTimeout
+	nowNano := time.Now().UnixNano()
+
+	for _, fs := range files {
+		fs.Lock.Lock()
+		if !fs.IsPrehydrating || len(fs.Clients) > 0 || fs.IsYielding || !fs.WriterActive {
+			fs.Lock.Unlock()
+			continue
+		}
+
+		lastProg := atomic.LoadInt64(&fs.LastProgressTimeNano)
+		if lastProg == 0 {
+			atomic.StoreInt64(&fs.LastProgressTimeNano, nowNano)
+			fs.Lock.Unlock()
+			continue
+		}
+
+		stallDuration := time.Duration(nowNano - lastProg)
+		if stallDuration < timeout {
+			fs.Lock.Unlock()
+			continue
+		}
+
+		log.Printf("[Prehydration] Prehydration %s made ZERO net-new byte progress for %s (>= %s). Suspending upstream workers; preserving .part on disk.",
+			fs.Key, stallDuration.Round(time.Second), timeout)
+
+		var nextURL string
+		var remainingNextURLs []string
+		if len(fs.NextURLs) > 0 {
+			nextURL = fs.NextURLs[0]
+			if len(fs.NextURLs) > 1 {
+				remainingNextURLs = append([]string{}, fs.NextURLs[1:]...)
+			}
+			fs.NextURLs = nil
+		}
+		fs.Lock.Unlock()
+
+		pm.YieldState(fs, "15-minute zero progress inactivity suspension")
+
+		if nextURL != "" {
+			log.Printf("[Prehydration] Passing baton from stalled episode %s to next episode: %s (remaining chain: %d)",
+				fs.Key, nextURL, len(remainingNextURLs))
+			pm.Enqueue(nextURL, remainingNextURLs)
+		}
 	}
 }
 
@@ -520,11 +610,54 @@ func (pm *PrehydrationManager) OnCancelled(key string) {
 	pm.mu.Unlock()
 }
 
+// OnPlayerPlayback is called when a human viewer begins playing an asset.
+// It removes the played asset from the prehydration queue and clears NextURLs
+// on all other files to ensure only the active playing title controls the downstream binge chain.
+func (pm *PrehydrationManager) OnPlayerPlayback(targetURL string, nextURLs []string) {
+	if pm == nil {
+		return
+	}
+	key, ext := getCacheKeyAndExt(targetURL)
+	cacheFileName := key + ext
+
+	pm.mu.Lock()
+	if pm.activePrehydrations[cacheFileName] {
+		delete(pm.activePrehydrations, cacheFileName)
+		if pm.prehydrationsStartedSinceLastPoll > 0 {
+			pm.prehydrationsStartedSinceLastPoll--
+		}
+	}
+	for i := len(pm.queue) - 1; i >= 0; i-- {
+		if pm.queue[i].TargetURL == targetURL {
+			pm.queue = append(pm.queue[:i], pm.queue[i+1:]...)
+		}
+	}
+	pm.mu.Unlock()
+
+	if len(nextURLs) > 0 {
+		GlobalRegistry.Lock.RLock()
+		files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
+		for _, fs := range GlobalRegistry.Files {
+			if fs.URL != targetURL {
+				files = append(files, fs)
+			}
+		}
+		GlobalRegistry.Lock.RUnlock()
+
+		for _, fs := range files {
+			fs.Lock.Lock()
+			fs.NextURLs = nil
+			fs.Lock.Unlock()
+		}
+	}
+}
+
 // OnCacheHit is invoked immediately when a player requests an episode that is already 100% on disk.
 func (pm *PrehydrationManager) OnCacheHit(currentURL string, nextURLs []string) {
 	if pm == nil || len(nextURLs) == 0 {
 		return
 	}
+	pm.OnPlayerPlayback(currentURL, nextURLs)
 	pm.AutoDiscoverDispatcharrURL(currentURL)
 	pm.Enqueue(nextURLs[0], nextURLs[1:])
 }
@@ -647,6 +780,9 @@ func (pm *PrehydrationManager) schedulerLoop() {
 }
 
 func (pm *PrehydrationManager) processNextTask() {
+	// 0. Check if any active prehydration file has stalled for 15 minutes without net-new bytes
+	pm.checkZeroProgressSuspension()
+
 	// 1. First, check if any yielded states are ready to resume
 	GlobalRegistry.Lock.RLock()
 	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
@@ -663,6 +799,18 @@ func (pm *PrehydrationManager) processNextTask() {
 		}
 		fs.Lock.Unlock()
 	}
+
+	// Sort yielded candidates by completion percentage descending (highest completion resumes first)
+	sort.Slice(yieldedCandidates, func(i, j int) bool {
+		var pctI, pctJ float64
+		if yieldedCandidates[i].TotalSize > 0 {
+			pctI = float64(yieldedCandidates[i].RangeSet.TotalBytes()) / float64(yieldedCandidates[i].TotalSize)
+		}
+		if yieldedCandidates[j].TotalSize > 0 {
+			pctJ = float64(yieldedCandidates[j].RangeSet.TotalBytes()) / float64(yieldedCandidates[j].TotalSize)
+		}
+		return pctI > pctJ
+	})
 
 	for _, fs := range yieldedCandidates {
 		if !pm.CanStartPrehydration(fs.URL) {

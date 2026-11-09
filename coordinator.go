@@ -21,7 +21,79 @@ import (
 var (
 	coordinatorSleepMu sync.RWMutex
 	coordinatorSleepFn func(time.Duration)
+
+	probeNextReadableOffsetFn = probeNextReadableOffset
 )
+
+// probeNextReadableOffset probes forward exponentially from stallOffset (+256KB, +1MB, +2MB, +4MB, +8MB, +16MB)
+// with a fast 2-second timeout per hop to find the next readable byte offset.
+func probeNextReadableOffset(ctx context.Context, targetURL string, stallOffset int64, totalSize int64, userAgent string) (int64, error) {
+	if stallOffset < 0 {
+		stallOffset = 0
+	}
+	hops := []int64{
+		256 * 1024,
+		1 * 1024 * 1024,
+		2 * 1024 * 1024,
+		4 * 1024 * 1024,
+		8 * 1024 * 1024,
+		16 * 1024 * 1024,
+	}
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	for _, hop := range hops {
+		if ctx != nil && ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+
+		probeStart := stallOffset + hop
+		if totalSize > 0 && probeStart >= totalSize {
+			break
+		}
+
+		probeEnd := probeStart + 1024 - 1
+		if totalSize > 0 && probeEnd >= totalSize {
+			probeEnd = totalSize - 1
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+		if err != nil {
+			continue
+		}
+
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", probeStart, probeEnd))
+		if userAgent != "" {
+			req.Header.Set("User-Agent", userAgent)
+		} else {
+			req.Header.Set("User-Agent", "Streamcache/1.0")
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[DeadZoneProbe] Probe at offset %d failed: %v", probeStart, err)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusOK {
+			buf := make([]byte, 1)
+			_, rerr := io.ReadFull(resp.Body, buf)
+			resp.Body.Close()
+			if rerr == nil {
+				log.Printf("[DeadZoneProbe] Found readable byte at offset %d (+%d KB from stalled %d)",
+					probeStart, hop/1024, stallOffset)
+				return probeStart, nil
+			}
+		} else {
+			resp.Body.Close()
+			log.Printf("[DeadZoneProbe] Probe at offset %d returned HTTP %d", probeStart, resp.StatusCode)
+		}
+	}
+
+	return 0, fmt.Errorf("no readable offset found within 16MB probe window")
+}
 
 // StartCoordinator spawns the manager goroutine for a given file
 func StartCoordinator(state *FileCacheState, initialHeader http.Header) {
@@ -585,7 +657,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 					} else if primaryStalled.spawnTimeNano > 0 {
 						stallDuration = time.Since(time.Unix(0, primaryStalled.spawnTimeNano))
 					}
-					log.Printf("[Coord] Worker %d starved of incoming bytes for %s (>= %s threshold) with client starving at %d. Breaking out of suppression and reconnecting.",
+					log.Printf("[Coord] Worker %d starved of incoming bytes for %s (>= %s threshold) with client starving at %d. Probing forward for dead-zone bypass...",
 						primaryStalled.id, stallDuration.Round(time.Millisecond), stallTimeout, sb)
 
 					for _, sw := range stalledWorkers {
@@ -594,42 +666,60 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 					}
 					state.WorkersLock.Unlock()
 
+					// Run exponential dead-zone probe forward (outside of locks!)
+					goodOffset, perr := probeNextReadableOffsetFn(parentCtx, state.URL, sb, state.TotalSize, state.UpstreamUserAgent)
+					spawnTarget := sb
+					if perr == nil && goodOffset > sb {
+						log.Printf("[Coord] Live dead zone detected [%d, %d). Synthesizing zeroes and launching scout at %d.",
+							sb, goodOffset, goodOffset)
+						state.RecordStalledGap(sb, goodOffset)
+						spawnTarget = goodOffset
+					}
+
 					state.Lock.Lock()
 					for clientID, starveOff := range state.Starving {
 						if starveOff == sb {
 							state.StarvingSince[clientID] = time.Now()
 						}
 					}
+					// Wake client readers immediately so CacheReader synthesizes zeroes if gap detected!
+					for _, ch := range state.Clients {
+						safeSignal(ch)
+					}
 					state.Lock.Unlock()
 
-					// Teardown cooldown: give Dispatcharr and upstream provider time to drop cleanly
-					// before establishing a fresh connection.
-					stallCooldown := 5 * time.Second
-					if GlobalConfig != nil {
-						stallCooldown = GlobalConfig.GetStallTeardownCooldown()
-					}
-					consecutiveStallBreakouts++
-					multiplier := consecutiveStallBreakouts
-					if multiplier > 3 {
-						multiplier = 3
-					}
-					actualCooldown := stallCooldown * time.Duration(multiplier)
-					log.Printf("[Coord] Starvation breakout teardown cooldown (%s, consecutive #%d) for %s before fresh upstream reconnect",
-						actualCooldown, consecutiveStallBreakouts, state.Key)
-
-					coordinatorSleepMu.RLock()
-					sleepFn := coordinatorSleepFn
-					coordinatorSleepMu.RUnlock()
-					if sleepFn != nil {
-						sleepFn(actualCooldown)
-					} else {
-						timer := time.NewTimer(actualCooldown)
-						select {
-						case <-timer.C:
-						case <-parentCtx.Done():
-							timer.Stop()
-							return
+					// If probe found a good offset, skip teardown cooldown to give live viewer 0ms buffering!
+					if spawnTarget == sb {
+						stallCooldown := 5 * time.Second
+						if GlobalConfig != nil {
+							stallCooldown = GlobalConfig.GetStallTeardownCooldown()
 						}
+						consecutiveStallBreakouts++
+						multiplier := consecutiveStallBreakouts
+						if multiplier > 3 {
+							multiplier = 3
+						}
+						actualCooldown := stallCooldown * time.Duration(multiplier)
+						log.Printf("[Coord] Starvation breakout teardown cooldown (%s, consecutive #%d) for %s before fresh upstream reconnect",
+							actualCooldown, consecutiveStallBreakouts, state.Key)
+
+						coordinatorSleepMu.RLock()
+						sleepFn := coordinatorSleepFn
+						coordinatorSleepMu.RUnlock()
+						if sleepFn != nil {
+							sleepFn(actualCooldown)
+						} else {
+							timer := time.NewTimer(actualCooldown)
+							select {
+							case <-timer.C:
+							case <-parentCtx.Done():
+								timer.Stop()
+								return
+							}
+						}
+					} else {
+						// Dead zone leaped: reset stall breakout counter
+						consecutiveStallBreakouts = 0
 					}
 
 					state.Lock.Lock()
@@ -640,7 +730,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 						continue
 					}
 
-					spawnWorker(sb)
+					spawnWorker(spawnTarget)
 					continue
 				}
 
@@ -769,6 +859,25 @@ func runDownloadWorker(
 		}
 
 		consecutiveFailures++
+
+		// Background Prehydration Dead-Zone Skip: If worker fails 3 consecutive retries at the exact same offset,
+		// probe forward to bypass the dead sector and continue downloading downstream video!
+		if consecutiveFailures >= 3 && currentOffset < state.TotalSize {
+			log.Printf("[Worker-%d] Worker reached %d consecutive failures at offset %d. Probing forward for dead zone...",
+				w.id, consecutiveFailures, currentOffset)
+			goodOffset, err := probeNextReadableOffsetFn(ctx, state.URL, currentOffset, state.TotalSize, state.UpstreamUserAgent)
+			if err == nil && goodOffset > currentOffset {
+				log.Printf("[Worker-%d] Dead zone bypassed [%d, %d). Leapfrogging worker to %d.",
+					w.id, currentOffset, goodOffset, goodOffset)
+				state.RecordStalledGap(currentOffset, goodOffset)
+				currentOffset = goodOffset
+				atomic.StoreInt64(&w.currentOffset, currentOffset)
+				consecutiveFailures = 0
+				backoff = 2 * time.Second
+				return false
+			}
+		}
+
 		maxRetries := GlobalConfig.GetMaxUpstreamRetries()
 		if maxRetries > 0 && consecutiveFailures >= maxRetries {
 			log.Printf("[Worker-%d] Maximum consecutive failures reached (%d/%d). Exiting worker.", w.id, consecutiveFailures, maxRetries)
@@ -1036,7 +1145,10 @@ func runDownloadWorker(
 			}
 
 			// Add to RangeSet and wake waiting readers immediately!
-			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
+			newMediaBytes := state.RangeSet.AddAndCount(currentOffset, currentOffset+int64(n))
+			if newMediaBytes > 0 {
+				atomic.StoreInt64(&state.LastProgressTimeNano, time.Now().UnixNano())
+			}
 
 			state.Lock.Lock()
 			for _, ch := range state.Clients {
@@ -1297,7 +1409,10 @@ func runInlineTailPrefetch(
 				break
 			}
 
-			state.RangeSet.Add(currentOffset, currentOffset+int64(n))
+			newMediaBytes := state.RangeSet.AddAndCount(currentOffset, currentOffset+int64(n))
+			if newMediaBytes > 0 {
+				atomic.StoreInt64(&state.LastProgressTimeNano, time.Now().UnixNano())
+			}
 			state.Lock.Lock()
 			for _, ch := range state.Clients {
 				safeSignal(ch)

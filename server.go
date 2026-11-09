@@ -296,6 +296,10 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 			GlobalRegistry.Files[cacheFileName] = state
 			GlobalRegistry.Lock.Unlock()
+
+			if GlobalPrehydrationManager != nil {
+				GlobalPrehydrationManager.OnPlayerPlayback(targetURL, nextURLs)
+			}
 		}
 	} else {
 		GlobalRegistry.Lock.Unlock()
@@ -325,6 +329,10 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			state.NextURLs = nextURLs
 		}
 		state.Lock.Unlock()
+
+		if GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnPlayerPlayback(targetURL, nextURLs)
+		}
 	}
 
 	// Create request-bound CacheReader

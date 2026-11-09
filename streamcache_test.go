@@ -42,6 +42,7 @@ func TestMain(m *testing.M) {
 		Connections: make(map[string]*ClientConnection),
 	}
 	InitHTTPClient()
+	InitLogBroker()
 
 	// Mock coordinator sleep in tests to prevent long delays
 	coordinatorSleepMu.Lock()
@@ -4177,6 +4178,124 @@ func TestUserAttributionAndAPISessions(t *testing.T) {
 	}
 	if respFilter.User != "BOB" {
 		t.Errorf("Expected response user 'BOB', got %q", respFilter.User)
+	}
+}
+
+func TestLiveReaderDeadZoneZeroFill(t *testing.T) {
+	state := NewFileCacheState(
+		"test_dead_zone",
+		"http://localhost/dummy",
+		filepath.Join(GlobalConfig.CacheDir, "test_dead_zone"),
+		filepath.Join(GlobalConfig.TmpDir, "test_dead_zone.part"),
+		filepath.Join(GlobalConfig.TmpDir, "test_dead_zone.json"),
+		"video/mp4",
+		"",
+		"",
+		500,
+	)
+
+	f, err := os.Create(state.PartPath)
+	if err != nil {
+		t.Fatalf("Failed to create part file: %v", err)
+	}
+	defer func() {
+		f.Close()
+		os.Remove(state.PartPath)
+	}()
+
+	// Healthy head: [0, 100)
+	headData := make([]byte, 100)
+	for i := range headData {
+		headData[i] = 0xAA
+	}
+	_, _ = f.WriteAt(headData, 0)
+	state.RangeSet.Add(0, 100)
+
+	// Healthy downstream (Scout worker buffered): [200, 300)
+	downstreamData := make([]byte, 100)
+	for i := range downstreamData {
+		downstreamData[i] = 0xBB
+	}
+	_, _ = f.WriteAt(downstreamData, 200)
+	state.RangeSet.Add(200, 300)
+	state.DiskMaterialized = true
+
+	// Dead zone recorded: [100, 200) is unreadable from upstream
+	state.RecordStalledGap(100, 200)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader := NewCacheReader(ctx, state, nil)
+	defer reader.Close()
+
+	// 1. Read healthy head
+	buf := make([]byte, 100)
+	n, err := reader.ReadAt(buf, 0)
+	if err != nil || n != 100 {
+		t.Fatalf("Expected to read 100 bytes from head, got n=%d, err=%v", n, err)
+	}
+	if buf[0] != 0xAA {
+		t.Fatalf("Expected 0xAA in head data, got %x", buf[0])
+	}
+
+	// 2. Read dead zone: [100, 200) - must return zeroes immediately without blocking
+	bufGap := make([]byte, 100)
+	for i := range bufGap {
+		bufGap[i] = 0xFF // poison buffer to verify zeroing
+	}
+	n, err = reader.ReadAt(bufGap, 100)
+	if err != nil || n != 100 {
+		t.Fatalf("Expected to read 100 bytes of zeroes across dead zone, got n=%d, err=%v", n, err)
+	}
+	for i, b := range bufGap {
+		if b != 0 {
+			t.Fatalf("Expected byte at index %d to be synthesized zero, got %x", i, b)
+		}
+	}
+
+	// 3. Read healthy downstream: [200, 300)
+	bufDownstream := make([]byte, 100)
+	n, err = reader.ReadAt(bufDownstream, 200)
+	if err != nil || n != 100 {
+		t.Fatalf("Expected to read 100 bytes from downstream, got n=%d, err=%v", n, err)
+	}
+	if bufDownstream[0] != 0xBB {
+		t.Fatalf("Expected 0xBB in downstream data, got %x", bufDownstream[0])
+	}
+}
+
+func TestExponentialDeadZoneProbe(t *testing.T) {
+	// Corrupt sector from byte 0 to byte 300,000.
+	// First probe at +256KB (262,144) will fail (HTTP 500).
+	// Second probe at +1MB (1,048,576) will succeed (HTTP 206).
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		var start, end int64
+		_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+
+		if start < 300000 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/10000000", start, end))
+		w.WriteHeader(http.StatusPartialContent)
+		data := make([]byte, end-start+1)
+		_, _ = w.Write(data)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	readableOffset, err := probeNextReadableOffset(ctx, ts.URL, 0, 10000000, "TestAgent")
+	if err != nil {
+		t.Fatalf("Expected probe to find readable offset, got error: %v", err)
+	}
+
+	// +1MB hop from 0 is 1048576
+	if readableOffset != 1024*1024 {
+		t.Fatalf("Expected readable offset at +1MB (%d), got %d", 1024*1024, readableOffset)
 	}
 }
 

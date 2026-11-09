@@ -2026,6 +2026,193 @@ func TestYieldProgressiveBackoff(t *testing.T) {
 	}
 }
 
+func TestZeroProgressSuspensionAndBatonPass(t *testing.T) {
+	oldTimeout := zeroProgressSuspensionTimeout
+	zeroProgressSuspensionTimeout = 50 * time.Millisecond
+	defer func() {
+		zeroProgressSuspensionTimeout = oldTimeout
+	}()
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		queue:               make([]*PrehydrationTask, 0),
+	}
+	GlobalPrehydrationManager = pm
+
+	state := NewFileCacheState(
+		"ep1_stalled",
+		"http://upstream/ep1.mp4",
+		"/tmp/ep1_stalled.mp4",
+		"/tmp/ep1_stalled.part",
+		"/tmp/ep1_stalled.json",
+		"video/mp4",
+		"",
+		"",
+		10000,
+	)
+	state.IsPrehydrating = true
+	state.WriterActive = true
+	state.RangeSet.Add(0, 1000) // 10% downloaded, then hit corrupt block
+	state.LastProgressTimeNano = time.Now().Add(-200 * time.Millisecond).UnixNano()
+	state.NextURLs = []string{"http://upstream/ep2.mp4", "http://upstream/ep3.mp4"}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[state.Key] = state
+	GlobalRegistry.Lock.Unlock()
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, state.Key)
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// Execute zero progress suspension check
+	pm.checkZeroProgressSuspension()
+
+	state.Lock.Lock()
+	isYielding := state.IsYielding
+	writerActive := state.WriterActive
+	chainCleared := len(state.NextURLs) == 0
+	state.Lock.Unlock()
+
+	if !isYielding {
+		t.Fatalf("Expected stalled prehydration to transition to IsYielding=true")
+	}
+	if writerActive {
+		t.Fatalf("Expected WriterActive=false after zero-progress suspension")
+	}
+	if !chainCleared {
+		t.Fatalf("Expected NextURLs to be cleared on stalled episode")
+	}
+
+	// Verify baton was passed to NextURLs[0] (ep2) with ep3 as remaining chain
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if len(pm.queue) != 1 {
+		t.Fatalf("Expected 1 task in queue after baton pass, got %d", len(pm.queue))
+	}
+	task := pm.queue[0]
+	if task.TargetURL != "http://upstream/ep2.mp4" {
+		t.Fatalf("Expected baton pass to ep2, got %s", task.TargetURL)
+	}
+	if len(task.NextURLs) != 1 || task.NextURLs[0] != "http://upstream/ep3.mp4" {
+		t.Fatalf("Expected remaining chain [ep3], got %v", task.NextURLs)
+	}
+}
+
+func TestYieldSortingPrioritizesStalledFiles(t *testing.T) {
+	oldRes := GlobalConfig.GetPrehydrateCapacityReservation()
+	oldPrefetch := GlobalConfig.GetEnableEpisodePrehydration()
+	GlobalConfig.SetPrehydrateCapacityReservation(1)
+	GlobalConfig.SetEnableEpisodePrehydration(true)
+	defer func() {
+		GlobalConfig.SetPrehydrateCapacityReservation(oldRes)
+		GlobalConfig.SetEnableEpisodePrehydration(oldPrefetch)
+	}()
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+
+	liveStreams := 1
+	pm.latestCapacity = &ProviderCapacityReport{
+		Status:                 "ok",
+		TotalMaxStreams:        3,
+		TotalActiveStreams:     3,
+		TotalAvailableStreams:  0,
+		TargetAvailableStreams: 0,
+		LiveStreams:            &liveStreams,
+	}
+
+	// File 1: Stalled 90% file (frozen progress 10 minutes ago)
+	fsStalled := NewFileCacheState("stalled_file", "http://u/stalled", "/tmp/s.mp4", "/tmp/s.part", "/tmp/s.json", "video/mp4", "", "", 1000)
+	fsStalled.IsPrehydrating = true
+	fsStalled.WriterActive = true
+	fsStalled.RangeSet.Add(0, 900) // 90%
+	fsStalled.LastProgressTimeNano = time.Now().Add(-10 * time.Minute).UnixNano()
+
+	// File 2: Active 40% file (actively downloading, last byte 1s ago)
+	fsActive := NewFileCacheState("active_file", "http://u/active", "/tmp/a.mp4", "/tmp/a.part", "/tmp/a.json", "video/mp4", "", "", 1000)
+	fsActive.IsPrehydrating = true
+	fsActive.WriterActive = true
+	fsActive.RangeSet.Add(0, 400) // 40%
+	fsActive.LastProgressTimeNano = time.Now().Add(-1 * time.Second).UnixNano()
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[fsStalled.Key] = fsStalled
+	GlobalRegistry.Files[fsActive.Key] = fsActive
+	GlobalRegistry.Lock.Unlock()
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, fsStalled.Key)
+		delete(GlobalRegistry.Files, fsActive.Key)
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// Needed to yield = reservation (1) - available (0) = 1 file.
+	pm.checkYieldConditions()
+
+	fsStalled.Lock.Lock()
+	stalledYielded := fsStalled.IsYielding
+	fsStalled.Lock.Unlock()
+
+	fsActive.Lock.Lock()
+	activeYielded := fsActive.IsYielding
+	fsActive.Lock.Unlock()
+
+	if !stalledYielded {
+		t.Fatalf("Expected stalled 90%% file to yield first due to oldest progress age")
+	}
+	if activeYielded {
+		t.Fatalf("Expected active 40%% file to NOT yield because stalled file yielded first")
+	}
+}
+
+func TestPlayerPlaybackAdoptsChainAndPrunesPredecessor(t *testing.T) {
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		queue: []*PrehydrationTask{
+			{TargetURL: "http://upstream/ep2.mp4", NextURLs: []string{"http://upstream/ep3.mp4"}},
+		},
+	}
+
+	fsEp1 := NewFileCacheState("ep1", "http://upstream/ep1.mp4", "/tmp/ep1.mp4", "/tmp/ep1.part", "/tmp/ep1.json", "video/mp4", "", "", 1000)
+	fsEp1.NextURLs = []string{"http://upstream/ep2.mp4"}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[fsEp1.Key] = fsEp1
+	GlobalRegistry.Lock.Unlock()
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, fsEp1.Key)
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	// Viewer plays Episode 2 directly with chain [Episode 3]
+	pm.OnPlayerPlayback("http://upstream/ep2.mp4", []string{"http://upstream/ep3.mp4"})
+
+	// Verify Ep2 was pruned from prehydration queue
+	pm.mu.Lock()
+	qLen := len(pm.queue)
+	pm.mu.Unlock()
+	if qLen != 0 {
+		t.Fatalf("Expected ep2 to be pruned from prehydration queue, got %d items", qLen)
+	}
+
+	// Verify Ep1 has its NextURLs cleared
+	fsEp1.Lock.Lock()
+	ep1Chain := fsEp1.NextURLs
+	fsEp1.Lock.Unlock()
+	if len(ep1Chain) != 0 {
+		t.Fatalf("Expected ep1 NextURLs to be cleared, got %v", ep1Chain)
+	}
+}
+
 
 
 

@@ -401,6 +401,23 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			break
 		}
 
+		// Check if off falls within an unreadable dead zone; if so, synthesize zeroes immediately!
+		if gapEnd := r.state.CheckStalledGap(off); gapEnd > off {
+			toZero := int64(len(p))
+			if toZero > (gapEnd - off) {
+				toZero = gapEnd - off
+			}
+			for i := int64(0); i < toZero; i++ {
+				p[i] = 0
+			}
+			r.state.Lock.Lock()
+			delete(r.state.Starving, r.clientID)
+			delete(r.state.StarvingSince, r.clientID)
+			r.state.Lock.Unlock()
+			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
+			return int(toZero), nil
+		}
+
 		select {
 		case <-r.ctx.Done():
 			r.state.Lock.Lock()
@@ -414,11 +431,22 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		r.state.Lock.Lock()
 		if !r.state.WriterActive {
 			wasYielding := r.state.IsYielding
-			if wasYielding {
+			wasPrehydrating := r.state.IsPrehydrating
+			if wasYielding || wasPrehydrating {
 				r.state.IsYielding = false
+				r.state.IsPrehydrating = false
 			}
+			key := r.state.Key
 			r.state.Lock.Unlock()
-			log.Printf("[Reader] Upstream coordinator inactive for %s while offset %d is required. Resuscitation triggered.", r.state.Key, off)
+
+			if wasYielding || wasPrehydrating {
+				log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", key)
+				if GlobalPrehydrationManager != nil {
+					GlobalPrehydrationManager.OnPriorityUpgrade(key)
+				}
+			}
+
+			log.Printf("[Reader] Upstream coordinator inactive for %s while offset %d is required. Resuscitation triggered.", key, off)
 			StartCoordinator(r.state, nil)
 			r.state.Lock.Lock()
 		}
@@ -464,9 +492,13 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		toRead = avail
 	}
 
+	r.state.Lock.Lock()
+	lb := r.state.LiveBuffer
+	r.state.Lock.Unlock()
+
 	// 1. LiveBuffer Fast-Path: check in-memory buffer first for zero-copy playback
-	if r.state.LiveBuffer != nil {
-		if memN, ok := r.state.LiveBuffer.ReadAt(p[:toRead], off); ok && memN > 0 {
+	if lb != nil {
+		if memN, ok := lb.ReadAt(p[:toRead], off); ok && memN > 0 {
 			if memN < int(toRead) && (r.state.IsDiskMaterialized() || FileExists(r.state.PartPath) || FileExists(r.state.Path)) {
 				if f, ferr := r.getFile(); ferr == nil {
 					diskN, _ := f.ReadAt(p[memN:toRead], off+int64(memN))
