@@ -4299,6 +4299,46 @@ func TestExponentialDeadZoneProbe(t *testing.T) {
 	}
 }
 
+func TestLargeGapNeverZeroFilled(t *testing.T) {
+	state := NewFileCacheState(
+		"large_gap_test",
+		"http://localhost/dummy",
+		filepath.Join(GlobalConfig.CacheDir, "large_gap_test"),
+		filepath.Join(GlobalConfig.TmpDir, "large_gap_test.part"),
+		filepath.Join(GlobalConfig.TmpDir, "large_gap_test.json"),
+		"video/mp4",
+		"",
+		"",
+		100*1024*1024, // 100MB file
+	)
+
+	// Simulate tail prefetch at 98MB - 100MB (common at startup for MP4/MKV index)
+	state.RangeSet.Add(98*1024*1024, 100*1024*1024)
+
+	// Simulate Worker 2 at 50MB (player 2 seeking)
+	state.RangeSet.Add(50*1024*1024, 52*1024*1024)
+
+	// Simulate Player 1 at 12MB. Worker 1 stopped at 12MB.
+	// 1. Attempting to record a 38MB dead zone (12MB -> 50MB) must be rejected by MaxDeadZoneSkip
+	state.RecordStalledGap(12*1024*1024, 50*1024*1024)
+	if state.CheckStalledGap(12*1024*1024) != 0 {
+		t.Fatalf("Expected gap > 16MB to be rejected by RecordStalledGap")
+	}
+
+	// 2. Reader at 12MB must NOT jump across the 38MB gap or the 86MB gap to tail!
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	reader := NewCacheReader(ctx, state, nil)
+	defer reader.Close()
+
+	buf := make([]byte, 1024)
+	n, err := reader.ReadAt(buf, 12*1024*1024)
+	// It should block waiting on upstream data (timing out on context), NOT return zeroes!
+	if n != 0 || (err != context.DeadlineExceeded && err != context.Canceled) {
+		t.Fatalf("Expected reader to block on missing 12MB data without zero-filling to 50MB or tail, got n=%d err=%v", n, err)
+	}
+}
+
 
 
 

@@ -146,22 +146,28 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 	return s
 }
 
+// MaxDeadZoneSkip is the absolute maximum byte span the reader is allowed to zero-fill (16MB).
+// Any unreadable or missing span larger than 16MB is treated as an error, never synthesized as zeroes.
+const MaxDeadZoneSkip = 16 * 1024 * 1024
+
 // CheckStalledGap checks if offset falls within any recorded dead zone [gapStart, gapEnd).
-// Returns the gapEnd offset if true, or 0 if not stalled.
+// Returns the gapEnd offset if true, or 0 if not stalled or if the gap exceeds MaxDeadZoneSkip.
 func (s *FileCacheState) CheckStalledGap(offset int64) int64 {
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
 	for gStart, gEnd := range s.StalledGaps {
 		if offset >= gStart && offset < gEnd {
-			return gEnd
+			if (gEnd - gStart) <= MaxDeadZoneSkip {
+				return gEnd
+			}
 		}
 	}
 	return 0
 }
 
-// RecordStalledGap records an unreadable sector [start, end)
+// RecordStalledGap records an unreadable sector [start, end), strictly capped at MaxDeadZoneSkip.
 func (s *FileCacheState) RecordStalledGap(start, end int64) {
-	if start >= end {
+	if start >= end || (end-start) > MaxDeadZoneSkip {
 		return
 	}
 	s.Lock.Lock()
