@@ -289,7 +289,7 @@ func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
 
 // ShouldYieldPrehydration checks if live streams have encroached on the capacity reservation.
 // Because the running prehydration worker is already counted in active_streams, available represents
-// the remaining live headroom. Yield when available < reservation.
+// the remaining live headroom. Yield when available < reservation AND active human playback exists.
 func (pm *PrehydrationManager) ShouldYieldPrehydration(targetURL string) bool {
 	reservation := 1
 	if GlobalConfig != nil {
@@ -309,7 +309,35 @@ func (pm *PrehydrationManager) ShouldYieldPrehydration(targetURL string) bool {
 		available = report.TargetAvailableStreams
 	}
 
-	return available < reservation
+	if available >= reservation {
+		return false
+	}
+
+	// Check if active playback sessions exist (Live TV/Timeshift in Dispatcharr or active VOD clients in Streamcache)
+	hasActivePlayback := false
+	if report.LiveStreams == nil {
+		// Legacy / mock report where live stream breakdown was not provided
+		hasActivePlayback = true
+	} else if *report.LiveStreams > 0 || report.LiveClients > 0 {
+		hasActivePlayback = true
+	}
+
+	if !hasActivePlayback && GlobalRegistry != nil {
+		GlobalRegistry.Lock.RLock()
+		for _, fs := range GlobalRegistry.Files {
+			fs.Lock.Lock()
+			if len(fs.Clients) > 0 {
+				hasActivePlayback = true
+			}
+			fs.Lock.Unlock()
+			if hasActivePlayback {
+				break
+			}
+		}
+		GlobalRegistry.Lock.RUnlock()
+	}
+
+	return hasActivePlayback
 }
 
 // checkYieldConditions is called on every capacity poll to yield active prehydration workers if live streams started.
@@ -326,13 +354,20 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 		return
 	}
 	available := report.TotalAvailableStreams
+	liveStreams := 0
+	hasExplicitLiveStreams := false
+	if report.LiveStreams != nil {
+		liveStreams = *report.LiveStreams
+		hasExplicitLiveStreams = true
+	}
+	liveClients := report.LiveClients
 	pm.mu.RUnlock()
 
 	if available >= reservation {
 		return
 	}
 
-	// Capacity tight: yield running prehydrations
+	// Capacity tight: check for active playback sessions (Live TV or active VOD clients)
 	GlobalRegistry.Lock.RLock()
 	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
 	for _, fs := range GlobalRegistry.Files {
@@ -340,13 +375,26 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 	}
 	GlobalRegistry.Lock.RUnlock()
 
+	hasActiveVODPlayback := false
 	var prehydratingFiles []*FileCacheState
 	for _, fs := range files {
 		fs.Lock.Lock()
-		if fs.IsPrehydrating && len(fs.Clients) == 0 && !fs.IsYielding && fs.WriterActive {
+		if len(fs.Clients) > 0 {
+			hasActiveVODPlayback = true
+		} else if fs.IsPrehydrating && len(fs.Clients) == 0 && !fs.IsYielding && fs.WriterActive {
 			prehydratingFiles = append(prehydratingFiles, fs)
 		}
 		fs.Lock.Unlock()
+	}
+
+	// Only yield if real human playback is competing for capacity:
+	// If live streams/clients are active, or an active VOD client is playing in Streamcache,
+	// or if the capacity report does not specify live breakdown (legacy/fallback).
+	hasActivePlayback := (!hasExplicitLiveStreams) || liveStreams > 0 || liveClients > 0 || hasActiveVODPlayback
+	if !hasActivePlayback {
+		// All active streams belong to background prehydrations or retrying workers.
+		// Never yield prehydrations to themselves!
+		return
 	}
 
 	neededToYield := reservation - available
@@ -355,8 +403,8 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 		if yieldedCount >= neededToYield {
 			break
 		}
-		log.Printf("[Prehydration] Provider capacity tight (Available: %d, Reserved: %d). Yielding prehydration: %s",
-			available, reservation, fs.Key)
+		log.Printf("[Prehydration] Provider capacity tight (Available: %d, Reserved: %d, LiveStreams: %d, ActiveVOD: %v). Yielding prehydration: %s",
+			available, reservation, liveStreams, hasActiveVODPlayback, fs.Key)
 		pm.YieldState(fs, "Live stream capacity reservation")
 		yieldedCount++
 	}
@@ -376,7 +424,22 @@ func (pm *PrehydrationManager) YieldState(state *FileCacheState, reason string) 
 	if GlobalConfig != nil {
 		backoff = GlobalConfig.GetPrehydrateYieldBackoff()
 	}
-	state.YieldCooldownUntil = time.Now().Add(backoff)
+
+	// Progressive backoff for rapid channel surfing:
+	// If re-yielded within 2x base backoff (60s), increase backoff multiplier
+	if !state.LastYieldTime.IsZero() && time.Since(state.LastYieldTime) < 2*backoff {
+		state.YieldCount++
+	} else {
+		state.YieldCount = 1
+	}
+	state.LastYieldTime = time.Now()
+
+	multiplier := 1 << (state.YieldCount - 1)
+	if multiplier > 4 {
+		multiplier = 4 // Max 4x backoff (e.g. 30s -> 60s -> 120s max)
+	}
+	actualBackoff := backoff * time.Duration(multiplier)
+	state.YieldCooldownUntil = time.Now().Add(actualBackoff)
 	state.WriterActive = false
 	state.Lock.Unlock()
 
@@ -393,8 +456,8 @@ func (pm *PrehydrationManager) YieldState(state *FileCacheState, reason string) 
 	}
 	pm.mu.Unlock()
 
-	log.Printf("[Prehydration] File %s transitioned to Yielding (%s). Upstream socket closed; .part blocks preserved.",
-		state.Key, reason)
+	log.Printf("[Prehydration] File %s transitioned to Yielding (cooldown %s until %s, attempt #%d, %s). Upstream socket closed; .part blocks preserved.",
+		state.Key, actualBackoff, state.YieldCooldownUntil.Format(time.RFC3339), state.YieldCount, reason)
 
 	if GlobalLogBroker != nil {
 		go GlobalLogBroker.BroadcastStateUpdate()

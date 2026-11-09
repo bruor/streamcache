@@ -400,8 +400,16 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 		spawnWorker(initialTargetOffset)
 	}
 
+	consecutiveStallBreakouts := 0
+	lastTotalBytesDownloaded := atomic.LoadInt64(&state.TotalBytesDownloaded)
+
 	// Main Coordinator Orchestration Loop
 	for {
+		currentTotalBytes := atomic.LoadInt64(&state.TotalBytesDownloaded)
+		if currentTotalBytes > lastTotalBytesDownloaded {
+			consecutiveStallBreakouts = 0
+			lastTotalBytesDownloaded = currentTotalBytes
+		}
 		// Sniff check for container optimization (skip during prehydration)
 		state.Lock.Lock()
 		isPrehydrating := state.IsPrehydrating
@@ -593,6 +601,44 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 						}
 					}
 					state.Lock.Unlock()
+
+					// Teardown cooldown: give Dispatcharr and upstream provider time to drop cleanly
+					// before establishing a fresh connection.
+					stallCooldown := 5 * time.Second
+					if GlobalConfig != nil {
+						stallCooldown = GlobalConfig.GetStallTeardownCooldown()
+					}
+					consecutiveStallBreakouts++
+					multiplier := consecutiveStallBreakouts
+					if multiplier > 3 {
+						multiplier = 3
+					}
+					actualCooldown := stallCooldown * time.Duration(multiplier)
+					log.Printf("[Coord] Starvation breakout teardown cooldown (%s, consecutive #%d) for %s before fresh upstream reconnect",
+						actualCooldown, consecutiveStallBreakouts, state.Key)
+
+					coordinatorSleepMu.RLock()
+					sleepFn := coordinatorSleepFn
+					coordinatorSleepMu.RUnlock()
+					if sleepFn != nil {
+						sleepFn(actualCooldown)
+					} else {
+						timer := time.NewTimer(actualCooldown)
+						select {
+						case <-timer.C:
+						case <-parentCtx.Done():
+							timer.Stop()
+							return
+						}
+					}
+
+					state.Lock.Lock()
+					active := state.WriterActive
+					isYielding := state.IsYielding
+					state.Lock.Unlock()
+					if !active || isYielding || parentCtx.Err() != nil {
+						continue
+					}
 
 					spawnWorker(sb)
 					continue
