@@ -1071,7 +1071,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 
 	var availableFreeable int64
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
 			continue
 		}
 		if !activeKeys[entry.Name()] {
@@ -1127,7 +1127,7 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 	var files []fileInfo
 
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
 			continue
 		}
 		path := filepath.Join(cacheDir, entry.Name())
@@ -1173,8 +1173,9 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 		}
 
 		// Prevent evicting files that are actively being downloaded or streamed
+		baseKey := strings.TrimSuffix(file.Name, ".part")
 		r.Lock.RLock()
-		_, active := r.Files[file.Name]
+		_, active := r.Files[baseKey]
 		r.Lock.RUnlock()
 
 		if active {
