@@ -245,7 +245,8 @@ func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Head
 			return size, ctype, etag, lm, notModified, nil
 		}
 		if isCatastrophicProbeError(err) {
-			log.Printf("[Probe] Range probe hit catastrophic failure on host %s: %v. Aborting immediately.", originalHost, err)
+			desc := describeCatastrophicProbeError(err)
+			log.Printf("[Probe] Range probe hit catastrophic failure on host %s [%s]: %v. Aborting immediately.", originalHost, desc, err)
 			return 0, "", "", "", false, err
 		}
 		log.Printf("[Probe] Range probe failed for host %s: %v. Trying standard GET fallback...", originalHost, err)
@@ -259,7 +260,8 @@ func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Head
 		return size, ctype, etag, lm, notModified, nil
 	}
 	if isCatastrophicProbeError(err) {
-		log.Printf("[Probe] Standard probe hit catastrophic failure on host %s: %v. Aborting immediately.", originalHost, err)
+		desc := describeCatastrophicProbeError(err)
+		log.Printf("[Probe] Standard probe hit catastrophic failure on host %s [%s]: %v. Aborting immediately.", originalHost, desc, err)
 		return 0, "", "", "", false, err
 	}
 
@@ -445,4 +447,30 @@ func isCatastrophicProbeError(err error) bool {
 		strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "context deadline exceeded") ||
 		strings.Contains(msg, "dial tcp")
+}
+
+func describeCatastrophicProbeError(err error) string {
+	if err == nil {
+		return "unknown"
+	}
+	msg := err.Error()
+	if isHTMLProbeError(err) {
+		return "HTML block page returned (CDN challenge or redirect)"
+	}
+	if isPermanentProbeError(err) {
+		return "permanent HTTP error (file not found/expired upstream)"
+	}
+	if strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "timeout awaiting response headers") {
+		return "upstream response header timeout (remote storage or gateway latency exceeded deadline)"
+	}
+	if strings.Contains(msg, "connection refused") {
+		return "connection refused (upstream host closed or rejecting traffic)"
+	}
+	if strings.Contains(msg, "no such host") {
+		return "DNS resolution failure"
+	}
+	if strings.Contains(msg, "dial tcp") {
+		return "TCP dial/handshake failure"
+	}
+	return "unrecoverable transport/network failure"
 }

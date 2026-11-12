@@ -951,15 +951,12 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 	pm.prehydrationsStartedSinceLastPoll++
 	pm.mu.Unlock()
 
-	// Probe upstream for headers (with 5s timeout to avoid tying up workers if provider is at capacity)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
+	// Probe upstream for headers (governed by transport response header timeout)
 	header := make(http.Header)
 	header.Set("User-Agent", GlobalConfig.GetUpstreamUserAgent())
 
 	log.Printf("[Prehydration] Probing upstream for upcoming episode: %s", targetURL)
-	totalSize, contentType, etag, lastMod, _, err := probeUpstream(ctx, targetURL, header, nil)
+	totalSize, contentType, etag, lastMod, _, err := probeUpstream(context.Background(), targetURL, header, nil)
 	if err != nil || totalSize <= 0 {
 		pm.mu.Lock()
 		if pm.prehydrationsStartedSinceLastPoll > 0 {
