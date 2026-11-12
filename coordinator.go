@@ -318,6 +318,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			}
 			if isCurrentGen {
 				state.WriterActive = false
+				// Reset Sniffed on incomplete exit so a restarted coordinator
+				// re-sniffs and schedules uncached tail probes.
+				state.Sniffed = false
 			}
 			state.Lock.Unlock()
 
@@ -373,9 +376,16 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 
 		state.Lock.Lock()
 		isPrehydrating := state.IsPrehydrating
+		hasStarving := false
+		for _, off := range state.Starving {
+			if !state.RangeSet.Contains(off) {
+				hasStarving = true
+				break
+			}
+		}
 		state.Lock.Unlock()
 
-		if isPrehydrating && len(state.ActiveWorkers) >= 1 {
+		if isPrehydrating && !hasStarving && len(state.ActiveWorkers) >= 1 {
 			return
 		}
 
@@ -548,12 +558,13 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 		isPrehydrating = state.IsPrehydrating
 		if pendingTail > 0 && GlobalConfig.GetMaxUpstreamWorkers() > 1 && !isPrehydrating {
 			state.PendingTailPrefetchOffset = -1
+			alreadyCached := state.RangeSet.Contains(pendingTail)
 			state.Lock.Unlock()
-			log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at offset %d", pendingTail)
-			spawnTailPrefetchWorker(pendingTail)
+			if !alreadyCached {
+				log.Printf("[Coord] Sniffed non-optimized container. Spawning parallel helper worker to pre-fetch metadata starting at offset %d", pendingTail)
+				spawnTailPrefetchWorker(pendingTail)
+			}
 			state.Lock.Lock()
-		} else if isPrehydrating {
-			state.PendingTailPrefetchOffset = -1
 		}
 
 		// Find all starving offsets that are not covered
@@ -1498,11 +1509,11 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 		state.Lock.Unlock()
 		return
 	}
-	state.Sniffed = true
 	lb := state.LiveBuffer
+	partPath := state.PartPath
+	finalPath := state.Path
 	state.Lock.Unlock()
 
-	log.Printf("[Coord] Initial header bytes available. Sniffing media container...")
 	buf := make([]byte, 128*1024)
 	n := 0
 	if lb != nil {
@@ -1511,7 +1522,25 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 	if n == 0 && file != nil {
 		n, _ = file.ReadAt(buf, 0)
 	}
+	if n == 0 {
+		for _, p := range []string{partPath, finalPath} {
+			if p == "" {
+				continue
+			}
+			if f, err := os.Open(p); err == nil {
+				n, _ = f.ReadAt(buf, 0)
+				_ = f.Close()
+				if n > 0 {
+					break
+				}
+			}
+		}
+	}
 	if n > 0 {
+		state.Lock.Lock()
+		state.Sniffed = true
+		state.Lock.Unlock()
+		log.Printf("[Coord] Initial header bytes available. Sniffing media container...")
 		data := buf[:n]
 		isFastStart := false
 		moovOffset := int64(0)

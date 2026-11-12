@@ -764,7 +764,7 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 
 	log.Printf("[Prehydration] Client disconnected from %s. Downshifting to prehydration mode.", key)
 
-	if !pm.CanStartPrehydration(targetURL) {
+	if pm.ShouldYieldPrehydration(targetURL) {
 		pm.YieldState(state, "Capacity tight on client disconnect")
 	} else {
 		pm.mu.Lock()
