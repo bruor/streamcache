@@ -1725,7 +1725,7 @@
                         ` : ''}
                         <div class="download-meta-card">
                             <span class="download-meta-label">Upstream Workers</span>
-                            <span class="download-meta-value" style="color: var(--accent-cyan); font-weight: 600;">${fileData.active_workers || 1} / ${fileData.max_workers || 2}</span>
+                            <span class="download-meta-value" style="color: var(--accent-cyan); font-weight: 600;">${fileData.active_workers ?? 0} / ${fileData.max_workers || 2}</span>
                         </div>
                         <div class="download-meta-card">
                             <span class="download-meta-label">Active Clients</span>
@@ -1782,6 +1782,8 @@
                         ranges: file.ranges || [],
                         downloaded_bytes: file.downloaded_bytes || 0,
                         active_clients: file.active_clients,
+                        active_workers: file.active_workers ?? 0,
+                        max_workers: file.max_workers || 2,
                         starving_queue: file.starving_queue,
                         client_positions: file.client_positions || [],
                         download_speed: file.download_speed,
@@ -1804,6 +1806,8 @@
                     fileData.ranges = file.ranges || [];
                     fileData.downloaded_bytes = file.downloaded_bytes || 0;
                     fileData.active_clients = file.active_clients;
+                    fileData.active_workers = file.active_workers ?? 0;
+                    fileData.max_workers = file.max_workers || 2;
                     fileData.starving_queue = file.starving_queue;
                     fileData.client_positions = file.client_positions || [];
                     fileData.download_speed = file.download_speed;
