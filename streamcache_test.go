@@ -1652,6 +1652,28 @@ func TestProbeCatastrophicAbort(t *testing.T) {
 	}
 }
 
+func TestDescribeCatastrophicProbeError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("unexpected status code: 404"), "permanent HTTP error (file not found/expired upstream)"},
+		{fmt.Errorf("Get \"http://test\": context deadline exceeded"), "upstream response header timeout (remote storage or gateway latency exceeded deadline)"},
+		{fmt.Errorf("dial tcp: connection refused"), "connection refused (upstream host closed or rejecting traffic)"},
+		{fmt.Errorf("no such host: foo.bar"), "DNS resolution failure"},
+		{fmt.Errorf("upstream returned HTML content type \"text/html\""), "HTML block page returned (CDN challenge or redirect)"},
+		{fmt.Errorf("dial tcp: i/o timeout"), "upstream response header timeout (remote storage or gateway latency exceeded deadline)"},
+		{nil, "unknown"},
+	}
+
+	for _, tc := range tests {
+		got := describeCatastrophicProbeError(tc.err)
+		if got != tc.want {
+			t.Errorf("describeCatastrophicProbeError(%v) = %q; want %q", tc.err, got, tc.want)
+		}
+	}
+}
+
 func TestProbeFailureNegativeCaching(t *testing.T) {
 	InitRegistry()
 
