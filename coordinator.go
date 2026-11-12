@@ -513,10 +513,26 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 		state.WorkersLock.Unlock()
 
 		if activeCount == 0 {
-			gapStart, _, found := state.RangeSet.FindNextGap(0, state.TotalSize)
-			if found {
-				log.Printf("[Coord] No active workers but hydration incomplete. Spawning worker at offset %d", gapStart)
-				spawnWorker(gapStart)
+			var keepAliveTarget int64 = -1
+			state.Lock.Lock()
+			for _, sb := range state.Starving {
+				if !state.RangeSet.Contains(sb) {
+					keepAliveTarget = sb
+					break
+				}
+			}
+			state.Lock.Unlock()
+
+			if keepAliveTarget == -1 {
+				gapStart, _, found := state.RangeSet.FindNextGap(0, state.TotalSize)
+				if found {
+					keepAliveTarget = gapStart
+				}
+			}
+
+			if keepAliveTarget != -1 {
+				log.Printf("[Coord] No active workers but hydration incomplete. Spawning worker at offset %d", keepAliveTarget)
+				spawnWorker(keepAliveTarget)
 			}
 		}
 

@@ -4339,6 +4339,74 @@ func TestLargeGapNeverZeroFilled(t *testing.T) {
 	}
 }
 
+func TestCoordinatorResuscitationAtStarvingOffset(t *testing.T) {
+	requestedOffsets := make(chan int64, 10)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		var start, end int64
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err == nil {
+			select {
+			case requestedOffsets <- start:
+			default:
+			}
+		} else if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-", &start); err == nil {
+			select {
+			case requestedOffsets <- start:
+			default:
+			}
+		}
+		w.Header().Set("Content-Range", "bytes 0-104857599/104857600")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 64*1024))
+	}))
+	defer ts.Close()
+
+	key := "test_resuscitate_starve"
+	state := NewFileCacheState(
+		key,
+		ts.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.TmpDir, key+".json"),
+		"video/mp4",
+		"",
+		"",
+		104857600, // 100MB
+	)
+	defer func() {
+		os.Remove(state.Path)
+		os.Remove(state.PartPath)
+		os.Remove(state.MetaPath)
+	}()
+
+	// Simulate completed probe at 0-384KB
+	state.RangeSet.Add(0, 384*1024)
+	state.WriterActive = false
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	reader := NewCacheReader(ctx, state, nil)
+	defer reader.Close()
+
+	// Player resumes at 10MB
+	targetSeekOffset := int64(10 * 1024 * 1024)
+	go func() {
+		buf := make([]byte, 1024)
+		_, _ = reader.ReadAt(buf, targetSeekOffset)
+	}()
+
+	// Worker should be spawned immediately at 10MB, NOT at gap 384KB!
+	select {
+	case startOffset := <-requestedOffsets:
+		if startOffset != targetSeekOffset {
+			t.Fatalf("Expected coordinator resuscitation to spawn worker at starving offset %d, got %d", targetSeekOffset, startOffset)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Timed out waiting for worker to connect")
+	}
+}
+
 
 
 
