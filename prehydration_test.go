@@ -180,7 +180,7 @@ func TestDownshiftOnDisconnect(t *testing.T) {
 			Status:                 "ok",
 			TotalMaxStreams:        2,
 			TotalActiveStreams:     1,
-			TotalAvailableStreams:  1, // At reservation limit -> will yield on downshift
+			TotalAvailableStreams:  1, // At reservation limit; already-running worker is self-accounted so downshift must NOT yield
 			TargetAvailableStreams: 1,
 		},
 	}
@@ -202,18 +202,44 @@ func TestDownshiftOnDisconnect(t *testing.T) {
 	state.IsPrehydrating = false
 	state.RangeSet.Add(0, 50*1024*1024)
 
-	// Simulate client disconnect downshift
+	// Simulate client disconnect downshift at reservation limit (avail == reservation)
 	pm.OnDownshift(state)
 
 	if !state.IsPrehydrating {
 		t.Fatalf("Expected state.IsPrehydrating=true after client disconnect")
 	}
-	if !state.IsYielding {
-		t.Fatalf("Expected state.IsYielding=true because available capacity is at reservation limit")
+	if state.IsYielding {
+		t.Fatalf("Expected state.IsYielding=false at reservation limit because the running worker is self-accounted")
 	}
 	// Verify .part file on disk was NOT deleted
 	if !FileExists(partPath) {
 		t.Fatalf("Expected .part file to be preserved on disconnect downshift")
+	}
+
+	// Now drop available streams below reservation limit (0 < 1) -> must yield on disconnect
+	pm.mu.Lock()
+	pm.latestCapacity.TotalAvailableStreams = 0
+	pm.mu.Unlock()
+
+	state2 := NewFileCacheState(
+		"movie2.mkv",
+		"http://dispatcharr:9191/proxy/vod/movie/456",
+		filepath.Join(tmpDir, "movie2.mkv"),
+		filepath.Join(tmpDir, "movie2.mkv.part"),
+		filepath.Join(tmpDir, "movie2.mkv.json"),
+		"video/mp4",
+		"",
+		"",
+		100*1024*1024,
+	)
+	state2.IsPrehydrating = false
+	pm.OnDownshift(state2)
+
+	if !state2.IsPrehydrating {
+		t.Fatalf("Expected state2.IsPrehydrating=true after client disconnect")
+	}
+	if !state2.IsYielding {
+		t.Fatalf("Expected state2.IsYielding=true when available capacity (0) is strictly below reservation limit")
 	}
 }
 
@@ -1384,6 +1410,16 @@ func TestYieldedCoordinatorPreservesPartFileAndRegistryEntry(t *testing.T) {
 		CancelCoordinator(fs)
 		fs.coordMu.Lock()
 		fs.coordMu.Unlock()
+		deadline := time.Now().Add(1 * time.Second)
+		for time.Now().Before(deadline) {
+			fs.WorkersLock.Lock()
+			active := len(fs.ActiveWorkers)
+			fs.WorkersLock.Unlock()
+			if active == 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 		GlobalRegistry.Lock.Lock()
 		delete(GlobalRegistry.Files, key)
 		GlobalRegistry.Lock.Unlock()

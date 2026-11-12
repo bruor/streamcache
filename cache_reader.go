@@ -249,6 +249,7 @@ func (r *CacheReader) Close() error {
 	}
 	r.state.Lock.Unlock()
 
+	GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
 	GlobalRegistry.UnregisterConnection(r.clientID)
 
 	if isProbe && remainingClients == 0 {
@@ -423,8 +424,14 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			delete(r.state.Starving, r.clientID)
 			delete(r.state.StarvingSince, r.clientID)
 			r.state.Lock.Unlock()
+			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
 			return 0, r.ctx.Err()
 		default:
+		}
+
+		minThreshold := int64(5 * 1024 * 1024)
+		if GlobalConfig != nil {
+			minThreshold = GlobalConfig.GetMinReadThresholdBytes()
 		}
 
 		r.state.Lock.Lock()
@@ -436,31 +443,49 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 		r.state.Starving[r.clientID] = off
 
-		if !r.state.WriterActive {
+		isTailSeek := r.state.TotalSize > 0 && off >= (r.state.TotalSize-2*1024*1024)
+		isMidSeek := off >= minThreshold && !isTailSeek
+		needsResuscitation := !r.state.WriterActive
+		shouldUpgrade := (needsResuscitation || isMidSeek) && (r.state.IsYielding || r.state.IsPrehydrating || r.state.IsProbe)
+
+		if needsResuscitation || shouldUpgrade {
 			wasYielding := r.state.IsYielding
 			wasPrehydrating := r.state.IsPrehydrating
 			wasProbe := r.state.IsProbe
-			if wasYielding || wasPrehydrating || wasProbe {
+			if shouldUpgrade {
 				r.state.IsYielding = false
 				r.state.IsPrehydrating = false
 				r.state.IsProbe = false
 			}
 			key := r.state.Key
+			totalSize := r.state.TotalSize
+			isDiskMat := r.state.DiskMaterialized
 			r.state.Lock.Unlock()
 
-			if wasProbe && GlobalRegistry != nil {
-				GlobalRegistry.UnregisterProbeBuffer(key)
-			}
-
-			if wasYielding || wasPrehydrating || wasProbe {
-				log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", key)
-				if GlobalPrehydrationManager != nil {
-					GlobalPrehydrationManager.OnPriorityUpgrade(key)
+			if shouldUpgrade {
+				if wasProbe && GlobalRegistry != nil {
+					GlobalRegistry.UnregisterProbeBuffer(key)
+				}
+				if isMidSeek && !isDiskMat {
+					if GlobalRegistry != nil && totalSize > 0 {
+						GlobalRegistry.PreEvict(totalSize)
+					}
+					_ = r.state.MaterializeDiskFile()
+				}
+				if wasYielding || wasPrehydrating || wasProbe {
+					log.Printf("[Server] Priority Upgrade: File %s upgraded from prehydration/yielding to Live Playback!", key)
+					if GlobalPrehydrationManager != nil {
+						GlobalPrehydrationManager.OnPriorityUpgrade(key)
+					}
 				}
 			}
 
-			log.Printf("[Reader] Upstream coordinator inactive for %s while offset %d is required. Resuscitation triggered.", key, off)
-			StartCoordinator(r.state, nil)
+			if needsResuscitation {
+				log.Printf("[Reader] Upstream coordinator inactive for %s while offset %d is required. Resuscitation triggered.", key, off)
+				StartCoordinator(r.state, nil)
+			} else if shouldUpgrade {
+				r.state.SetUpstreamStatus("Downloading")
+			}
 			r.state.Lock.Lock()
 		}
 
@@ -488,6 +513,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			delete(r.state.Starving, r.clientID)
 			delete(r.state.StarvingSince, r.clientID)
 			r.state.Lock.Unlock()
+			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
 			return 0, r.ctx.Err()
 		}
 	}

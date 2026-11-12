@@ -4429,6 +4429,419 @@ func TestCoordinatorResuscitationAtStarvingOffset(t *testing.T) {
 	}
 }
 
+func buildTestNonFaststartMkvHeader(totalSize, cuesRelOffset int64, padSize int) ([]byte, int64) {
+	ebmlHeader := makeEbmlElement(ID_EBML, []byte{0x42, 0x86, 0x81, 0x01})
+	seekID := makeEbmlElement(ID_SEEKID, []byte{0x1C, 0x53, 0xBB, 0x6B})
+	v := uint32(cuesRelOffset)
+	seekPos := makeEbmlElement(ID_SEEKPOS, []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)})
+	seek := makeEbmlElement(ID_SEEK, append(seekID, seekPos...))
+	seekHead := makeEbmlElement(ID_SEEKHEAD, seek)
+
+	segmentHeader := append(makeVintID(ID_SEGMENT), makeVint(totalSize-64)...)
+	segmentDataStart := int64(len(ebmlHeader) + len(segmentHeader))
+	cuesAbsOffset := segmentDataStart + cuesRelOffset
+
+	header := append(ebmlHeader, segmentHeader...)
+	header = append(header, seekHead...)
+	if len(header) < padSize {
+		padded := make([]byte, padSize)
+		copy(padded, header)
+		header = padded
+	}
+	return header, cuesAbsOffset
+}
+
+func TestProbeThenMidFileSeekSpawnsWorkersAndTailProbe(t *testing.T) {
+	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
+	GlobalConfig.MaxUpstreamWorkers = 2
+	defer func() { GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers }()
+
+	const totalSize = int64(24 * 1024 * 1024)
+	const cuesRelOffset = int64(23 * 1024 * 1024)
+	headerData, cuesAbsOffset := buildTestNonFaststartMkvHeader(totalSize, cuesRelOffset, 256*1024)
+	midSeekOffset := totalSize / 2 // 12MB
+
+	var mu sync.Mutex
+	var requestedStarts []int64
+	releaseW1 := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(releaseW1) }) }
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var start, end int64
+		end = -1
+		rangeHeader := r.Header.Get("Range")
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+			_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+		}
+
+		mu.Lock()
+		requestedStarts = append(requestedStarts, start)
+		mu.Unlock()
+
+		if start == 0 {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", totalSize-1, totalSize))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(headerData)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			// Keep Worker 1 open/slow after initial header so WriterActive remains true during seek
+			select {
+			case <-releaseW1:
+			case <-r.Context().Done():
+			}
+			return
+		}
+
+		chunkEnd := start + 512*1024 - 1
+		if end >= start && end < chunkEnd {
+			chunkEnd = end
+		}
+		if chunkEnd >= totalSize {
+			chunkEnd = totalSize - 1
+		}
+		chunkLen := int(chunkEnd - start + 1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, chunkEnd, totalSize))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", chunkLen))
+		w.WriteHeader(http.StatusPartialContent)
+		payload := make([]byte, chunkLen)
+		for i := range payload {
+			payload[i] = byte((start + int64(i)) & 0xFF)
+		}
+		_, _ = w.Write(payload)
+	}))
+	defer ts.Close()
+	defer closeRelease()
+
+	key := "test_probe_then_mid_seek"
+	state := NewFileCacheState(
+		key,
+		ts.URL,
+		filepath.Join(GlobalConfig.CacheDir, key),
+		filepath.Join(GlobalConfig.TmpDir, key+".part"),
+		filepath.Join(GlobalConfig.TmpDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		totalSize,
+	)
+	state.IsPrehydrating = true // Probe gate starts file in probe/prehydration mode
+	defer func() {
+		closeRelease()
+		CancelCoordinator(state)
+		deadline := time.Now().Add(1 * time.Second)
+		for time.Now().Before(deadline) {
+			state.WorkersLock.Lock()
+			active := len(state.ActiveWorkers)
+			state.WorkersLock.Unlock()
+			if active == 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		ts.Close()
+		os.Remove(state.Path)
+		os.Remove(state.PartPath)
+		os.Remove(state.MetaPath)
+	}()
+
+	// Step 1: Client 1 opens a <5MB probe at offset 0 and disconnects.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer probeCancel()
+	probeReader := NewCacheReader(probeCtx, state, nil)
+	probeBuf := make([]byte, 128*1024)
+	n, err := io.ReadFull(io.NewSectionReader(probeReader, 0, int64(len(probeBuf))), probeBuf)
+	if err != nil || n != len(probeBuf) {
+		t.Fatalf("Probe ReadFull failed: n=%d err=%v", n, err)
+	}
+	probeReader.Close()
+	probeCancel()
+
+	state.Lock.Lock()
+	stillPrehydrating := state.IsPrehydrating
+	state.Lock.Unlock()
+	if !stillPrehydrating {
+		t.Fatalf("Expected <5MB probe read to preserve IsPrehydrating=true (probe gate)")
+	}
+
+	// Step 2: Client 2 immediately seeks to 50% (12MB) while Worker 1 is still active.
+	seekCtx, seekCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer seekCancel()
+	seekReader := NewCacheReader(seekCtx, state, nil)
+	defer seekReader.Close()
+
+	seekBuf := make([]byte, 64*1024)
+	n, err = io.ReadFull(io.NewSectionReader(seekReader, midSeekOffset, int64(len(seekBuf))), seekBuf)
+	if err != nil || n != len(seekBuf) {
+		t.Fatalf("Mid-file seek ReadFull failed: n=%d err=%v", n, err)
+	}
+	for i := 0; i < 64; i++ {
+		want := byte((midSeekOffset + int64(i)) & 0xFF)
+		if seekBuf[i] != want {
+			t.Fatalf("Seek byte mismatch at +%d: got %d want %d", i, seekBuf[i], want)
+		}
+	}
+
+	state.Lock.Lock()
+	upgraded := !state.IsPrehydrating
+	state.Lock.Unlock()
+	if !upgraded {
+		t.Fatalf("Expected mid-file seek at %d to upgrade IsPrehydrating to false", midSeekOffset)
+	}
+
+	// Step 3: Release Worker 1 if needed so Worker slots are free, then verify MKV Cues tail probe caches cuesAbsOffset.
+	deadline := time.Now().Add(3 * time.Second)
+	tailCached := false
+	for time.Now().Before(deadline) {
+		if state.RangeSet.Contains(cuesAbsOffset) {
+			tailCached = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !tailCached {
+		mu.Lock()
+		reqs := append([]int64(nil), requestedStarts...)
+		mu.Unlock()
+		t.Fatalf("Expected MKV Cues tail probe at offset %d to be cached after mid-file seek upgrade; upstream requests=%v", cuesAbsOffset, reqs)
+	}
+}
+
+func TestLivePlaybackDownshiftThenMidFileSeekSpawnsSecondWorkerAndTailProbe(t *testing.T) {
+	oldMaxWorkers := GlobalConfig.MaxUpstreamWorkers
+	GlobalConfig.MaxUpstreamWorkers = 2
+	defer func() { GlobalConfig.MaxUpstreamWorkers = oldMaxWorkers }()
+
+	const totalSize = int64(24 * 1024 * 1024)
+	const cuesRelOffset = int64(23 * 1024 * 1024)
+	headerData, cuesAbsOffset := buildTestNonFaststartMkvHeader(totalSize, cuesRelOffset, 256*1024)
+	midSeekOffset := totalSize / 2 // 12MB
+	liveReadTarget := int64(5*1024*1024 + 512*1024)
+
+	var mu sync.Mutex
+	var requestedStarts []int64
+	releaseW1 := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(releaseW1) }) }
+
+	// Hold tail Cues responses until after client 1 downshifts so PendingTailPrefetchOffset
+	// or post-seek tail probe must survive/complete across the live->prehydrating->live transition.
+	allowTailProbe := make(chan struct{})
+	var allowTailOnce sync.Once
+	openTailGate := func() { allowTailOnce.Do(func() { close(allowTailProbe) }) }
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var start, end int64
+		end = -1
+		rangeHeader := r.Header.Get("Range")
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+			_, _ = fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+		}
+
+		mu.Lock()
+		requestedStarts = append(requestedStarts, start)
+		mu.Unlock()
+
+		if start == 0 {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", totalSize-1, totalSize))
+			w.WriteHeader(http.StatusPartialContent)
+			initialBurst := make([]byte, 6*1024*1024)
+			copy(initialBurst, headerData)
+			_, _ = w.Write(initialBurst)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			// Keep Worker 1 connected slowly so WriterActive=true across downshift & mid-file seek
+			select {
+			case <-releaseW1:
+			case <-r.Context().Done():
+			}
+			return
+		}
+
+		if start == cuesAbsOffset {
+			select {
+			case <-allowTailProbe:
+			case <-r.Context().Done():
+				return
+			}
+		}
+
+		chunkEnd := start + 512*1024 - 1
+		if end >= start && end < chunkEnd {
+			chunkEnd = end
+		}
+		if chunkEnd >= totalSize {
+			chunkEnd = totalSize - 1
+		}
+		chunkLen := int(chunkEnd - start + 1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, chunkEnd, totalSize))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", chunkLen))
+		w.WriteHeader(http.StatusPartialContent)
+		payload := make([]byte, chunkLen)
+		for i := range payload {
+			payload[i] = byte((start + int64(i)) & 0xFF)
+		}
+		_, _ = w.Write(payload)
+	}))
+	defer ts.Close()
+	defer closeRelease()
+	defer openTailGate()
+
+	tmpDir := t.TempDir()
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		latestCapacity: &ProviderCapacityReport{
+			Status:                 "ok",
+			TotalMaxStreams:        5,
+			TotalActiveStreams:     4,
+			TotalAvailableStreams:  1, // Equal to reservation=1; running worker is self-accounted
+			TargetAvailableStreams: 1,
+		},
+	}
+
+	key := "test_live_downshift_mid_seek"
+	state := NewFileCacheState(
+		key,
+		ts.URL,
+		filepath.Join(tmpDir, key),
+		filepath.Join(tmpDir, key+".part"),
+		filepath.Join(tmpDir, key+".json"),
+		"video/x-matroska",
+		"",
+		"",
+		totalSize,
+	)
+	state.IsPrehydrating = true
+	oldPM := GlobalPrehydrationManager
+	GlobalPrehydrationManager = pm
+	defer func() {
+		openTailGate()
+		closeRelease()
+		CancelCoordinator(state)
+		deadline := time.Now().Add(1 * time.Second)
+		for time.Now().Before(deadline) {
+			state.WorkersLock.Lock()
+			active := len(state.ActiveWorkers)
+			state.WorkersLock.Unlock()
+			if active == 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		ts.Close()
+		GlobalPrehydrationManager = oldPM
+	}()
+
+	// Step 1: Player 1 reads past the 5MB probe threshold -> live upgrade & disk materialization.
+	liveCtx, liveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	liveReader := NewCacheReader(liveCtx, state, nil)
+	buf := make([]byte, 512*1024)
+	for off := int64(0); off < liveReadTarget; off += int64(len(buf)) {
+		n, err := io.ReadFull(io.NewSectionReader(liveReader, off, int64(len(buf))), buf)
+		if err != nil || n == 0 {
+			liveReader.Close()
+			liveCancel()
+			t.Fatalf("Live playback ReadFull at %d failed: n=%d err=%v", off, n, err)
+		}
+	}
+
+	state.Lock.Lock()
+	wasPrehydratingAfter5MB := state.IsPrehydrating
+	diskMaterialized := state.DiskMaterialized
+	state.Lock.Unlock()
+	if wasPrehydratingAfter5MB {
+		liveReader.Close()
+		liveCancel()
+		t.Fatalf("Expected live playback >5MB to have cleared IsPrehydrating")
+	}
+	if !diskMaterialized {
+		liveReader.Close()
+		liveCancel()
+		t.Fatalf("Expected live playback >5MB to have materialized disk file")
+	}
+
+	// Step 2: Client disconnects; Close() automatically triggers real-time OnDownshift -> Prehydrating
+	// while Worker 1 keeps running at offset 0.
+	liveReader.Close()
+	liveCancel()
+
+	state.Lock.Lock()
+	isPrehydratingAfterDownshift := state.IsPrehydrating
+	isYielding := state.IsYielding
+	writerActive := state.WriterActive
+	state.Lock.Unlock()
+	if !isPrehydratingAfterDownshift {
+		t.Fatalf("Expected OnDownshift to set IsPrehydrating=true")
+	}
+	if isYielding {
+		t.Fatalf("Expected OnDownshift NOT to yield while available streams == reservation (self-accounted worker)")
+	}
+	if !writerActive {
+		t.Fatalf("Expected Worker 1 to remain active after non-yielding downshift")
+	}
+
+	// Step 3: Player reconnects and jumps to 50% (12MB). Must immediately upgrade, spawn Worker 2,
+	// and complete the Cues tail probe.
+	openTailGate()
+	seekCtx, seekCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer seekCancel()
+	seekReader := NewCacheReader(seekCtx, state, nil)
+	defer seekReader.Close()
+
+	seekBuf := make([]byte, 64*1024)
+	n, err := io.ReadFull(io.NewSectionReader(seekReader, midSeekOffset, int64(len(seekBuf))), seekBuf)
+	if err != nil || n != len(seekBuf) {
+		t.Fatalf("Post-downshift mid-file seek ReadFull failed: n=%d err=%v", n, err)
+	}
+	for i := 0; i < 64; i++ {
+		want := byte((midSeekOffset + int64(i)) & 0xFF)
+		if seekBuf[i] != want {
+			t.Fatalf("Seek byte mismatch at +%d: got %d want %d", i, seekBuf[i], want)
+		}
+	}
+
+	state.Lock.Lock()
+	upgradedAgain := !state.IsPrehydrating
+	state.Lock.Unlock()
+	if !upgradedAgain {
+		t.Fatalf("Expected mid-file seek after downshift to immediately set IsPrehydrating=false")
+	}
+
+	mu.Lock()
+	sawMidWorker := false
+	for _, s := range requestedStarts {
+		if s == midSeekOffset {
+			sawMidWorker = true
+			break
+		}
+	}
+	reqsSnapshot := append([]int64(nil), requestedStarts...)
+	mu.Unlock()
+	if !sawMidWorker {
+		t.Fatalf("Expected Worker 2 to be requested at mid-file offset %d; got requests=%v", midSeekOffset, reqsSnapshot)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	tailCached := false
+	for time.Now().Before(deadline) {
+		if state.RangeSet.Contains(cuesAbsOffset) {
+			tailCached = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !tailCached {
+		mu.Lock()
+		reqs := append([]int64(nil), requestedStarts...)
+		mu.Unlock()
+		t.Fatalf("Expected Cues tail probe at offset %d to be cached; requests=%v", cuesAbsOffset, reqs)
+	}
+}
+
 
 
 
