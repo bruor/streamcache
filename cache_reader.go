@@ -428,6 +428,14 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 
 		r.state.Lock.Lock()
+		if _, exists := r.state.StarvingSince[r.clientID]; !exists {
+			if r.state.StarvingSince == nil {
+				r.state.StarvingSince = make(map[string]time.Time)
+			}
+			r.state.StarvingSince[r.clientID] = time.Now()
+		}
+		r.state.Starving[r.clientID] = off
+
 		if !r.state.WriterActive {
 			wasYielding := r.state.IsYielding
 			wasPrehydrating := r.state.IsPrehydrating
@@ -456,13 +464,6 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			r.state.Lock.Lock()
 		}
 
-		if _, exists := r.state.StarvingSince[r.clientID]; !exists {
-			if r.state.StarvingSince == nil {
-				r.state.StarvingSince = make(map[string]time.Time)
-			}
-			r.state.StarvingSince[r.clientID] = time.Now()
-		}
-		r.state.Starving[r.clientID] = off
 		clientChan := r.state.Clients[r.clientID]
 		r.state.Lock.Unlock()
 
