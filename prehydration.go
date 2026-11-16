@@ -775,6 +775,19 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 	}
 }
 
+// isAssetCached checks whether a completed copy already exists in the configured storage backend (local disk or S3).
+func isAssetCached(ctx context.Context, cacheFileName, cacheFilePath string) bool {
+	if GlobalStorage != nil {
+		_, exists, err := GlobalStorage.Stat(ctx, cacheFileName)
+		if err != nil {
+			log.Printf("[Prehydration] Storage Stat error for %s: %v", cacheFileName, err)
+			return false
+		}
+		return exists
+	}
+	return FileExists(cacheFilePath)
+}
+
 // Enqueue adds an upcoming episode URL to the prehydration queue.
 func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	if pm == nil || targetURL == "" {
@@ -786,9 +799,9 @@ func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	cacheDir := GlobalConfig.GetCacheDir()
 	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
 
-	// If already completed on disk, chain immediately to the next one!
-	if FileExists(cacheFilePath) {
-		log.Printf("[Prehydration] Episode %s is already cached on disk (Cache HIT). Chaining to next in sequence.", targetURL)
+	// If already completed in storage (local disk or S3), chain immediately to the next one!
+	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
+		log.Printf("[Prehydration] Episode %s is already cached (Cache HIT). Chaining to next in sequence.", targetURL)
 		if len(nextURLs) > 0 {
 			pm.Enqueue(nextURLs[0], nextURLs[1:])
 		}
@@ -924,7 +937,7 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 	cacheDir := GlobalConfig.GetCacheDir()
 	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
 
-	if FileExists(cacheFilePath) {
+	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
 		if len(task.NextURLs) > 0 {
 			pm.Enqueue(task.NextURLs[0], task.NextURLs[1:])
 		}

@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1036,6 +1038,356 @@ func TestS3RecompositionAbortOnFailure(t *testing.T) {
 		t.Errorf("Expected 0 active multipart uploads after recomposition failure, got %d", mockS3.ActiveUploads())
 	}
 }
+
+func TestS3PrehydrationSkipsAlreadyCachedInS3(t *testing.T) {
+	mockS3 := NewMockS3Server("prehydrate-s3-bucket")
+	defer mockS3.Close()
+
+	tempDir, err := os.MkdirTemp("", "sc2_s3_prehydrate_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldConfig := GlobalConfig
+	GlobalConfig = &Config{
+		CacheDir:                filepath.Join(tempDir, "files"),
+		TmpDir:                  filepath.Join(tempDir, "tmp"),
+		CacheRevalidateInterval: 1 * time.Hour,
+		StorageBackend:          "s3",
+	}
+	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
+	_ = os.MkdirAll(GlobalConfig.TmpDir, 0755)
+	defer func() { GlobalConfig = oldConfig }()
+
+	backend, err := NewS3StorageBackend(S3Config{
+		Endpoint:     mockS3.URL(),
+		Bucket:       "prehydrate-s3-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    32 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	oldStorage := GlobalStorage
+	GlobalStorage = backend
+	defer func() { GlobalStorage = oldStorage }()
+
+	InitRegistry()
+
+	var ep2Hits atomic.Int32
+	ep2Server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ep2Hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ep2Server.Close()
+
+	ep2URL := ep2Server.URL + "/episode2.mkv"
+	ep3URL := ep2Server.URL + "/episode3.mkv"
+
+	ep2Key, ep2Ext := getCacheKeyAndExt(ep2URL)
+	ep2CacheName := ep2Key + ep2Ext
+
+	// Pre-commit episode 2 ONLY in S3 (local CACHE_DIR remains completely empty)
+	ep2Part := filepath.Join(GlobalConfig.TmpDir, "ep2_seed.part")
+	_ = os.WriteFile(ep2Part, []byte("episode2-already-in-s3"), 0644)
+	err = backend.CommitLocalFile(context.Background(), ep2CacheName, ep2Part, FileMeta{
+		URL:           ep2URL,
+		TotalSize:     int64(len("episode2-already-in-s3")),
+		LastValidated: time.Now().Unix(),
+		Completed:     true,
+	})
+	if err != nil {
+		t.Fatalf("CommitLocalFile failed: %v", err)
+	}
+	_ = os.Remove(ep2Part)
+
+	pm := &PrehydrationManager{
+		queue:               make([]*PrehydrationTask, 0),
+		activePrehydrations: make(map[string]bool),
+		notifyCh:            make(chan struct{}, 1),
+		stopCh:              make(chan struct{}),
+	}
+
+	// 1. Enqueue episode 2 (cached in S3) with next episode 3 (not cached) -> should skip ep2 and queue ep3
+	pm.Enqueue(ep2URL, []string{ep3URL})
+
+	pm.mu.Lock()
+	if len(pm.queue) != 1 || pm.queue[0].TargetURL != ep3URL {
+		pm.mu.Unlock()
+		t.Fatalf("Expected only %s in prehydration queue after skipping S3-cached ep2, got %+v", ep3URL, pm.queue)
+	}
+	pm.mu.Unlock()
+
+	// 2. executePrehydration on ep2 must also skip without probing upstream
+	pm.executePrehydration(&PrehydrationTask{
+		TargetURL: ep2URL,
+		NextURLs:  nil,
+	})
+
+	if ep2Hits.Load() != 0 {
+		t.Errorf("Expected 0 upstream HTTP requests for S3-cached episode2, got %d", ep2Hits.Load())
+	}
+}
+
+type delayedRecomposeStorage struct {
+	*S3StorageBackend
+	recomposeStarted chan struct{}
+	releaseRecompose chan struct{}
+	once             sync.Once
+}
+
+func (d *delayedRecomposeStorage) Recompose(ctx context.Context, key string, totalParts int, meta FileMeta) error {
+	d.once.Do(func() {
+		close(d.recomposeStarted)
+	})
+	<-d.releaseRecompose
+	return d.S3StorageBackend.Recompose(ctx, key, totalParts, meta)
+}
+
+func TestS3SynchronousFinalizeAndReaderTransition(t *testing.T) {
+	mockS3 := NewMockS3Server("sync-commit-bucket")
+	defer mockS3.Close()
+
+	tempDir, err := os.MkdirTemp("", "sc2_s3_sync_commit_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldConfig := GlobalConfig
+	GlobalConfig = &Config{
+		CacheDir:                filepath.Join(tempDir, "files"),
+		TmpDir:                  filepath.Join(tempDir, "tmp"),
+		CacheRevalidateInterval: 1 * time.Hour,
+		WritebackBufferSize:     64 * 1024,
+		StorageBackend:          "s3",
+		S3Config: S3Config{
+			ChunkSize:           32 * 1024,
+			ScratchMaxBytes:     10 * 1024 * 1024,
+			ScratchMinFreeBytes: 1024,
+		},
+	}
+	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
+	_ = os.MkdirAll(GlobalConfig.TmpDir, 0755)
+	defer func() { GlobalConfig = oldConfig }()
+
+	rawBackend, err := NewS3StorageBackend(S3Config{
+		Endpoint:            mockS3.URL(),
+		Bucket:              "sync-commit-bucket",
+		Region:              "us-east-1",
+		AccessKey:           "test-access",
+		SecretKey:           "test-secret",
+		UsePathStyle:        true,
+		DisableSSL:          true,
+		ChunkSize:           32 * 1024,
+		ScratchMaxBytes:     10 * 1024 * 1024,
+		ScratchMinFreeBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	delayed := &delayedRecomposeStorage{
+		S3StorageBackend: rawBackend,
+		recomposeStarted: make(chan struct{}),
+		releaseRecompose: make(chan struct{}),
+	}
+
+	oldStorage := GlobalStorage
+	GlobalStorage = delayed
+	defer func() { GlobalStorage = oldStorage }()
+
+	InitRegistry()
+
+	key := "sync_commit_episode.mkv"
+	totalSize := int64(96 * 1024) // 3 chunks of 32 KB
+	fullData := make([]byte, totalSize)
+	for i := range fullData {
+		fullData[i] = byte((i * 13) % 256)
+	}
+
+	partPath := filepath.Join(GlobalConfig.TmpDir, key+".part")
+	metaPath := filepath.Join(GlobalConfig.CacheDir, key+".json")
+	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile error: %v", err)
+	}
+	_ = f.Truncate(totalSize)
+
+	state := NewFileCacheState(key, "http://example.com/sync_ep.mkv", filepath.Join(GlobalConfig.CacheDir, key), partPath, metaPath, "video/x-matroska", "", "", totalSize)
+	state.File = f
+	state.DiskMaterialized = true
+	state.WriterActive = true
+	state.UpstreamStatus = "Downloading"
+	wp := NewWritebackPipeline(f, state, GlobalConfig.GetWritebackBufferSize())
+	state.Pipeline = wp
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	// Active viewer streaming during download & commit
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader := NewCacheReader(ctx, state, nil)
+	defer reader.Close()
+
+	// Simulate streaming all 3 chunks through WritebackPipeline
+	for off := int64(0); off < totalSize; off += 16 * 1024 {
+		end := off + 16*1024
+		if err := wp.WriteChunk(off, fullData[off:end]); err != nil {
+			t.Fatalf("WriteChunk error: %v", err)
+		}
+		state.RangeSet.Add(off, end)
+		atomic.AddInt64(&state.TotalBytesDownloaded, end-off)
+		GlobalRegistry.UpdateSize(end - off)
+	}
+
+	// Simulate coordinator finishing download and starting finalizeAndCommitCache asynchronously
+	state.Lock.Lock()
+	fileToClose := state.File
+	state.File = nil
+	pipelineToClose := state.Pipeline
+	state.Pipeline = nil
+	state.IsCommitting = true
+	state.UpstreamStatus = "Committing"
+	state.Lock.Unlock()
+
+	commitDone := make(chan struct{})
+	go func() {
+		finalizeAndCommitCache(state, fileToClose, pipelineToClose)
+		close(commitDone)
+	}()
+
+	// Wait until Recompose is in-flight (blocked on delayed.releaseRecompose)
+	select {
+	case <-delayed.recomposeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for Recompose to start")
+	}
+
+	// CRITICAL ASSERTIONS WHILE RECOMPOSE IS IN PROGRESS:
+	// 1. State must STILL remain in GlobalRegistry.Files with "Committing" status
+	GlobalRegistry.Lock.RLock()
+	activeState, stillRegistered := GlobalRegistry.Files[key]
+	GlobalRegistry.Lock.RUnlock()
+	if !stillRegistered || activeState != state {
+		t.Fatalf("Expected %s to remain in GlobalRegistry.Files while S3 Recompose is still running", key)
+	}
+
+	// 2. Local .part must NOT be removed yet while Recompose is running
+	if !FileExists(partPath) {
+		t.Fatalf("Expected scratch part file to remain intact until S3 Recompose completes")
+	}
+
+	// 3. Reader must still be able to read chunk 0 from S3 chunks while Recompose is blocked
+	bufChunk0 := make([]byte, 16*1024)
+	n, err := reader.ReadAt(bufChunk0, 0)
+	if err != nil || n != len(bufChunk0) || !bytes.Equal(bufChunk0, fullData[:16*1024]) {
+		t.Fatalf("Expected active reader to read chunk 0 from S3 during recomposition (n=%d, err=%v)", n, err)
+	}
+
+	// Now allow Recompose to finish sealing vod/<key>
+	close(delayed.releaseRecompose)
+
+	select {
+	case <-commitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for finalizeAndCommitCache to finish")
+	}
+
+	// POST-COMMIT ASSERTIONS:
+	// 1. Part file cleaned up after seal
+	if FileExists(partPath) {
+		t.Errorf("Expected scratch part file to be removed after S3 Recompose succeeded")
+	}
+
+	// 2. State removed from GlobalRegistry.Files and local cache size reconciled back to 0
+	GlobalRegistry.Lock.RLock()
+	_, stillExists := GlobalRegistry.Files[key]
+	GlobalRegistry.Lock.RUnlock()
+	if stillExists {
+		t.Errorf("Expected %s to be removed from GlobalRegistry.Files after S3 seal", key)
+	}
+	if totalSizeTracked := GlobalRegistry.GetTotalSize(); totalSizeTracked != 0 {
+		t.Errorf("Expected local TotalCacheSize to return to 0 after S3 commit, got %d", totalSizeTracked)
+	}
+
+	// 3. Monolithic object exists via Stat, and existing reader transitions seamlessly to monolithic s3Reader
+	_, statExists, err := rawBackend.Stat(context.Background(), key)
+	if err != nil || !statExists {
+		t.Fatalf("Expected monolithic vod/%s to exist via Stat after commit (err=%v, exists=%v)", key, err, statExists)
+	}
+
+	bufTail := make([]byte, 32*1024)
+	nTail, err := reader.ReadAt(bufTail, 64*1024)
+	if err != nil || nTail != len(bufTail) || !bytes.Equal(bufTail, fullData[64*1024:]) {
+		t.Fatalf("Expected reader to transition cleanly to monolithic vod/%s (n=%d, err=%v)", key, nTail, err)
+	}
+
+	reader.s3ReaderMu.Lock()
+	hasS3Reader := reader.s3Reader != nil
+	reader.s3ReaderMu.Unlock()
+	if !hasS3Reader {
+		t.Errorf("Expected reader to have transitioned to s3Reader after S3 recomposition completed")
+	}
+}
+
+func TestS3StatDoesNotPolluteOriginETag(t *testing.T) {
+	mockS3 := NewMockS3Server("etag-bucket")
+	defer mockS3.Close()
+
+	backend, err := NewS3StorageBackend(S3Config{
+		Endpoint:     mockS3.URL(),
+		Bucket:       "etag-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    32 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	tempDir, err := os.MkdirTemp("", "sc2_etag_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	key := "no_origin_etag.mkv"
+	partPath := filepath.Join(tempDir, key+".part")
+	_ = os.WriteFile(partPath, []byte("test-media-bytes"), 0644)
+
+	// Commit without an upstream ETag
+	err = backend.CommitLocalFile(context.Background(), key, partPath, FileMeta{
+		URL:           "http://example.com/no_origin_etag.mkv",
+		TotalSize:     16,
+		ETag:          "",
+		LastValidated: time.Now().Unix(),
+		Completed:     true,
+	})
+	if err != nil {
+		t.Fatalf("CommitLocalFile error: %v", err)
+	}
+
+	meta, exists, err := backend.Stat(context.Background(), key)
+	if err != nil || !exists {
+		t.Fatalf("Stat failed: exists=%v err=%v", exists, err)
+	}
+	if meta.ETag != "" {
+		t.Errorf("Expected meta.ETag to stay empty when upstream ETag is absent, got %q (S3 ETag leaked!)", meta.ETag)
+	}
+}
+
 
 
 

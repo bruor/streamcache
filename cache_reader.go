@@ -249,8 +249,14 @@ func (r *CacheReader) Close() error {
 	isDiskMat := r.state.DiskMaterialized || FileExists(r.state.PartPath)
 	isProbe := !isCompleted && !isDiskMat && totalRead < minThreshold && maxOffset < minThreshold
 
-	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
-	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
+	alreadyCommittedS3 := GlobalStorage != nil && GlobalStorage.Type() == "s3" && r.state.ChunkManager != nil && r.state.ChunkManager.IsRecomposed()
+	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommittedS3 && !FileExists(r.state.Path)
+	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
+
+	if shouldFinalize {
+		r.state.IsCommitting = true
+		r.state.UpstreamStatus = "Committing"
+	}
 
 	var fileToClose *os.File
 	var pipelineToClose StorageSink
@@ -343,6 +349,12 @@ func (r *CacheReader) Close() error {
 }
 
 func (r *CacheReader) finalizeCache() {
+	defer func() {
+		r.state.Lock.Lock()
+		r.state.IsCommitting = false
+		r.state.Lock.Unlock()
+	}()
+
 	// Close write handle if open
 	r.state.Lock.Lock()
 	fileToClose := r.state.File
@@ -374,20 +386,41 @@ func (r *CacheReader) finalizeCache() {
 	}
 
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		var commitErr error
 		if r.state.ChunkManager != nil {
-			r.state.ChunkManager.AttemptRecompose()
+			commitErr = r.state.ChunkManager.WaitAndRecompose(context.Background())
 		} else {
-			_ = GlobalStorage.CommitLocalFile(context.Background(), r.state.Key, r.state.PartPath, meta)
+			commitErr = GlobalStorage.CommitLocalFile(context.Background(), r.state.Key, r.state.PartPath, meta)
 		}
 		_ = os.Remove(r.state.PartPath)
 		_ = os.Remove(r.state.MetaPath)
+
+		accounted := atomic.SwapInt64(&r.state.TotalBytesDownloaded, 0)
+		if accounted > 0 && GlobalRegistry != nil {
+			GlobalRegistry.UpdateSize(-accounted)
+		}
+
+		GlobalRegistry.MarkConnectionsAsInCache(r.state.Key)
+		if commitErr != nil {
+			log.Printf("[Reader] S3 commit/recomposition failed on client exit for %s: %v", r.state.Key, commitErr)
+			r.state.SetUpstreamStatus("Error")
+		} else {
+			r.state.SetUpstreamStatus("Completed")
+			log.Printf("[Reader] Cache file finalized and committed to S3 on last client exit: %s", r.state.Key)
+		}
 
 		GlobalRegistry.Lock.Lock()
 		delete(GlobalRegistry.Files, r.state.Key)
 		GlobalRegistry.Lock.Unlock()
 
+		if GlobalLogBroker != nil {
+			go GlobalLogBroker.BroadcastStateUpdate()
+		}
+		if commitErr == nil && GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(r.state)
+		}
+
 		debug.FreeOSMemory()
-		log.Printf("[Reader] Cache file finalized and committed to S3 on last client exit: %s", r.state.Key)
 		return
 	}
 
@@ -612,7 +645,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		isRecomposed := false
 		if r.state.ChunkManager != nil && r.state.ChunkManager.IsRecomposed() {
 			isRecomposed = true
-		} else if !FileExists(r.state.PartPath) {
+		} else if !FileExists(r.state.PartPath) && r.state.RangeSet.IsComplete(r.state.TotalSize) {
 			isRecomposed = true
 		}
 

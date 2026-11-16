@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -20,11 +21,12 @@ type S3ChunkManager struct {
 	totalParts  int
 	isMultipart bool
 
-	mu          sync.RWMutex
-	uploaded    map[int]bool
-	uploading   map[int]bool
-	recomposing bool
-	recomposed  bool
+	mu           sync.RWMutex
+	uploaded     map[int]bool
+	uploading    map[int]bool
+	recomposing  bool
+	recomposed   bool
+	recomposeErr error
 
 	// In-flight scratch budget & socket backpressure
 	maxInFlightBytes int64
@@ -33,10 +35,12 @@ type S3ChunkManager struct {
 	budgetMu         sync.Mutex
 	budgetChan       chan struct{}
 
-	activeUploads int32
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
+	trackDiskFlushes atomic.Bool
+	activeUploads    int32
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup // tracks chunk upload workers
+	recomposeWg      sync.WaitGroup // tracks server-side recomposition / commit
 }
 
 // CalculateDynamicChunkConfig calculates the optimal chunk size and determines
@@ -218,11 +222,29 @@ func (m *S3ChunkManager) IsChunkUploaded(chunkIndex int) bool {
 	return m.uploaded[chunkIndex]
 }
 
-// CheckAndTriggerUploads inspects RangeSet to see if any new chunks can be uploaded
+// SetTrackDiskFlushes controls whether CheckAndTriggerUploads gates on DiskRangeSet
+// (bytes flushed to disk by WritebackPipeline) vs RangeSet.
+func (m *S3ChunkManager) SetTrackDiskFlushes(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.trackDiskFlushes.Store(enabled)
+}
+
+func (m *S3ChunkManager) activeRangeSet() *RangeSet {
+	if m.trackDiskFlushes.Load() && m.state.DiskRangeSet != nil {
+		return m.state.DiskRangeSet
+	}
+	return m.state.RangeSet
+}
+
+// CheckAndTriggerUploads inspects RangeSet (or DiskRangeSet when pipelined) to see if any new chunks can be uploaded
 func (m *S3ChunkManager) CheckAndTriggerUploads() {
 	if m == nil || m.storage == nil {
 		return
 	}
+
+	rs := m.activeRangeSet()
 
 	m.mu.Lock()
 	if m.recomposed {
@@ -232,7 +254,7 @@ func (m *S3ChunkManager) CheckAndTriggerUploads() {
 
 	if !m.isMultipart {
 		m.mu.Unlock()
-		if m.state.RangeSet.HasAvailable(0, m.totalSize) {
+		if rs.HasAvailable(0, m.totalSize) {
 			m.AttemptRecompose()
 		}
 		return
@@ -247,7 +269,7 @@ func (m *S3ChunkManager) CheckAndTriggerUploads() {
 				chunkLen = m.totalSize - chunkStart
 			}
 
-			if m.state.RangeSet.HasAvailable(chunkStart, chunkLen) {
+			if rs.HasAvailable(chunkStart, chunkLen) {
 				m.uploading[i] = true
 				candidates = append(candidates, i)
 			}
@@ -358,11 +380,12 @@ func (m *S3ChunkManager) AttemptRecompose() {
 		return
 	}
 	m.recomposing = true
+	m.recomposeErr = nil
 	m.mu.Unlock()
 
-	m.wg.Add(1)
+	m.recomposeWg.Add(1)
 	go func() {
-		defer m.wg.Done()
+		defer m.recomposeWg.Done()
 
 		meta := FileMeta{
 			URL:           m.state.URL,
@@ -388,6 +411,7 @@ func (m *S3ChunkManager) AttemptRecompose() {
 			log.Printf("[S3ChunkManager] Server-side recomposition/commit failed for %s: %v", m.key, err)
 			m.mu.Lock()
 			m.recomposing = false
+			m.recomposeErr = err
 			m.mu.Unlock()
 			return
 		}
@@ -395,6 +419,7 @@ func (m *S3ChunkManager) AttemptRecompose() {
 		m.mu.Lock()
 		m.recomposed = true
 		m.recomposing = false
+		m.recomposeErr = nil
 		m.mu.Unlock()
 
 		log.Printf("[S3ChunkManager] Server-side recomposition SUCCESS for %s. Monolithic object sealed.", m.key)
@@ -408,6 +433,76 @@ func (m *S3ChunkManager) AttemptRecompose() {
 	}()
 }
 
+// WaitAndRecompose triggers any remaining chunk uploads, waits for all uploads to finish,
+// and waits for server-side recomposition (or direct CommitLocalFile) to seal the S3 object.
+func (m *S3ChunkManager) WaitAndRecompose(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	if m.IsRecomposed() {
+		return nil
+	}
+
+	waitWG := func(wg *sync.WaitGroup) error {
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-m.ctx.Done():
+			return m.ctx.Err()
+		}
+	}
+
+	// Ensure any remaining completed chunks (e.g. final chunk after pipeline flush) are uploaded
+	m.CheckAndTriggerUploads()
+	if err := waitWG(&m.wg); err != nil {
+		return err
+	}
+
+	// If any multipart chunk failed transiently and isn't uploaded yet, trigger one retry pass
+	if m.isMultipart {
+		m.mu.RLock()
+		uploadedCount := len(m.uploaded)
+		m.mu.RUnlock()
+		if uploadedCount < m.totalParts {
+			m.CheckAndTriggerUploads()
+			if err := waitWG(&m.wg); err != nil {
+				return err
+			}
+			m.mu.RLock()
+			uploadedCount = len(m.uploaded)
+			m.mu.RUnlock()
+			if uploadedCount < m.totalParts {
+				return fmt.Errorf("incomplete S3 chunk uploads (%d/%d) for %s", uploadedCount, m.totalParts, m.key)
+			}
+		}
+	}
+
+	m.AttemptRecompose()
+	if err := waitWG(&m.recomposeWg); err != nil {
+		return err
+	}
+
+	m.mu.RLock()
+	recomposed := m.recomposed
+	err := m.recomposeErr
+	m.mu.RUnlock()
+
+	if !recomposed {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("S3 recomposition did not complete for %s", m.key)
+	}
+	return nil
+}
+
 // Close cancels in-flight chunk uploads and waits for workers to exit
 func (m *S3ChunkManager) Close() {
 	if m == nil {
@@ -419,4 +514,5 @@ func (m *S3ChunkManager) Close() {
 	default:
 	}
 	m.wg.Wait()
+	m.recomposeWg.Wait()
 }

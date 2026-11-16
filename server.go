@@ -143,7 +143,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	var cacheHit bool
 	var cacheMeta *FileMeta
 	if GlobalStorage != nil {
-		if meta, exists, err := GlobalStorage.Stat(r.Context(), cacheFileName); err == nil && exists {
+		if meta, exists, err := GlobalStorage.Stat(r.Context(), cacheFileName); err != nil {
+			log.Printf("[Server] Storage Stat error for %s: %v (falling back to hydration check)", cacheFileName, err)
+		} else if exists {
 			cacheHit = true
 			cacheMeta = meta
 		}
@@ -153,7 +155,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 	if cacheHit {
 		valid, err := Revalidate(cacheFileName, targetURL, r.Header)
-		if err == nil && valid {
+		if err != nil {
+			log.Printf("[Server] Revalidate error for %s: %v", cacheFileName, err)
+		} else if valid {
 			var reader StorageReadSeeker
 			if GlobalStorage != nil {
 				reader, err = GlobalStorage.Open(r.Context(), cacheFileName)
@@ -167,7 +171,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if err == nil {
+			if err != nil {
+				log.Printf("[Server] Cache HIT Open failed for %s: %v", cacheFileName, err)
+			} else {
 				defer reader.Close()
 
 				// Generate unique client ID using atomic counter

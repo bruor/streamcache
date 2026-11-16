@@ -307,6 +307,11 @@ func (lb *LiveBuffer) Clear() {
 
 // FlushToFile writes all currently retained chunks in LiveBuffer to file
 func (lb *LiveBuffer) FlushToFile(file *os.File) error {
+	return lb.FlushToFileAndTrack(file, nil)
+}
+
+// FlushToFileAndTrack writes retained chunks in LiveBuffer to file and records written ranges in rs.
+func (lb *LiveBuffer) FlushToFileAndTrack(file *os.File, rs *RangeSet) error {
 	if lb == nil || file == nil {
 		return nil
 	}
@@ -319,6 +324,9 @@ func (lb *LiveBuffer) FlushToFile(file *os.File) error {
 			_, err := file.WriteAt((*c.bufPtr)[:c.length], c.offset)
 			if err != nil {
 				return err
+			}
+			if rs != nil {
+				rs.Add(c.offset, c.offset+int64(c.length))
 			}
 		}
 	}
@@ -404,6 +412,10 @@ func NewWritebackPipeline(file *os.File, state *FileCacheState, bufferBytes int6
 		windows:    make([]writeWindow, 0, 4),
 	}
 
+	if state != nil && state.ChunkManager != nil {
+		state.ChunkManager.SetTrackDiskFlushes(true)
+	}
+
 	wp.wg.Add(1)
 	go wp.storageConsumer()
 
@@ -477,7 +489,11 @@ func (wp *WritebackPipeline) AttachFile(file *os.File) error {
 	wp.fd = file.Fd()
 
 	if wp.liveBuffer != nil {
-		if err := wp.liveBuffer.FlushToFile(file); err != nil {
+		var diskRS *RangeSet
+		if wp.state != nil {
+			diskRS = wp.state.DiskRangeSet
+		}
+		if err := wp.liveBuffer.FlushToFileAndTrack(file, diskRS); err != nil {
 			log.Printf("[WritebackPipeline] Error flushing LiveBuffer to file: %v", err)
 			return err
 		}
@@ -504,6 +520,11 @@ func (wp *WritebackPipeline) storageConsumer() {
 					wp.lastErr = err
 				}
 				wp.errMu.Unlock()
+			} else if wp.state != nil && wp.state.DiskRangeSet != nil {
+				wp.state.DiskRangeSet.Add(writeOffset, writeOffset+int64(length))
+				if wp.state.ChunkManager != nil {
+					wp.state.ChunkManager.CheckAndTriggerUploads()
+				}
 			}
 		}
 
@@ -653,6 +674,10 @@ func (wp *WritebackPipeline) FlushAndClose() error {
 	wp.mu.Unlock()
 
 	wp.wg.Wait()
+
+	if wp.state != nil && wp.state.ChunkManager != nil {
+		wp.state.ChunkManager.SetTrackDiskFlushes(false)
+	}
 
 	if wp.liveBuffer != nil {
 		shouldClear := true

@@ -298,9 +298,13 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			state.File = nil
 			pipelineToClose := state.Pipeline
 			state.Pipeline = nil
+			state.IsCommitting = true
+			state.UpstreamStatus = "Committing"
 			state.Lock.Unlock()
 
-			state.SetUpstreamStatus("Committing")
+			if GlobalLogBroker != nil {
+				go GlobalLogBroker.BroadcastStateUpdate()
+			}
 			log.Printf("[Coord] Committing completed cache file to disk: %s", state.Key)
 
 			go finalizeAndCommitCache(state, fileToClose, pipelineToClose)
@@ -1183,6 +1187,9 @@ func runDownloadWorker(
 				werr = pipeline.WriteChunk(currentOffset, buf[:n])
 			} else if file != nil {
 				_, werr = file.WriteAt(buf[:n], currentOffset)
+				if werr == nil && state.DiskRangeSet != nil {
+					state.DiskRangeSet.Add(currentOffset, currentOffset+int64(n))
+				}
 			}
 			if werr != nil {
 				log.Printf("[Worker-%d] File write error at %d: %v", w.id, currentOffset, werr)
@@ -1461,6 +1468,9 @@ func runInlineTailPrefetch(
 				werr = pipeline.WriteChunk(currentOffset, buf[:n])
 			} else if file != nil {
 				_, werr = file.WriteAt(buf[:n], currentOffset)
+				if werr == nil && state.DiskRangeSet != nil {
+					state.DiskRangeSet.Add(currentOffset, currentOffset+int64(n))
+				}
 			}
 			if werr != nil {
 				log.Printf("[Worker-%d] Inline tail pre-fetch write error at %d: %v", w.id, currentOffset, werr)
@@ -1597,6 +1607,7 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 	defer func() {
 		state.Lock.Lock()
 		state.WriterActive = false
+		state.IsCommitting = false
 		state.Lock.Unlock()
 	}()
 
@@ -1631,26 +1642,43 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 			Completed:     true,
 		}
 
+		var commitErr error
 		if state.ChunkManager != nil {
-			state.ChunkManager.AttemptRecompose()
+			commitErr = state.ChunkManager.WaitAndRecompose(context.Background())
 		} else {
-			_ = GlobalStorage.CommitLocalFile(context.Background(), state.Key, state.PartPath, meta)
+			commitErr = GlobalStorage.CommitLocalFile(context.Background(), state.Key, state.PartPath, meta)
 		}
 
 		_ = os.Remove(state.PartPath)
 		_ = os.Remove(state.MetaPath)
 
+		accounted := atomic.SwapInt64(&state.TotalBytesDownloaded, 0)
+		if accounted > 0 && GlobalRegistry != nil {
+			GlobalRegistry.UpdateSize(-accounted)
+		}
+
 		GlobalRegistry.MarkConnectionsAsInCache(state.Key)
-		state.SetUpstreamStatus("Completed")
+		if commitErr != nil {
+			log.Printf("[Coord] S3 commit/recomposition FAILED for %s: %v", state.Key, commitErr)
+			state.SetUpstreamStatus("Error")
+		} else {
+			state.SetUpstreamStatus("Completed")
+			log.Printf("[Coord] Cached file finalized and committed to S3: %s", state.Key)
+		}
 
 		GlobalRegistry.Lock.Lock()
 		delete(GlobalRegistry.Files, state.Key)
 		GlobalRegistry.Lock.Unlock()
 
 		if GlobalLogBroker != nil {
-			GlobalLogBroker.BroadcastStateUpdate()
+			go GlobalLogBroker.BroadcastStateUpdate()
 		}
-		log.Printf("[Coord] Cached file finalized and committed to S3: %s", state.Key)
+		if commitErr == nil && GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(state)
+		}
+
+		runtime.GC()
+		debug.FreeOSMemory()
 		return
 	}
 

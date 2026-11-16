@@ -70,6 +70,7 @@ type FileCacheState struct {
 	MetaPath      string
 	TotalSize     int64
 	RangeSet      *RangeSet
+	DiskRangeSet  *RangeSet
 	Cond          *sync.Cond
 	ContentType   string
 	ETag          string
@@ -79,6 +80,7 @@ type FileCacheState struct {
 	Lock               sync.Mutex
 	Cancel             context.CancelFunc
 	WriterActive       bool
+	IsCommitting       bool
 	Clients            map[string]chan struct{}
 	Starving           map[string]int64 // Map of clientID -> starving byte offset
 	StarvingSince      map[string]time.Time // Map of clientID -> when starvation began
@@ -130,6 +132,7 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		MetaPath:                  metaPath,
 		TotalSize:                 totalSize,
 		RangeSet:                  NewRangeSet(),
+		DiskRangeSet:              NewRangeSet(),
 		ContentType:               contentType,
 		ETag:                      etag,
 		LastModified:              lastMod,
@@ -337,7 +340,7 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 			}
 		}
 	} else if s.LiveBuffer != nil {
-		_ = s.LiveBuffer.FlushToFile(file)
+		_ = s.LiveBuffer.FlushToFileAndTrack(file, s.DiskRangeSet)
 	}
 
 	if s.File != nil && s.File != file {

@@ -178,9 +178,6 @@ func (b *S3StorageBackend) Stat(ctx context.Context, key string) (*FileMeta, boo
 	if meta.TotalSize == 0 && resp.ContentLength != nil {
 		meta.TotalSize = *resp.ContentLength
 	}
-	if meta.ETag == "" && resp.ETag != nil {
-		meta.ETag = strings.Trim(*resp.ETag, "\"")
-	}
 	meta.Completed = true
 	return &meta, true, nil
 }
