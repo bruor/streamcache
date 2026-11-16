@@ -1632,6 +1632,13 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 	state.Lock.Unlock()
 
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		// Upstream download is complete and all provider connections are closed;
+		// release the prehydration chain before S3 recomposition so the next episode
+		// can begin downloading immediately instead of waiting for Recompose.
+		if GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(state)
+		}
+
 		meta := FileMeta{
 			URL:           state.URL,
 			TotalSize:     state.TotalSize,
@@ -1675,9 +1682,6 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 
 		if GlobalLogBroker != nil {
 			go GlobalLogBroker.BroadcastStateUpdate()
-		}
-		if commitErr == nil && GlobalPrehydrationManager != nil {
-			GlobalPrehydrationManager.OnHydrationCompleted(state)
 		}
 
 		runtime.GC()

@@ -387,7 +387,7 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 		fs.Lock.Lock()
 		if len(fs.Clients) > 0 {
 			hasActiveVODPlayback = true
-		} else if fs.IsPrehydrating && len(fs.Clients) == 0 && !fs.IsYielding && fs.WriterActive {
+		} else if fs.IsPrehydrating && len(fs.Clients) == 0 && !fs.IsYielding && !fs.IsCommitting && fs.WriterActive {
 			prehydratingFiles = append(prehydratingFiles, fs)
 		}
 		fs.Lock.Unlock()
@@ -515,7 +515,7 @@ func (pm *PrehydrationManager) checkZeroProgressSuspension() {
 			continue
 		}
 
-		if !fs.IsPrehydrating || len(fs.Clients) > 0 || fs.IsYielding || !fs.WriterActive {
+		if !fs.IsPrehydrating || len(fs.Clients) > 0 || fs.IsYielding || fs.IsCommitting || !fs.WriterActive {
 			fs.Lock.Unlock()
 			continue
 		}
@@ -730,6 +730,7 @@ func (pm *PrehydrationManager) OnHydrationCompleted(state *FileCacheState) {
 
 	state.Lock.Lock()
 	next := state.NextURLs
+	state.NextURLs = nil
 	key := state.Key
 	state.Lock.Unlock()
 

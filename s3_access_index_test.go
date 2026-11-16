@@ -370,3 +370,143 @@ func TestS3AccessIndex_ProbeIgnoredVsPlaybackAndChainTouch(t *testing.T) {
 	}
 	idx.mu.Unlock()
 }
+
+func TestS3PrehydrationChainsBeforeRecomposeCompletes(t *testing.T) {
+	const bucket = "early-chain-bucket"
+	mockS3 := NewMockS3Server(bucket)
+	defer mockS3.Close()
+
+	tempDir, err := os.MkdirTemp("", "sc2_s3_early_chain_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	oldConfig := GlobalConfig
+	oldStorage := GlobalStorage
+	oldRegistry := GlobalRegistry
+	oldPM := GlobalPrehydrationManager
+	defer func() {
+		if GlobalS3Index != nil {
+			GlobalS3Index.Stop()
+		}
+		GlobalConfig = oldConfig
+		GlobalStorage = oldStorage
+		GlobalRegistry = oldRegistry
+		GlobalPrehydrationManager = oldPM
+	}()
+
+	GlobalConfig = &Config{
+		CacheDir:                filepath.Join(tempDir, "files"),
+		TmpDir:                  filepath.Join(tempDir, "tmp"),
+		CacheRevalidateInterval: 1 * time.Hour,
+		WritebackBufferSize:     64 * 1024,
+		StorageBackend:          "s3",
+		S3Config: S3Config{
+			ChunkSize:           32 * 1024,
+			ScratchMaxBytes:     10 * 1024 * 1024,
+			ScratchMinFreeBytes: 1024,
+		},
+	}
+	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
+	_ = os.MkdirAll(GlobalConfig.TmpDir, 0755)
+
+	rawBackend := newTestS3Backend(t, mockS3, bucket)
+	rawBackend.chunkSize = 32 * 1024
+	delayed := &delayedRecomposeStorage{
+		S3StorageBackend: rawBackend,
+		recomposeStarted: make(chan struct{}),
+		releaseRecompose: make(chan struct{}),
+	}
+	GlobalStorage = delayed
+
+	InitRegistry()
+
+	GlobalPrehydrationManager = &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+	}
+
+	key := "early_chain_ep1.mkv"
+	totalSize := int64(96 * 1024)
+	fullData := bytes.Repeat([]byte("Z"), int(totalSize))
+	partPath := filepath.Join(GlobalConfig.TmpDir, key+".part")
+	metaPath := filepath.Join(GlobalConfig.CacheDir, key+".json")
+	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("OpenFile error: %v", err)
+	}
+	_ = f.Truncate(totalSize)
+
+	state := NewFileCacheState(key, "http://origin.example.com/ep1.mkv", filepath.Join(GlobalConfig.CacheDir, key), partPath, metaPath, "video/x-matroska", "", "", totalSize)
+	state.File = f
+	state.DiskMaterialized = true
+	state.WriterActive = true
+	state.IsPrehydrating = true
+	state.IsCommitting = true
+	state.UpstreamStatus = "Committing"
+	state.NextURLs = []string{"http://origin.example.com/ep2.mkv", "http://origin.example.com/ep3.mkv"}
+	wp := NewWritebackPipeline(f, state, GlobalConfig.GetWritebackBufferSize())
+	state.Pipeline = wp
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	GlobalPrehydrationManager.mu.Lock()
+	GlobalPrehydrationManager.activePrehydrations[key] = true
+	GlobalPrehydrationManager.prehydrationsStartedSinceLastPoll = 1
+	GlobalPrehydrationManager.mu.Unlock()
+
+	for off := int64(0); off < totalSize; off += 32 * 1024 {
+		end := off + 32*1024
+		if err := wp.WriteChunk(off, fullData[off:end]); err != nil {
+			t.Fatalf("WriteChunk error: %v", err)
+		}
+		state.RangeSet.Add(off, end)
+	}
+
+	state.Lock.Lock()
+	fileToClose := state.File
+	state.File = nil
+	pipelineToClose := state.Pipeline
+	state.Pipeline = nil
+	state.Lock.Unlock()
+
+	commitDone := make(chan struct{})
+	go func() {
+		finalizeAndCommitCache(state, fileToClose, pipelineToClose)
+		close(commitDone)
+	}()
+
+	select {
+	case <-delayed.recomposeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for Recompose to start")
+	}
+
+	// While S3 Recompose is still blocked, next episode MUST already be queued and ep1 cleared from activePrehydrations
+	GlobalPrehydrationManager.mu.Lock()
+	stillActive := GlobalPrehydrationManager.activePrehydrations[key]
+	qLen := len(GlobalPrehydrationManager.queue)
+	var queuedURL string
+	if qLen > 0 {
+		queuedURL = GlobalPrehydrationManager.queue[0].TargetURL
+	}
+	GlobalPrehydrationManager.mu.Unlock()
+
+	if stillActive {
+		t.Errorf("Expected %s to be cleared from activePrehydrations before Recompose finishes", key)
+	}
+	if qLen != 1 || queuedURL != "http://origin.example.com/ep2.mkv" {
+		t.Fatalf("Expected ep2.mkv to be queued while Recompose is running, got qLen=%d url=%q", qLen, queuedURL)
+	}
+
+	close(delayed.releaseRecompose)
+	select {
+	case <-commitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Timed out waiting for finalizeAndCommitCache to complete")
+	}
+}

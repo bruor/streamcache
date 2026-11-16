@@ -28,9 +28,11 @@ type S3AccessIndex struct {
 	indexPath string
 	entries   map[string]*S3IndexEntry
 	dirty     bool
-	nowFn     func() time.Time
-	stopCh    chan struct{}
-	stopOnce  sync.Once
+	nowFn      func() time.Time
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	loopCancel context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // GlobalS3Index tracks cached S3 assets when running with STORAGE_BACKEND=s3.
@@ -405,24 +407,39 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 		return
 	}
 
+	// Capture config reference and parameters on the caller goroutine so background
+	// loops never race on GlobalConfig pointer reassignment in tests.
+	cfg := GlobalConfig
+	maxIdle := 720 * time.Hour
+	interval := 6 * time.Hour
+	if cfg != nil {
+		maxIdle = cfg.GetS3MaxIdleAge()
+		interval = cfg.GetS3EvictInterval()
+	}
+
+	loopCtx, loopCancel := context.WithCancel(context.Background())
+	idx.mu.Lock()
+	idx.loopCancel = loopCancel
+	idx.mu.Unlock()
+
 	// Initial startup reconcile + sweep
+	idx.wg.Add(1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer idx.wg.Done()
+		ctx, cancel := context.WithTimeout(loopCtx, 2*time.Minute)
 		defer cancel()
 
-		maxIdle := 720 * time.Hour
-		if GlobalConfig != nil {
-			maxIdle = GlobalConfig.GetS3MaxIdleAge()
-		}
 		if maxIdle > 0 {
 			idx.SweepExpired(ctx, storage, registry, maxIdle)
-		} else if err := idx.Reconcile(ctx, storage); err != nil {
+		} else if err := idx.Reconcile(ctx, storage); err != nil && loopCtx.Err() == nil {
 			log.Printf("[S3Index] Initial reconcile failed: %v", err)
 		}
 	}()
 
 	// Periodic metadata flush for playback touches
+	idx.wg.Add(1)
 	go func() {
+		defer idx.wg.Done()
 		flushTicker := time.NewTicker(60 * time.Second)
 		defer flushTicker.Stop()
 		for {
@@ -437,11 +454,9 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 	}()
 
 	// Periodic idle-age sweep
+	idx.wg.Add(1)
 	go func() {
-		interval := 6 * time.Hour
-		if GlobalConfig != nil {
-			interval = GlobalConfig.GetS3EvictInterval()
-		}
+		defer idx.wg.Done()
 		evictTicker := time.NewTicker(interval)
 		defer evictTicker.Stop()
 		for {
@@ -449,13 +464,13 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 			case <-idx.stopCh:
 				return
 			case <-evictTicker.C:
-				maxIdle := 720 * time.Hour
-				if GlobalConfig != nil {
-					maxIdle = GlobalConfig.GetS3MaxIdleAge()
+				curMaxIdle := 720 * time.Hour
+				if cfg != nil {
+					curMaxIdle = cfg.GetS3MaxIdleAge()
 				}
-				if maxIdle > 0 {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-					idx.SweepExpired(ctx, storage, registry, maxIdle)
+				if curMaxIdle > 0 {
+					ctx, cancel := context.WithTimeout(loopCtx, 5*time.Minute)
+					idx.SweepExpired(ctx, storage, registry, curMaxIdle)
 					cancel()
 				}
 			}
@@ -469,6 +484,13 @@ func (idx *S3AccessIndex) Stop() {
 		return
 	}
 	idx.stopOnce.Do(func() {
+		idx.mu.Lock()
+		cancel := idx.loopCancel
+		idx.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
 		close(idx.stopCh)
 	})
+	idx.wg.Wait()
 }
