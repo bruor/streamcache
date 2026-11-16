@@ -1,10 +1,10 @@
 # Stage 1: Build binary
-FROM golang:1.21-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
 # Copy go.mod and download dependencies
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy the rest of the source code and assets
