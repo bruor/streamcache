@@ -3,7 +3,15 @@ package main
 import (
 	"context"
 	"io"
+	"time"
 )
+
+// StorageObjectInfo describes a completed asset stored in a StorageBackend.
+type StorageObjectInfo struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
 
 // StorageReadSeeker extends io.ReadSeeker with io.ReaderAt, io.Closer, and Size()
 type StorageReadSeeker interface {
@@ -49,6 +57,9 @@ type StorageBackend interface {
 
 	// UpdateMetadata refreshes the FileMeta (e.g. LastValidated) in storage
 	UpdateMetadata(ctx context.Context, key string, meta FileMeta) error
+
+	// List returns all completed monolithic assets tracked by the storage backend
+	List(ctx context.Context) ([]StorageObjectInfo, error)
 }
 
 // GlobalStorage holds the active singleton storage backend

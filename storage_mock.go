@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ type MockS3Server struct {
 	buckets      map[string]bool
 	objects      map[string][]byte                 // "bucket/key" -> content
 	metadata     map[string]map[string]string      // "bucket/key" -> metadata headers
+	modTimes     map[string]time.Time              // "bucket/key" -> last modified time
 	uploads      map[string]map[int][]byte         // uploadId -> (partNumber -> content)
 	uploadMetas  map[string]map[string]string      // uploadId -> metadata headers
 	uploadKeys   map[string]string                 // uploadId -> "bucket/key"
@@ -35,6 +37,7 @@ func NewMockS3Server(bucket string) *MockS3Server {
 		buckets:      make(map[string]bool),
 		objects:      make(map[string][]byte),
 		metadata:     make(map[string]map[string]string),
+		modTimes:     make(map[string]time.Time),
 		uploads:      make(map[string]map[int][]byte),
 		uploadMetas:  make(map[string]map[string]string),
 		uploadKeys:   make(map[string]string),
@@ -113,6 +116,91 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 
 	case http.MethodGet:
+		if query.Get("list-type") == "2" {
+			prefix := query.Get("prefix")
+			maxKeys := 1000
+			if mkStr := query.Get("max-keys"); mkStr != "" {
+				if parsed, err := strconv.Atoi(mkStr); err == nil && parsed > 0 {
+					maxKeys = parsed
+				}
+			}
+			continuationToken := query.Get("continuation-token")
+
+			bucketPrefix := bucket + "/"
+			var matched []string
+			for fk := range m.objects {
+				if !strings.HasPrefix(fk, bucketPrefix) {
+					continue
+				}
+				objKey := strings.TrimPrefix(fk, bucketPrefix)
+				if prefix != "" && !strings.HasPrefix(objKey, prefix) {
+					continue
+				}
+				if continuationToken != "" && objKey <= continuationToken {
+					continue
+				}
+				matched = append(matched, objKey)
+			}
+			sort.Strings(matched)
+
+			isTruncated := false
+			nextToken := ""
+			if len(matched) > maxKeys {
+				isTruncated = true
+				matched = matched[:maxKeys]
+				nextToken = matched[len(matched)-1]
+			}
+
+			type listContent struct {
+				Key          string `xml:"Key"`
+				LastModified string `xml:"LastModified"`
+				ETag         string `xml:"ETag"`
+				Size         int64  `xml:"Size"`
+				StorageClass string `xml:"StorageClass"`
+			}
+			type listBucketResult struct {
+				XMLName               xml.Name      `xml:"ListBucketResult"`
+				Xmlns                 string        `xml:"xmlns,attr"`
+				Name                  string        `xml:"Name"`
+				Prefix                string        `xml:"Prefix"`
+				KeyCount              int           `xml:"KeyCount"`
+				MaxKeys               int           `xml:"MaxKeys"`
+				IsTruncated           bool          `xml:"IsTruncated"`
+				NextContinuationToken string        `xml:"NextContinuationToken,omitempty"`
+				Contents              []listContent `xml:"Contents"`
+			}
+
+			res := listBucketResult{
+				Xmlns:                 "http://s3.amazonaws.com/doc/2006-03-01/",
+				Name:                  bucket,
+				Prefix:                prefix,
+				KeyCount:              len(matched),
+				MaxKeys:               maxKeys,
+				IsTruncated:           isTruncated,
+				NextContinuationToken: nextToken,
+			}
+			for _, objKey := range matched {
+				fk := bucketPrefix + objKey
+				data := m.objects[fk]
+				mt := m.modTimes[fk]
+				if mt.IsZero() {
+					mt = time.Now().UTC()
+				}
+				res.Contents = append(res.Contents, listContent{
+					Key:          objKey,
+					LastModified: mt.UTC().Format(time.RFC3339),
+					ETag:         fmt.Sprintf("\"%x\"", md5.Sum(data)),
+					Size:         int64(len(data)),
+					StorageClass: "STANDARD",
+				})
+			}
+
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			_ = xml.NewEncoder(w).Encode(res)
+			return
+		}
+
 		content, ok := m.objects[fullKey]
 		if !ok {
 			http.NotFound(w, r)
@@ -247,6 +335,7 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		m.metadata[fullKey] = meta
+		m.modTimes[fullKey] = time.Now().UTC()
 
 		w.Header().Set("ETag", fmt.Sprintf("\"%x\"", md5.Sum(m.objects[fullKey])))
 		w.WriteHeader(http.StatusOK)
@@ -320,6 +409,7 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 			targetKey := m.uploadKeys[uploadID]
 			m.objects[targetKey] = combined
 			m.metadata[targetKey] = m.uploadMetas[uploadID]
+			m.modTimes[targetKey] = time.Now().UTC()
 
 			delete(m.uploads, uploadID)
 			delete(m.uploadKeys, uploadID)
@@ -360,6 +450,7 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 					objFullKey := bucket + "/" + obj.Key
 					delete(m.objects, objFullKey)
 					delete(m.metadata, objFullKey)
+					delete(m.modTimes, objFullKey)
 				}
 			}
 
@@ -391,6 +482,7 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(m.objects, fullKey)
 		delete(m.metadata, fullKey)
+		delete(m.modTimes, fullKey)
 		w.WriteHeader(http.StatusNoContent)
 
 	default:
@@ -409,6 +501,12 @@ func (m *MockS3Server) ObjectCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.objects)
+}
+
+func (m *MockS3Server) SetObjectModTime(bucket, key string, t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.modTimes[bucket+"/"+key] = t.UTC()
 }
 
 func computeMD5(data []byte) string {

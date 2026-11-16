@@ -221,3 +221,38 @@ func (b *LocalStorageBackend) UpdateMetadata(ctx context.Context, key string, me
 	}
 	return os.WriteFile(targetPath+".json", metaBytes, 0644)
 }
+
+func (b *LocalStorageBackend) List(ctx context.Context) ([]StorageObjectInfo, error) {
+	b.mu.RLock()
+	cacheDir := b.cacheDir
+	b.mu.RUnlock()
+
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var result []StorageObjectInfo
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(entry.Name())
+		if ext == ".json" || ext == ".part" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		result = append(result, StorageObjectInfo{
+			Key:          entry.Name(),
+			Size:         info.Size(),
+			LastModified: info.ModTime(),
+		})
+	}
+	return result, nil
+}

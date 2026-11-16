@@ -154,6 +154,9 @@ func evictCachedFile(path, metaPath string) {
 	if GlobalStorage != nil {
 		_ = GlobalStorage.Delete(context.Background(), key)
 	}
+	if GlobalS3Index != nil {
+		GlobalS3Index.Delete(key)
+	}
 
 	info, err := os.Stat(path)
 	var size int64

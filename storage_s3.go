@@ -585,3 +585,32 @@ func (b *S3StorageBackend) UpdateMetadata(ctx context.Context, key string, meta 
 	})
 	return err
 }
+
+func (b *S3StorageBackend) List(ctx context.Context) ([]StorageObjectInfo, error) {
+	const prefix = "vod/"
+	paginator := s3.NewListObjectsV2Paginator(b.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(b.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var result []StorageObjectInfo
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range page.Contents {
+			fullKey := aws.ToString(obj.Key)
+			key := strings.TrimPrefix(fullKey, prefix)
+			if key == "" {
+				continue
+			}
+			result = append(result, StorageObjectInfo{
+				Key:          key,
+				Size:         aws.ToInt64(obj.Size),
+				LastModified: aws.ToTime(obj.LastModified),
+			})
+		}
+	}
+	return result, nil
+}

@@ -221,11 +221,19 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					lastEvictedOffset: startOffset,
 					onRead: func(off int64, n int) {
 						GlobalRegistry.UpdateConnectionOffset(connID, off+int64(n))
-						if r.Method != http.MethodHead && GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
+						if r.Method != http.MethodHead {
 							newRead := atomic.AddInt64(&hitTotalRead, int64(n))
 							if newRead >= minThreshold || (fileSize > 0 && newRead >= fileSize) {
 								hitPrehydrateOnce.Do(func() {
-									GlobalPrehydrationManager.OnCacheHit(targetURL, nextURLs)
+									if GlobalS3Index != nil {
+										GlobalS3Index.RecordAccess(cacheFileName, targetURL, fileSize)
+										if len(nextURLs) > 0 {
+											GlobalS3Index.TouchChain(nextURLs)
+										}
+									}
+									if GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
+										GlobalPrehydrationManager.OnCacheHit(targetURL, nextURLs)
+									}
 								})
 							}
 						}
@@ -556,6 +564,13 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		if capReport := GlobalPrehydrationManager.GetLatestCapacity(); capReport != nil {
 			data["provider_capacity"] = capReport
 		}
+	}
+
+	if GlobalS3Index != nil {
+		s3Count, s3Bytes := GlobalS3Index.Stats()
+		data["s3_cached_objects"] = s3Count
+		data["s3_cached_bytes"] = s3Bytes
+		data["s3_max_idle_age_seconds"] = int64(GlobalConfig.GetS3MaxIdleAge().Seconds())
 	}
 
 	w.Header().Set("Content-Type", "application/json")

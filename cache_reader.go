@@ -33,8 +33,9 @@ type CacheReader struct {
 	chunkBufOff int64
 	chunkBufMu  sync.Mutex
 
-	totalBytesRead int64
-	maxReadOffset  int64
+	totalBytesRead   int64
+	maxReadOffset    int64
+	chainTouchedOnce sync.Once
 }
 
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
@@ -203,6 +204,16 @@ func (r *CacheReader) recordRead(off int64, n int) {
 			_ = r.state.MaterializeDiskFile()
 		}
 		r.upgradeFromPrehydration()
+		if r.state != nil && GlobalS3Index != nil {
+			r.chainTouchedOnce.Do(func() {
+				r.state.Lock.Lock()
+				next := append([]string(nil), r.state.NextURLs...)
+				r.state.Lock.Unlock()
+				if len(next) > 0 {
+					GlobalS3Index.TouchChain(next)
+				}
+			})
+		}
 	} else if r.state != nil && !r.state.IsDiskMaterialized() && GlobalRegistry != nil {
 		GlobalRegistry.RecordProbeActivity()
 	}

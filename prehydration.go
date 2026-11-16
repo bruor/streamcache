@@ -716,6 +716,9 @@ func (pm *PrehydrationManager) OnCacheHit(currentURL string, nextURLs []string) 
 	}
 	pm.OnPlayerPlayback(currentURL, nextURLs)
 	pm.AutoDiscoverDispatcharrURL(currentURL)
+	if GlobalS3Index != nil {
+		GlobalS3Index.TouchChain(nextURLs)
+	}
 	pm.Enqueue(nextURLs[0], nextURLs[1:])
 }
 
@@ -802,6 +805,11 @@ func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	// If already completed in storage (local disk or S3), chain immediately to the next one!
 	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
 		log.Printf("[Prehydration] Episode %s is already cached (Cache HIT). Chaining to next in sequence.", targetURL)
+		if GlobalS3Index != nil && !GlobalS3Index.TouchIfPresent(cacheFileName) && GlobalStorage != nil {
+			if sm, exists, err := GlobalStorage.Stat(context.Background(), cacheFileName); err == nil && exists && sm != nil {
+				GlobalS3Index.RecordAccess(cacheFileName, targetURL, sm.TotalSize)
+			}
+		}
 		if len(nextURLs) > 0 {
 			pm.Enqueue(nextURLs[0], nextURLs[1:])
 		}

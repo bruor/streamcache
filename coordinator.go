@@ -1664,6 +1664,9 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 		} else {
 			state.SetUpstreamStatus("Completed")
 			log.Printf("[Coord] Cached file finalized and committed to S3: %s", state.Key)
+			if GlobalS3Index != nil {
+				GlobalS3Index.RecordCommit(state.Key, state.URL, state.TotalSize)
+			}
 		}
 
 		GlobalRegistry.Lock.Lock()

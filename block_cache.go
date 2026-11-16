@@ -417,6 +417,11 @@ func InitRegistry() {
 		_ = InitStorage()
 	}
 
+	if GlobalS3Index != nil {
+		GlobalS3Index.Stop()
+		GlobalS3Index = nil
+	}
+
 	GlobalRegistry = &CacheRegistry{
 		Files:        make(map[string]*FileCacheState),
 		Connections:  make(map[string]*ClientConnection),
@@ -433,6 +438,34 @@ func InitRegistry() {
 	go startDiskFreeMonitor()
 
 	go GlobalRegistry.startSpeedMonitor()
+
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		indexPath := filepath.Join(GlobalConfig.GetCacheDir(), "s3_index.json")
+		idx := NewS3AccessIndex(indexPath)
+		if err := idx.Load(); err != nil {
+			log.Printf("[S3Index] Warning: Failed to load %s: %v", indexPath, err)
+		}
+		GlobalS3Index = idx
+		idx.StartBackgroundLoops(GlobalStorage, GlobalRegistry)
+	}
+}
+
+// IsKeyInUse reports whether key has an active FileCacheState or open client connection.
+func (r *CacheRegistry) IsKeyInUse(key string) bool {
+	if r == nil || key == "" {
+		return false
+	}
+	r.Lock.RLock()
+	defer r.Lock.RUnlock()
+	if _, ok := r.Files[key]; ok {
+		return true
+	}
+	for _, conn := range r.Connections {
+		if conn != nil && conn.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *CacheRegistry) RegisterProbeBuffer(key string) {
