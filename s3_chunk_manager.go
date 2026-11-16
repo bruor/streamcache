@@ -301,8 +301,8 @@ func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
 		chunkLen = m.totalSize - chunkStart
 	}
 
-	// Open read handle to local scratch file
-	f, err := os.Open(m.state.PartPath)
+	// Open read-write handle so fallocate(FALLOC_FL_PUNCH_HOLE) succeeds (O_RDONLY fails with EBADF)
+	f, err := os.OpenFile(m.state.PartPath, os.O_RDWR, 0644)
 	if err != nil {
 		log.Printf("[S3ChunkManager] Failed to open local scratch for chunk %d of %s: %v", chunkIndex, m.key, err)
 		m.mu.Lock()
@@ -348,7 +348,10 @@ func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
 	m.mu.Unlock()
 
 	// 1. Deallocate physical disk blocks (Linux hole punching)
-	_ = PunchHole(f.Fd(), chunkStart, chunkLen)
+	if punchErr := PunchHole(f.Fd(), chunkStart, chunkLen); punchErr != nil {
+		log.Printf("[S3ChunkManager] WARNING: PunchHole failed for %s chunk %d [%d, %d): %v",
+			m.key, chunkIndex, chunkStart, chunkStart+chunkLen, punchErr)
+	}
 
 	// 2. Evict clean pages from host OS cache for this uploaded chunk
 	FadviseDontNeed(f.Fd(), chunkStart, chunkLen)

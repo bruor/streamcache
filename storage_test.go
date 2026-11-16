@@ -1388,6 +1388,100 @@ func TestS3StatDoesNotPolluteOriginETag(t *testing.T) {
 	}
 }
 
+func TestS3UploadWorkerPunchesHole(t *testing.T) {
+	mockS3 := NewMockS3Server("punch-worker-bucket")
+	defer mockS3.Close()
+
+	chunkSize := int64(64 * 1024) // 64 KB
+	backend, err := NewS3StorageBackend(S3Config{
+		Endpoint:     mockS3.URL(),
+		Bucket:       "punch-worker-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    chunkSize,
+	})
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	tempDir, err := os.MkdirTemp("", "sc2_punch_worker_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	key := "punch_worker_movie.mkv"
+	partPath := filepath.Join(tempDir, key+".part")
+	totalSize := chunkSize * 2
+
+	// Fill both chunks with non-zero bytes on disk
+	data := make([]byte, totalSize)
+	for i := range data {
+		data[i] = 0x5A
+	}
+	if err := os.WriteFile(partPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile error: %v", err)
+	}
+
+	state := &FileCacheState{
+		Key:       key,
+		PartPath:  partPath,
+		TotalSize: totalSize,
+		RangeSet:  NewRangeSet(),
+		Clients:   make(map[string]chan struct{}),
+	}
+	chunkMgr := NewS3ChunkManager(state, backend, chunkSize)
+
+	// Upload only chunk 0 via uploadWorker
+	state.RangeSet.Add(0, chunkSize)
+	chunkMgr.CheckAndTriggerUploads()
+	chunkMgr.wg.Wait()
+
+	if !chunkMgr.IsChunkUploaded(0) {
+		t.Fatalf("Expected chunk 0 to be uploaded")
+	}
+
+	// Verify S3 received intact non-zero chunk 0 data before hole was punched
+	rc, err := backend.OpenChunkRange(context.Background(), key, 0, 0, chunkSize)
+	if err != nil {
+		t.Fatalf("OpenChunkRange error: %v", err)
+	}
+	s3Bytes, _ := io.ReadAll(rc)
+	_ = rc.Close()
+	if !bytes.Equal(s3Bytes, data[:chunkSize]) {
+		t.Fatalf("Uploaded S3 chunk 0 bytes corrupted!")
+	}
+
+	// Verify local .part chunk 0 was hole-punched by uploadWorker (reads back as zeros on Linux)
+	f, err := os.Open(partPath)
+	if err != nil {
+		t.Fatalf("Open error: %v", err)
+	}
+	defer f.Close()
+
+	localChunk0 := make([]byte, chunkSize)
+	if _, err := io.ReadFull(f, localChunk0); err != nil {
+		t.Fatalf("ReadFull local chunk 0 error: %v", err)
+	}
+	for i, b := range localChunk0 {
+		if b != 0 {
+			t.Fatalf("Expected uploadWorker to punch hole in chunk 0 (offset %d was 0x%02x, expected 0x00)", i, b)
+		}
+	}
+
+	// Chunk 1 (not uploaded yet) must still retain 0x5A
+	localChunk1 := make([]byte, chunkSize)
+	if _, err := f.ReadAt(localChunk1, chunkSize); err != nil {
+		t.Fatalf("ReadAt local chunk 1 error: %v", err)
+	}
+	if !bytes.Equal(localChunk1, data[chunkSize:]) {
+		t.Fatalf("Chunk 1 on disk was unexpectedly modified!")
+	}
+}
+
 
 
 
