@@ -1656,7 +1656,9 @@
             let rawStatus = fileData.upstream_status || 'Downloading';
             
             // Refine status label for intuitive clarity
-            if (fileData.is_yielding || rawStatus === 'Yielding') {
+            if (rawStatus === 'Committing') {
+                rawStatus = 'Committing';
+            } else if (fileData.is_yielding || rawStatus === 'Yielding') {
                 rawStatus = 'Yielding';
             } else if (fileData.is_prehydrating || rawStatus === 'Prehydrating') {
                 rawStatus = 'Prehydrating';

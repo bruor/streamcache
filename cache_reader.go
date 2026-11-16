@@ -624,7 +624,8 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	// 1. LiveBuffer Fast-Path: check in-memory buffer first for zero-copy playback
 	if lb != nil {
 		if memN, ok := lb.ReadAt(p[:toRead], off); ok && memN > 0 {
-			if memN < int(toRead) && (r.state.IsDiskMaterialized() || FileExists(r.state.PartPath) || FileExists(r.state.Path)) {
+			isS3Chunked := GlobalStorage != nil && GlobalStorage.Type() == "s3" && r.state.ChunkManager != nil
+			if memN < int(toRead) && !isS3Chunked && (r.state.IsDiskMaterialized() || FileExists(r.state.PartPath) || FileExists(r.state.Path)) {
 				if f, ferr := r.getFile(); ferr == nil {
 					diskN, _ := f.ReadAt(p[memN:toRead], off+int64(memN))
 					memN += diskN
@@ -723,21 +724,25 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 				}
 				r.chunkBufMu.Unlock()
 
-				// If chunk read failed (e.g. chunks deleted during recomposition race), transition to monolithic reader
-				if r.state.ChunkManager.IsRecomposed() {
-					s3Reader, err := r.getS3Reader()
-					if err == nil {
-						s3N, rerr := s3Reader.ReadAt(p[:toRead], off)
-						if s3N > 0 {
-							GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
-							GlobalRegistry.SetConnectionInCache(r.clientID, true)
-							return s3N, nil
-						}
-						if rerr != nil {
-							return 0, rerr
-						}
+				// Chunk was already uploaded to S3 and hole-punched locally: NEVER fall back to reading zeroes from .part!
+				// If OpenChunkRange failed (e.g. DeleteObjects ran milliseconds before m.recomposed=true),
+				// immediately try opening the sealed monolithic S3 object (CompleteMultipartUpload finishes before DeleteObjects).
+				s3Reader, s3Err := r.getS3Reader()
+				if s3Err == nil {
+					s3N, rerr := s3Reader.ReadAt(p[:toRead], off)
+					if s3N > 0 {
+						GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
+						GlobalRegistry.SetConnectionInCache(r.clientID, true)
+						return s3N, nil
+					}
+					if rerr != nil {
+						return 0, rerr
 					}
 				}
+				if err != nil {
+					return 0, err
+				}
+				return 0, s3Err
 			}
 		}
 	}

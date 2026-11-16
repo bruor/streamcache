@@ -149,7 +149,9 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 	}
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
 		chunkSize := int64(64 * 1024 * 1024)
-		if GlobalConfig != nil {
+		if s3b, ok := GlobalStorage.(*S3StorageBackend); ok && s3b.ChunkSize() > 0 {
+			chunkSize = s3b.ChunkSize()
+		} else if GlobalConfig != nil {
 			chunkSize = GlobalConfig.GetS3Config().ChunkSize
 		}
 		s.ChunkManager = NewS3ChunkManager(s, GlobalStorage, chunkSize)

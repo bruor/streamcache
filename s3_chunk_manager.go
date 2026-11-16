@@ -98,7 +98,14 @@ func NewS3ChunkManager(state *FileCacheState, storage StorageBackend, chunkSize 
 
 	maxInFlight := int64(2 * 1024 * 1024 * 1024) // 2GB default
 	minFreeDisk := int64(1 * 1024 * 1024 * 1024) // 1GB default
-	if GlobalConfig != nil {
+	if s3b, ok := storage.(*S3StorageBackend); ok {
+		if s3b.ScratchMaxBytes() > 0 {
+			maxInFlight = s3b.ScratchMaxBytes()
+		}
+		if s3b.ScratchMinFreeBytes() > 0 {
+			minFreeDisk = s3b.ScratchMinFreeBytes()
+		}
+	} else if GlobalConfig != nil {
 		s3Cfg := GlobalConfig.GetS3Config()
 		if s3Cfg.ScratchMaxBytes > 0 {
 			maxInFlight = s3Cfg.ScratchMaxBytes
