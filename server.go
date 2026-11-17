@@ -190,6 +190,10 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					startOffset = parseRangeStart(r.Header.Get("Range"))
 				}
 
+				cacheSource := "disk"
+				if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+					cacheSource = "s3"
+				}
 				conn := &ClientConnection{
 					ID:             connID,
 					Key:            cacheFileName,
@@ -202,6 +206,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					TotalSize:      totalSize,
 					StartTime:      time.Now().Unix(),
 					InCache:        true,
+					CacheSource:    cacheSource,
 					StarvingOffset: -1,
 				}
 				GlobalRegistry.RegisterConnection(connID, conn)
@@ -548,6 +553,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
+		"storage_backend":        GlobalConfig.GetStorageBackend(),
 		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
 		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
 		"disk_free_bytes":        freeSpace,

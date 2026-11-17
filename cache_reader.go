@@ -75,6 +75,15 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		startOffset = parseRangeStart(req.Header.Get("Range"))
 	}
 
+	cacheSource := ""
+	if isCompleted {
+		if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+			cacheSource = "s3"
+		} else {
+			cacheSource = "disk"
+		}
+	}
+
 	conn := &ClientConnection{
 		ID:             clientID,
 		Key:            key,
@@ -87,6 +96,7 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		TotalSize:      totalSize,
 		StartTime:      time.Now().Unix(),
 		InCache:        isCompleted,
+		CacheSource:    cacheSource,
 		StarvingOffset: -1,
 	}
 	GlobalRegistry.RegisterConnection(clientID, conn)

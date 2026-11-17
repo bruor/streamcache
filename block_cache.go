@@ -37,6 +37,7 @@ type ClientConnection struct {
 	TotalSize      int64  `json:"total_size"`
 	StartTime      int64  `json:"start_time"` // Unix timestamp
 	InCache        bool   `json:"in_cache"`
+	CacheSource    string `json:"cache_source,omitempty"`
 	StarvingOffset int64  `json:"starving_offset"` // -1 if not starving
 }
 
@@ -53,6 +54,7 @@ type ClientSession struct {
 	StartTime      int64                       `json:"start_time"` // Unix timestamp
 	LastActive     time.Time                   `json:"last_active"`
 	InCache        bool                        `json:"in_cache"`
+	CacheSource    string                      `json:"cache_source,omitempty"`
 	StarvingOffset int64                       `json:"starving_offset"` // -1 if not starving
 	ActiveConns    int                         `json:"active_conns"`
 	Conns          map[string]*SessionConnInfo `json:"-"`
@@ -836,6 +838,9 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		if !conn.InCache {
 			matchedSession.InCache = false
 		}
+		if conn.CacheSource != "" {
+			matchedSession.CacheSource = conn.CacheSource
+		}
 		matchedSession.StarvingOffset = conn.StarvingOffset
 	} else {
 		if r.Sessions == nil {
@@ -862,6 +867,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 			StartTime:      time.Now().Unix(),
 			LastActive:     time.Now(),
 			InCache:        conn.InCache,
+			CacheSource:    conn.CacheSource,
 			StarvingOffset: conn.StarvingOffset,
 			ActiveConns:    1,
 			Conns: map[string]*SessionConnInfo{
@@ -928,11 +934,21 @@ func (r *CacheRegistry) SetConnectionInCache(connID string, inCache bool) {
 	if r.Connections != nil {
 		if conn, ok := r.Connections[connID]; ok {
 			conn.InCache = inCache
+			if inCache && conn.CacheSource == "" {
+				if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+					conn.CacheSource = "s3"
+				} else {
+					conn.CacheSource = "disk"
+				}
+			}
 			if r.Sessions != nil {
 				for _, session := range r.Sessions {
 					if _, exists := session.Conns[connID]; exists {
 						if !inCache {
 							session.InCache = false
+						}
+						if conn.CacheSource != "" {
+							session.CacheSource = conn.CacheSource
 						}
 						session.LastActive = time.Now()
 						break
@@ -1013,6 +1029,7 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 								StartTime:      cc.StartTime,
 								LastActive:     now,
 								InCache:        cc.InCache,
+								CacheSource:    cc.CacheSource,
 								StarvingOffset: cc.StarvingOffset,
 								ActiveConns:    1,
 								Conns: map[string]*SessionConnInfo{
@@ -1101,6 +1118,14 @@ func (r *CacheRegistry) LoadExistingCache() {
 			return nil
 		}
 		if !d.IsDir() {
+			base := filepath.Base(path)
+			if base == "s3_index.json" {
+				return nil
+			}
+			if strings.HasPrefix(base, "s3_index.json.tmp.") {
+				_ = os.Remove(path)
+				return nil
+			}
 			ext := filepath.Ext(path)
 			if ext == ".json" {
 				// Check if the corresponding media file exists
@@ -1225,7 +1250,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 
 	var availableFreeable int64
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
 			continue
 		}
 		if !activeKeys[entry.Name()] {
@@ -1281,7 +1306,7 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 	var files []fileInfo
 
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
 			continue
 		}
 		path := filepath.Join(cacheDir, entry.Name())

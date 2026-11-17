@@ -256,6 +256,12 @@
             border: 1px solid rgba(57, 255, 20, 0.35);
         }
 
+        .session-origin-badge.s3 {
+            background: rgba(255, 159, 28, 0.14);
+            color: var(--accent-orange);
+            border: 1px solid rgba(255, 159, 28, 0.4);
+        }
+
         .session-origin-badge.cdn {
             background: rgba(0, 240, 255, 0.12);
             color: var(--accent-secondary);
@@ -1920,7 +1926,13 @@
                 let originBadge = '';
                 let hydrationBadge = '';
                 if (conn.in_cache) {
-                    originBadge = `<span class="session-origin-badge disk">DISK</span>`;
+                    const defaultBackend = (latestServerState && latestServerState.storage_backend) ? latestServerState.storage_backend : 'disk';
+                    const cacheBackend = (conn.cache_source || defaultBackend || 'disk').toLowerCase();
+                    if (cacheBackend === 's3') {
+                        originBadge = `<span class="session-origin-badge s3">S3</span>`;
+                    } else {
+                        originBadge = `<span class="session-origin-badge disk">DISK</span>`;
+                    }
                 } else {
                     originBadge = `<span class="session-origin-badge cdn">CDN</span>`;
                     const fileData = fileStore[conn.key];

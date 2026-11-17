@@ -423,6 +423,7 @@ func buildStatePayload() ([]byte, error) {
 
 	data := map[string]interface{}{
 		"server_instance_id":     ServerInstanceID,
+		"storage_backend":        GlobalConfig.GetStorageBackend(),
 		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
 		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
 		"max_observed_speed":     GlobalRegistry.GetMaxObservedSpeed(),

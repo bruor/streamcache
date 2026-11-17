@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -508,5 +509,95 @@ func TestS3PrehydrationChainsBeforeRecomposeCompletes(t *testing.T) {
 	case <-commitDone:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Timed out waiting for finalizeAndCommitCache to complete")
+	}
+}
+
+func TestLoadExistingCachePreservesS3Index(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "sc2_load_s3_index_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	origConfig := GlobalConfig
+	GlobalConfig = &Config{
+		CacheDir: filepath.Join(tempDir, "files"),
+		TmpDir:   filepath.Join(tempDir, "tmp"),
+	}
+	defer func() { GlobalConfig = origConfig }()
+
+	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
+	_ = os.MkdirAll(GlobalConfig.TmpDir, 0755)
+
+	// Write s3_index.json, a crash temp file, and an orphaned media .json
+	s3IndexPath := filepath.Join(GlobalConfig.CacheDir, "s3_index.json")
+	tmpIndexPath := filepath.Join(GlobalConfig.CacheDir, "s3_index.json.tmp.12345")
+	orphanMetaPath := filepath.Join(GlobalConfig.CacheDir, "orphan_movie.mkv.json")
+	_ = os.WriteFile(s3IndexPath, []byte(`{"ep1.mkv":{"key":"ep1.mkv","last_accessed":1700000000}}`), 0644)
+	_ = os.WriteFile(tmpIndexPath, []byte(`partial`), 0644)
+	_ = os.WriteFile(orphanMetaPath, []byte(`{}`), 0644)
+
+	reg := &CacheRegistry{
+		Files:       make(map[string]*FileCacheState),
+		Connections: make(map[string]*ClientConnection),
+		Sessions:    make(map[string]*ClientSession),
+	}
+	reg.LoadExistingCache()
+
+	if !FileExists(s3IndexPath) {
+		t.Fatalf("Expected LoadExistingCache to preserve s3_index.json")
+	}
+	if FileExists(tmpIndexPath) {
+		t.Errorf("Expected LoadExistingCache to clean up s3_index.json.tmp.*")
+	}
+	if FileExists(orphanMetaPath) {
+		t.Errorf("Expected LoadExistingCache to clean up orphan_movie.mkv.json")
+	}
+}
+
+func TestClientSessionCacheSourceS3(t *testing.T) {
+	origConfig := GlobalConfig
+	origRegistry := GlobalRegistry
+	defer func() {
+		GlobalConfig = origConfig
+		GlobalRegistry = origRegistry
+	}()
+
+	GlobalConfig = &Config{StorageBackend: "s3"}
+	reg := &CacheRegistry{
+		Files:       make(map[string]*FileCacheState),
+		Connections: make(map[string]*ClientConnection),
+		Sessions:    make(map[string]*ClientSession),
+	}
+	GlobalRegistry = reg
+
+	reg.RegisterConnection("conn-s3-1", &ClientConnection{
+		ID:          "conn-s3-1",
+		Key:         "ep1.mkv",
+		URL:         "http://origin/ep1.mkv",
+		RemoteAddr:  "127.0.0.1:1234",
+		UserAgent:   "Emby",
+		TotalSize:   1000,
+		StartTime:   time.Now().Unix(),
+		InCache:     true,
+		CacheSource: "s3",
+	})
+	defer reg.UnregisterConnection("conn-s3-1")
+
+	sessions := reg.GetActiveSessions()
+	if len(sessions) != 1 || sessions[0].CacheSource != "s3" {
+		t.Fatalf("Expected active session CacheSource='s3', got %+v", sessions)
+	}
+
+	raw, err := buildStatePayload()
+	if err != nil {
+		t.Fatalf("buildStatePayload error: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("Unmarshal buildStateJSON error: %v", err)
+	}
+	if payload["storage_backend"] != "s3" {
+		t.Errorf("Expected storage_backend='s3' in SSE state, got %v", payload["storage_backend"])
 	}
 }
