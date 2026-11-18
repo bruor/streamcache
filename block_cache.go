@@ -37,6 +37,7 @@ type ClientConnection struct {
 	TotalSize      int64  `json:"total_size"`
 	StartTime      int64  `json:"start_time"` // Unix timestamp
 	InCache        bool   `json:"in_cache"`
+	CacheSource    string `json:"cache_source,omitempty"`
 	StarvingOffset int64  `json:"starving_offset"` // -1 if not starving
 }
 
@@ -53,6 +54,7 @@ type ClientSession struct {
 	StartTime      int64                       `json:"start_time"` // Unix timestamp
 	LastActive     time.Time                   `json:"last_active"`
 	InCache        bool                        `json:"in_cache"`
+	CacheSource    string                      `json:"cache_source,omitempty"`
 	StarvingOffset int64                       `json:"starving_offset"` // -1 if not starving
 	ActiveConns    int                         `json:"active_conns"`
 	Conns          map[string]*SessionConnInfo `json:"-"`
@@ -70,6 +72,7 @@ type FileCacheState struct {
 	MetaPath      string
 	TotalSize     int64
 	RangeSet      *RangeSet
+	DiskRangeSet  *RangeSet
 	Cond          *sync.Cond
 	ContentType   string
 	ETag          string
@@ -79,6 +82,7 @@ type FileCacheState struct {
 	Lock               sync.Mutex
 	Cancel             context.CancelFunc
 	WriterActive       bool
+	IsCommitting       bool
 	Clients            map[string]chan struct{}
 	Starving           map[string]int64 // Map of clientID -> starving byte offset
 	StarvingSince      map[string]time.Time // Map of clientID -> when starvation began
@@ -101,6 +105,7 @@ type FileCacheState struct {
 	Sniffed              bool
 	LiveBuffer           *LiveBuffer
 	Pipeline             StorageSink
+	ChunkManager         *S3ChunkManager
 	IsPrehydrating       bool
 	IsYielding           bool
 	IsProbe              bool
@@ -129,6 +134,7 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		MetaPath:                  metaPath,
 		TotalSize:                 totalSize,
 		RangeSet:                  NewRangeSet(),
+		DiskRangeSet:              NewRangeSet(),
 		ContentType:               contentType,
 		ETag:                      etag,
 		LastModified:              lastMod,
@@ -142,6 +148,15 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		LiveBuffer:                NewLiveBuffer(bufSize),
 		LastProgressTimeNano:      time.Now().UnixNano(),
 		StalledGaps:               make(map[int64]int64),
+	}
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		chunkSize := int64(64 * 1024 * 1024)
+		if s3b, ok := GlobalStorage.(*S3StorageBackend); ok && s3b.ChunkSize() > 0 {
+			chunkSize = s3b.ChunkSize()
+		} else if GlobalConfig != nil {
+			chunkSize = GlobalConfig.GetS3Config().ChunkSize
+		}
+		s.ChunkManager = NewS3ChunkManager(s, GlobalStorage, chunkSize)
 	}
 	s.Cond = sync.NewCond(&s.Lock)
 	return s
@@ -183,6 +198,16 @@ type ConnectionInfo struct {
 	ID     string
 	Opened time.Time
 	Closed time.Time // IsZero if still active
+}
+
+// GetChunkManager safely reads s.ChunkManager under s.Lock.
+func (s *FileCacheState) GetChunkManager() *S3ChunkManager {
+	if s == nil {
+		return nil
+	}
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	return s.ChunkManager
 }
 
 func (s *FileCacheState) SetUpstreamStatus(status string) {
@@ -329,7 +354,7 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 			}
 		}
 	} else if s.LiveBuffer != nil {
-		_ = s.LiveBuffer.FlushToFile(file)
+		_ = s.LiveBuffer.FlushToFileAndTrack(file, s.DiskRangeSet)
 	}
 
 	if s.File != nil && s.File != file {
@@ -400,6 +425,15 @@ func (r *CacheRegistry) IsProbeActive() bool {
 }
 
 func InitRegistry() {
+	if GlobalStorage == nil {
+		_ = InitStorage()
+	}
+
+	if GlobalS3Index != nil {
+		GlobalS3Index.Stop()
+		GlobalS3Index = nil
+	}
+
 	GlobalRegistry = &CacheRegistry{
 		Files:        make(map[string]*FileCacheState),
 		Connections:  make(map[string]*ClientConnection),
@@ -416,6 +450,34 @@ func InitRegistry() {
 	go startDiskFreeMonitor()
 
 	go GlobalRegistry.startSpeedMonitor()
+
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		indexPath := filepath.Join(GlobalConfig.GetCacheDir(), "s3_index.json")
+		idx := NewS3AccessIndex(indexPath)
+		if err := idx.Load(); err != nil {
+			log.Printf("[S3Index] Warning: Failed to load %s: %v", indexPath, err)
+		}
+		GlobalS3Index = idx
+		idx.StartBackgroundLoops(GlobalStorage, GlobalRegistry)
+	}
+}
+
+// IsKeyInUse reports whether key has an active FileCacheState or open client connection.
+func (r *CacheRegistry) IsKeyInUse(key string) bool {
+	if r == nil || key == "" {
+		return false
+	}
+	r.Lock.RLock()
+	defer r.Lock.RUnlock()
+	if _, ok := r.Files[key]; ok {
+		return true
+	}
+	for _, conn := range r.Connections {
+		if conn != nil && conn.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *CacheRegistry) RegisterProbeBuffer(key string) {
@@ -786,6 +848,9 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		if !conn.InCache {
 			matchedSession.InCache = false
 		}
+		if conn.CacheSource != "" {
+			matchedSession.CacheSource = conn.CacheSource
+		}
 		matchedSession.StarvingOffset = conn.StarvingOffset
 	} else {
 		if r.Sessions == nil {
@@ -812,6 +877,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 			StartTime:      time.Now().Unix(),
 			LastActive:     time.Now(),
 			InCache:        conn.InCache,
+			CacheSource:    conn.CacheSource,
 			StarvingOffset: conn.StarvingOffset,
 			ActiveConns:    1,
 			Conns: map[string]*SessionConnInfo{
@@ -878,11 +944,21 @@ func (r *CacheRegistry) SetConnectionInCache(connID string, inCache bool) {
 	if r.Connections != nil {
 		if conn, ok := r.Connections[connID]; ok {
 			conn.InCache = inCache
+			if inCache && conn.CacheSource == "" {
+				if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+					conn.CacheSource = "s3"
+				} else {
+					conn.CacheSource = "disk"
+				}
+			}
 			if r.Sessions != nil {
 				for _, session := range r.Sessions {
 					if _, exists := session.Conns[connID]; exists {
 						if !inCache {
 							session.InCache = false
+						}
+						if conn.CacheSource != "" {
+							session.CacheSource = conn.CacheSource
 						}
 						session.LastActive = time.Now()
 						break
@@ -963,6 +1039,7 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 								StartTime:      cc.StartTime,
 								LastActive:     now,
 								InCache:        cc.InCache,
+								CacheSource:    cc.CacheSource,
 								StarvingOffset: cc.StarvingOffset,
 								ActiveConns:    1,
 								Conns: map[string]*SessionConnInfo{
@@ -1051,6 +1128,14 @@ func (r *CacheRegistry) LoadExistingCache() {
 			return nil
 		}
 		if !d.IsDir() {
+			base := filepath.Base(path)
+			if base == "s3_index.json" {
+				return nil
+			}
+			if strings.HasPrefix(base, "s3_index.json.tmp.") {
+				_ = os.Remove(path)
+				return nil
+			}
 			ext := filepath.Ext(path)
 			if ext == ".json" {
 				// Check if the corresponding media file exists
@@ -1175,7 +1260,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 
 	var availableFreeable int64
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
 			continue
 		}
 		if !activeKeys[entry.Name()] {
@@ -1231,7 +1316,7 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 	var files []fileInfo
 
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
 			continue
 		}
 		path := filepath.Join(cacheDir, entry.Name())

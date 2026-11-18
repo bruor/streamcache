@@ -23,3 +23,11 @@ func FadviseDontNeed(fd uintptr, offset int64, length int64) {
 	}
 	_ = unix.Fadvise(int(fd), offset, length, unix.FADV_DONTNEED)
 }
+
+// PunchHole deallocates physical disk blocks while preserving file offsets (ext4, xfs, btrfs)
+func PunchHole(fd uintptr, offset int64, length int64) error {
+	if fd == 0 || fd == ^uintptr(0) || length <= 0 {
+		return nil
+	}
+	return unix.Fallocate(int(fd), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, offset, length)
+}

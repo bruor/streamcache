@@ -137,6 +137,8 @@ func CancelCoordinator(state *FileCacheState) {
 		state.LiveBuffer.Clear()
 		state.LiveBuffer = nil
 	}
+	chunkManager := state.ChunkManager
+	state.ChunkManager = nil
 	state.Lock.Unlock()
 
 	if GlobalRegistry != nil {
@@ -157,6 +159,10 @@ func CancelCoordinator(state *FileCacheState) {
 
 	if pipelineToClose != nil {
 		_ = pipelineToClose.FlushAndClose()
+	}
+
+	if chunkManager != nil {
+		chunkManager.Close()
 	}
 
 	if fileToClose != nil {
@@ -292,9 +298,13 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			state.File = nil
 			pipelineToClose := state.Pipeline
 			state.Pipeline = nil
+			state.IsCommitting = true
+			state.UpstreamStatus = "Committing"
 			state.Lock.Unlock()
 
-			state.SetUpstreamStatus("Committing")
+			if GlobalLogBroker != nil {
+				go GlobalLogBroker.BroadcastStateUpdate()
+			}
 			log.Printf("[Coord] Committing completed cache file to disk: %s", state.Key)
 
 			go finalizeAndCommitCache(state, fileToClose, pipelineToClose)
@@ -868,6 +878,10 @@ func runDownloadWorker(
 	defer onExit(w)
 	log.Printf("[Worker-%d] Starting background downloader at offset %d", w.id, w.startOffset)
 
+	state.Lock.Lock()
+	cm := state.ChunkManager
+	state.Lock.Unlock()
+
 	consecutiveFailures := 0
 	backoff := 2 * time.Second
 	currentOffset := w.startOffset
@@ -1156,6 +1170,14 @@ func runDownloadWorker(
 			}
 		}
 
+		// Wait if scratch disk budget is exceeded or disk free space is low (TCP socket backpressure)
+		if cm != nil {
+			if berr := cm.WaitScratchBudget(ctx); berr != nil {
+				closeConnection()
+				return
+			}
+		}
+
 		// Read streaming chunk from upstream HTTP body
 		readStartTime := time.Now()
 		n, err := activeRespBody.Read(buf)
@@ -1165,6 +1187,9 @@ func runDownloadWorker(
 				werr = pipeline.WriteChunk(currentOffset, buf[:n])
 			} else if file != nil {
 				_, werr = file.WriteAt(buf[:n], currentOffset)
+				if werr == nil && state.DiskRangeSet != nil {
+					state.DiskRangeSet.Add(currentOffset, currentOffset+int64(n))
+				}
 			}
 			if werr != nil {
 				log.Printf("[Worker-%d] File write error at %d: %v", w.id, currentOffset, werr)
@@ -1180,6 +1205,10 @@ func runDownloadWorker(
 			newMediaBytes := state.RangeSet.AddAndCount(currentOffset, currentOffset+int64(n))
 			if newMediaBytes > 0 {
 				atomic.StoreInt64(&state.LastProgressTimeNano, time.Now().UnixNano())
+			}
+			if cm != nil {
+				cm.AddInFlightBytes(int64(n))
+				cm.CheckAndTriggerUploads()
 			}
 
 			state.Lock.Lock()
@@ -1393,6 +1422,10 @@ func runInlineTailPrefetch(
 	atomic.StoreInt64(&w.currentOffset, tailStartOffset)
 	defer atomic.StoreInt32(&w.isPrefetching, 0)
 
+	state.Lock.Lock()
+	cm := state.ChunkManager
+	state.Lock.Unlock()
+
 	log.Printf("[Worker-%d] MaxUpstreamWorkers=1: Executing inline tail pre-fetch (%d bytes) starting at offset %d", w.id, prefetchLength, tailStartOffset)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", state.URL, nil)
@@ -1435,6 +1468,9 @@ func runInlineTailPrefetch(
 				werr = pipeline.WriteChunk(currentOffset, buf[:n])
 			} else if file != nil {
 				_, werr = file.WriteAt(buf[:n], currentOffset)
+				if werr == nil && state.DiskRangeSet != nil {
+					state.DiskRangeSet.Add(currentOffset, currentOffset+int64(n))
+				}
 			}
 			if werr != nil {
 				log.Printf("[Worker-%d] Inline tail pre-fetch write error at %d: %v", w.id, currentOffset, werr)
@@ -1444,6 +1480,9 @@ func runInlineTailPrefetch(
 			newMediaBytes := state.RangeSet.AddAndCount(currentOffset, currentOffset+int64(n))
 			if newMediaBytes > 0 {
 				atomic.StoreInt64(&state.LastProgressTimeNano, time.Now().UnixNano())
+			}
+			if cm != nil {
+				cm.CheckAndTriggerUploads()
 			}
 			state.Lock.Lock()
 			for _, ch := range state.Clients {
@@ -1568,6 +1607,7 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 	defer func() {
 		state.Lock.Lock()
 		state.WriterActive = false
+		state.IsCommitting = false
 		state.Lock.Unlock()
 	}()
 
@@ -1590,6 +1630,64 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 		state.LiveBuffer = nil
 	}
 	state.Lock.Unlock()
+
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		// Upstream download is complete and all provider connections are closed;
+		// release the prehydration chain before S3 recomposition so the next episode
+		// can begin downloading immediately instead of waiting for Recompose.
+		if GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(state)
+		}
+
+		meta := FileMeta{
+			URL:           state.URL,
+			TotalSize:     state.TotalSize,
+			ContentType:   state.ContentType,
+			ETag:          state.ETag,
+			LastModified:  state.LastModified,
+			LastValidated: time.Now().Unix(),
+			Completed:     true,
+		}
+
+		var commitErr error
+		if cm := state.GetChunkManager(); cm != nil {
+			commitErr = cm.WaitAndRecompose(context.Background())
+		} else {
+			commitErr = GlobalStorage.CommitLocalFile(context.Background(), state.Key, state.PartPath, meta)
+		}
+
+		_ = os.Remove(state.PartPath)
+		_ = os.Remove(state.MetaPath)
+
+		accounted := atomic.SwapInt64(&state.TotalBytesDownloaded, 0)
+		if accounted > 0 && GlobalRegistry != nil {
+			GlobalRegistry.UpdateSize(-accounted)
+		}
+
+		GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+		if commitErr != nil {
+			log.Printf("[Coord] S3 commit/recomposition FAILED for %s: %v", state.Key, commitErr)
+			state.SetUpstreamStatus("Error")
+		} else {
+			state.SetUpstreamStatus("Completed")
+			log.Printf("[Coord] Cached file finalized and committed to S3: %s", state.Key)
+			if GlobalS3Index != nil {
+				GlobalS3Index.RecordCommit(state.Key, state.URL, state.TotalSize)
+			}
+		}
+
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, state.Key)
+		GlobalRegistry.Lock.Unlock()
+
+		if GlobalLogBroker != nil {
+			go GlobalLogBroker.BroadcastStateUpdate()
+		}
+
+		runtime.GC()
+		debug.FreeOSMemory()
+		return
+	}
 
 	if !FileExists(state.Path) {
 		err := os.Rename(state.PartPath, state.Path)

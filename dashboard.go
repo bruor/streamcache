@@ -215,10 +215,11 @@ func buildStatePayload() ([]byte, error) {
 		ConnectionsLast30s int            `json:"connections_last_30s"`
 		ObservedCooldown   float64        `json:"observed_cooldown"`
 		UpstreamUserAgent  string         `json:"upstream_user_agent"`
-		IsPrehydrating     bool           `json:"is_prehydrating"`
-		IsYielding         bool           `json:"is_yielding"`
-		QueuedPrehydrations int           `json:"queued_prehydrations"`
-		NextURLs           []string       `json:"next_urls,omitempty"`
+		IsPrehydrating      bool            `json:"is_prehydrating"`
+		IsYielding          bool            `json:"is_yielding"`
+		QueuedPrehydrations int             `json:"queued_prehydrations"`
+		NextURLs            []string        `json:"next_urls,omitempty"`
+		CommitProgress      *CommitProgress `json:"commit_progress,omitempty"`
 	}
 
 	type sseProbeBuffer struct {
@@ -354,30 +355,36 @@ func buildStatePayload() ([]byte, error) {
 			status = "Downloading"
 		}
 
+		var commitProgress *CommitProgress
+		if status == "Committing" && fileState.ChunkManager != nil {
+			commitProgress = fileState.ChunkManager.GetCommitProgress()
+		}
+
 		activeFiles = append(activeFiles, sseFile{
-			Key:                k,
-			URL:                fileState.URL,
-			TotalSize:          fileState.TotalSize,
-			Ranges:             ranges,
-			DownloadedBytes:    downloaded,
-			ActiveWriter:       fileState.WriterActive,
-			ActiveClients:      len(fileState.Clients),
-			ActiveWorkers:      activeCount,
-			MaxWorkers:         GlobalConfig.GetMaxUpstreamWorkers(),
-			StarvingQueue:      starveQueue,
-			DownloadSpeed:      fileState.DownloadSpeed,
-			AvgDownloadSpeed:   fileState.AvgDownloadSpeed,
-			UpstreamStatus:     status,
-			IsStalled:          fileState.ZeroSpeedSec >= 3,
-			StalledSeconds:     fileState.ZeroSpeedSec,
-			ClientPositions:    clientPositions,
-			ConnectionsLast30s: activeCount + closedInLast30sCount,
-			ObservedCooldown:   fileState.ObservedCooldown,
-			UpstreamUserAgent:  effectiveUA,
-			IsPrehydrating:     fileState.IsPrehydrating,
-			IsYielding:         fileState.IsYielding,
+			Key:                 k,
+			URL:                 fileState.URL,
+			TotalSize:           fileState.TotalSize,
+			Ranges:              ranges,
+			DownloadedBytes:     downloaded,
+			ActiveWriter:        fileState.WriterActive,
+			ActiveClients:       len(fileState.Clients),
+			ActiveWorkers:       activeCount,
+			MaxWorkers:          GlobalConfig.GetMaxUpstreamWorkers(),
+			StarvingQueue:       starveQueue,
+			DownloadSpeed:       fileState.DownloadSpeed,
+			AvgDownloadSpeed:    fileState.AvgDownloadSpeed,
+			UpstreamStatus:      status,
+			IsStalled:           fileState.ZeroSpeedSec >= 3,
+			StalledSeconds:      fileState.ZeroSpeedSec,
+			ClientPositions:     clientPositions,
+			ConnectionsLast30s:  activeCount + closedInLast30sCount,
+			ObservedCooldown:    fileState.ObservedCooldown,
+			UpstreamUserAgent:   effectiveUA,
+			IsPrehydrating:      fileState.IsPrehydrating,
+			IsYielding:          fileState.IsYielding,
 			QueuedPrehydrations: len(fileState.NextURLs),
-			NextURLs:           append([]string(nil), fileState.NextURLs...),
+			NextURLs:            append([]string(nil), fileState.NextURLs...),
+			CommitProgress:      commitProgress,
 		})
 		fileState.Lock.Unlock()
 	}
@@ -423,6 +430,7 @@ func buildStatePayload() ([]byte, error) {
 
 	data := map[string]interface{}{
 		"server_instance_id":     ServerInstanceID,
+		"storage_backend":        GlobalConfig.GetStorageBackend(),
 		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
 		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
 		"max_observed_speed":     GlobalRegistry.GetMaxObservedSpeed(),

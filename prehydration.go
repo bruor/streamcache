@@ -387,7 +387,7 @@ func (pm *PrehydrationManager) checkYieldConditions() {
 		fs.Lock.Lock()
 		if len(fs.Clients) > 0 {
 			hasActiveVODPlayback = true
-		} else if fs.IsPrehydrating && len(fs.Clients) == 0 && !fs.IsYielding && fs.WriterActive {
+		} else if fs.IsPrehydrating && len(fs.Clients) == 0 && !fs.IsYielding && !fs.IsCommitting && fs.WriterActive {
 			prehydratingFiles = append(prehydratingFiles, fs)
 		}
 		fs.Lock.Unlock()
@@ -515,7 +515,7 @@ func (pm *PrehydrationManager) checkZeroProgressSuspension() {
 			continue
 		}
 
-		if !fs.IsPrehydrating || len(fs.Clients) > 0 || fs.IsYielding || !fs.WriterActive {
+		if !fs.IsPrehydrating || len(fs.Clients) > 0 || fs.IsYielding || fs.IsCommitting || !fs.WriterActive {
 			fs.Lock.Unlock()
 			continue
 		}
@@ -716,6 +716,9 @@ func (pm *PrehydrationManager) OnCacheHit(currentURL string, nextURLs []string) 
 	}
 	pm.OnPlayerPlayback(currentURL, nextURLs)
 	pm.AutoDiscoverDispatcharrURL(currentURL)
+	if GlobalS3Index != nil {
+		GlobalS3Index.TouchChain(nextURLs)
+	}
 	pm.Enqueue(nextURLs[0], nextURLs[1:])
 }
 
@@ -727,6 +730,7 @@ func (pm *PrehydrationManager) OnHydrationCompleted(state *FileCacheState) {
 
 	state.Lock.Lock()
 	next := state.NextURLs
+	state.NextURLs = nil
 	key := state.Key
 	state.Lock.Unlock()
 
@@ -775,6 +779,19 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 	}
 }
 
+// isAssetCached checks whether a completed copy already exists in the configured storage backend (local disk or S3).
+func isAssetCached(ctx context.Context, cacheFileName, cacheFilePath string) bool {
+	if GlobalStorage != nil {
+		_, exists, err := GlobalStorage.Stat(ctx, cacheFileName)
+		if err != nil {
+			log.Printf("[Prehydration] Storage Stat error for %s: %v", cacheFileName, err)
+			return false
+		}
+		return exists
+	}
+	return FileExists(cacheFilePath)
+}
+
 // Enqueue adds an upcoming episode URL to the prehydration queue.
 func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	if pm == nil || targetURL == "" {
@@ -786,9 +803,14 @@ func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	cacheDir := GlobalConfig.GetCacheDir()
 	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
 
-	// If already completed on disk, chain immediately to the next one!
-	if FileExists(cacheFilePath) {
-		log.Printf("[Prehydration] Episode %s is already cached on disk (Cache HIT). Chaining to next in sequence.", targetURL)
+	// If already completed in storage (local disk or S3), chain immediately to the next one!
+	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
+		log.Printf("[Prehydration] Episode %s is already cached (Cache HIT). Chaining to next in sequence.", targetURL)
+		if GlobalS3Index != nil && !GlobalS3Index.TouchIfPresent(cacheFileName) && GlobalStorage != nil {
+			if sm, exists, err := GlobalStorage.Stat(context.Background(), cacheFileName); err == nil && exists && sm != nil {
+				GlobalS3Index.RecordAccess(cacheFileName, targetURL, sm.TotalSize)
+			}
+		}
 		if len(nextURLs) > 0 {
 			pm.Enqueue(nextURLs[0], nextURLs[1:])
 		}
@@ -924,7 +946,7 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 	cacheDir := GlobalConfig.GetCacheDir()
 	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
 
-	if FileExists(cacheFilePath) {
+	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
 		if len(task.NextURLs) > 0 {
 			pm.Enqueue(task.NextURLs[0], task.NextURLs[1:])
 		}

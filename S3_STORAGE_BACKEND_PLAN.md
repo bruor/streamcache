@@ -86,7 +86,7 @@ A core requirement of Streamcache is preventing redundant upstream connections t
    - **Zero Local Disk Usage**: The proxy streams `chunk_0000.bin` directly from OVH S3 through a small in-memory buffer (e.g. 4–8 MB in RAM) straight into Viewer 2's HTTP response.
 3. **Viewer 3 (Seeking Ahead to 95%)**:
    - If Viewer 3 seeks beyond Viewer 1, they starve for un-downloaded bytes.
-   - Streamcache's existing Starvation Scheduler ([coordinator.go](file:///home/adrien/opencode_projects/SC2/coordinator.go)) detects starvation and leapfrogs upstream download workers to fetch the 95% range immediately into local scratch.
+   - Streamcache's existing Starvation Scheduler ([coordinator.go](coordinator.go)) detects starvation and leapfrogs upstream download workers to fetch the 95% range immediately into local scratch.
 
 ---
 
@@ -178,7 +178,7 @@ type StorageBackend interface {
 
 ### 6.2 Reader Resolution Strategy
 
-The [`CacheReader.ReadAt`](file:///home/adrien/opencode_projects/SC2/cache_reader.go#L198) method resolves requested byte ranges through a tiered resolution hierarchy:
+The [`CacheReader.ReadAt`](cache_reader.go#L198) method resolves requested byte ranges through a tiered resolution hierarchy:
 
 ```
 Requested Range [Offset, Offset+Len]
@@ -226,7 +226,7 @@ Requested Range [Offset, Offset+Len]
   - `S3_SCRATCH_MAX_BYTES=4GB`
 
 ### Phase 4: S3 Chunk Reader for Concurrent Viewers
-- Update [`CacheReader`](file:///home/adrien/opencode_projects/SC2/cache_reader.go) to read seamlessly from S3 chunk objects when the requested offset is behind the active local scratch window.
+- Update [`CacheReader`](cache_reader.go) to read seamlessly from S3 chunk objects when the requested offset is behind the active local scratch window.
 - Verify that trailing viewers (Viewer 2 at 0%) consume zero local scratch space and zero origin CDN connections.
 
 ### Phase 5: Server-Side Recomposition (`UploadPartCopy`)
@@ -235,8 +235,8 @@ Requested Range [Offset, Offset+Len]
 - Implement post-recomposition reader migration and bulk deletion of temporary chunk objects.
 
 ### Phase 6: S3 Revalidation & Dashboard Telemetry
-- Update [revalidator.go](file:///home/adrien/opencode_projects/SC2/revalidator.go) to inspect and update S3 metadata.
-- Expose S3 storage metrics (committed S3 bytes, active chunk count, recomposition queue) on the real-time SSE Web Dashboard ([dashboard.go](file:///home/adrien/opencode_projects/SC2/dashboard.go)).
+- Update [revalidator.go](revalidator.go) to inspect and update S3 metadata.
+- Expose S3 storage metrics (committed S3 bytes, active chunk count, recomposition queue) on the real-time SSE Web Dashboard ([dashboard.go](dashboard.go)).
 
 ---
 

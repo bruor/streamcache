@@ -27,10 +27,14 @@ type Config struct {
 	UpstreamUserAgent       string
 	UpstreamUserAgentMode   string
 	MaxUpstreamRetries      int
-	StarvationStallTimeout  time.Duration
-	StallTeardownCooldown   time.Duration
-	LogVerbose              bool
-	WritebackBufferSize     int64
+	StarvationStallTimeout        time.Duration
+	StallTeardownCooldown         time.Duration
+	LogVerbose                    bool
+	WritebackBufferSize           int64
+	StorageBackend                string
+	S3Config                      S3Config
+	S3MaxIdleAge                  time.Duration
+	S3EvictInterval               time.Duration
 	DispatcharrURL                string
 	PrehydrateCapacityReservation int
 	DispatcharrPollInterval       time.Duration
@@ -293,6 +297,97 @@ func (c *Config) SetWritebackBufferSize(val int64) {
 	c.WritebackBufferSize = val
 }
 
+type S3Config struct {
+	Endpoint            string
+	Bucket              string
+	Region              string
+	AccessKey           string
+	SecretKey           string
+	UsePathStyle        bool
+	DisableSSL          bool
+	ChunkSize           int64
+	ScratchMaxBytes     int64
+	ScratchMinFreeBytes int64
+}
+
+func (c *Config) GetStorageBackend() string {
+	if c == nil {
+		return "local"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.StorageBackend == "" {
+		return "local"
+	}
+	return c.StorageBackend
+}
+
+func (c *Config) SetStorageBackend(b string) {
+	if c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.StorageBackend = b
+	}
+}
+
+func (c *Config) GetS3Config() S3Config {
+	if c == nil {
+		return S3Config{
+			ChunkSize:           64 * 1024 * 1024,
+			ScratchMaxBytes:     2 * 1024 * 1024 * 1024,
+			ScratchMinFreeBytes: 1 * 1024 * 1024 * 1024,
+		}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.S3Config
+}
+
+func (c *Config) SetS3Config(s3Cfg S3Config) {
+	if c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.S3Config = s3Cfg
+	}
+}
+
+func (c *Config) GetS3MaxIdleAge() time.Duration {
+	if c == nil {
+		return 720 * time.Hour
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.S3MaxIdleAge
+}
+
+func (c *Config) SetS3MaxIdleAge(val time.Duration) {
+	if c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.S3MaxIdleAge = val
+	}
+}
+
+func (c *Config) GetS3EvictInterval() time.Duration {
+	if c == nil {
+		return 6 * time.Hour
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.S3EvictInterval <= 0 {
+		return 6 * time.Hour
+	}
+	return c.S3EvictInterval
+}
+
+func (c *Config) SetS3EvictInterval(val time.Duration) {
+	if c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.S3EvictInterval = val
+	}
+}
+
 func (c *Config) GetDispatcharrURL() string {
 	if c == nil {
 		return ""
@@ -457,6 +552,21 @@ func parseConfigFromEnv() *Config {
 		StallTeardownCooldown:   getEnvDuration("STALL_TEARDOWN_COOLDOWN", 5*time.Second),
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
+		StorageBackend:         getEnv("STORAGE_BACKEND", "local"),
+		S3Config: S3Config{
+			Endpoint:            getEnv("S3_ENDPOINT", ""),
+			Bucket:              getEnv("S3_BUCKET", ""),
+			Region:              getEnv("S3_REGION", "us-east-1"),
+			AccessKey:           getEnv("S3_ACCESS_KEY", ""),
+			SecretKey:           getEnv("S3_SECRET_KEY", ""),
+			UsePathStyle:        getEnvBool("S3_USE_PATH_STYLE", true),
+			DisableSSL:          getEnvBool("S3_DISABLE_SSL", false),
+			ChunkSize:           getEnvSize("S3_CHUNK_SIZE", 64*1024*1024),
+			ScratchMaxBytes:     getEnvSize("S3_SCRATCH_MAX_BYTES", 2*1024*1024*1024),
+			ScratchMinFreeBytes: getEnvSize("S3_SCRATCH_MIN_FREE_BYTES", 1*1024*1024*1024),
+		},
+		S3MaxIdleAge:                  getEnvDuration("S3_MAX_IDLE_AGE", 720*time.Hour),
+		S3EvictInterval:               getEnvDuration("S3_EVICT_INTERVAL", 6*time.Hour),
 		DispatcharrURL:                getEnv("DISPATCHARR_URL", ""),
 		PrehydrateCapacityReservation: getEnvInt("PREHYDRATE_CAPACITY_RESERVATION", 1),
 		DispatcharrPollInterval:       getEnvDuration("DISPATCHARR_POLL_INTERVAL", 5*time.Second),
@@ -489,12 +599,15 @@ func parseConfigFromEnv() *Config {
 func LoadConfig() {
 	cfg := parseConfigFromEnv()
 	GlobalConfig = cfg
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, DispatcharrURL=%s, MaxCache=%dGB, MinDiskFree=%dGB, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, StorageBackend=%s, DispatcharrURL=%s, MaxCache=%dGB, MinDiskFree=%dGB, S3MaxIdleAge=%s, S3EvictInterval=%s, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
 		cfg.Port,
 		cfg.CacheDir,
+		cfg.StorageBackend,
 		cfg.GetDispatcharrURL(),
 		cfg.CacheMaxBytes/(1024*1024*1024),
 		cfg.MinDiskFreeBytes/(1024*1024*1024),
+		cfg.GetS3MaxIdleAge(),
+		cfg.GetS3EvictInterval(),
 		cfg.UpstreamReadTimeout,
 		cfg.MaxUpstreamRetries,
 		cfg.MaxUpstreamWorkers,

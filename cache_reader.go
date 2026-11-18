@@ -25,8 +25,17 @@ type CacheReader struct {
 	file              *os.File
 	fileMu            sync.Mutex
 	lastEvictedOffset int64
-	totalBytesRead    int64
-	maxReadOffset     int64
+	s3Reader   StorageReadSeeker
+	s3ReaderMu sync.Mutex
+
+	chunkBuf    []byte
+	chunkBufIdx int
+	chunkBufOff int64
+	chunkBufMu  sync.Mutex
+
+	totalBytesRead   int64
+	maxReadOffset    int64
+	chainTouchedOnce sync.Once
 }
 
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
@@ -38,7 +47,7 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 
 	var remoteAddr, userAgent, username string
 	if req != nil {
-		remoteAddr = req.RemoteAddr
+		remoteAddr = getClientAddr(req)
 		userAgent = req.Header.Get("User-Agent")
 		username = req.URL.Query().Get("user")
 		if username == "" {
@@ -66,6 +75,15 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		startOffset = parseRangeStart(req.Header.Get("Range"))
 	}
 
+	cacheSource := ""
+	if isCompleted {
+		if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+			cacheSource = "s3"
+		} else {
+			cacheSource = "disk"
+		}
+	}
+
 	conn := &ClientConnection{
 		ID:             clientID,
 		Key:            key,
@@ -78,6 +96,7 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 		TotalSize:      totalSize,
 		StartTime:      time.Now().Unix(),
 		InCache:        isCompleted,
+		CacheSource:    cacheSource,
 		StarvingOffset: -1,
 	}
 	GlobalRegistry.RegisterConnection(clientID, conn)
@@ -115,6 +134,23 @@ func (r *CacheReader) getFile() (*os.File, error) {
 	}
 	r.file = f
 	return r.file, nil
+}
+
+func (r *CacheReader) getS3Reader() (StorageReadSeeker, error) {
+	r.s3ReaderMu.Lock()
+	defer r.s3ReaderMu.Unlock()
+	if r.s3Reader != nil {
+		return r.s3Reader, nil
+	}
+	if GlobalStorage == nil {
+		return nil, errors.New("storage backend not initialized")
+	}
+	s3r, err := GlobalStorage.Open(r.ctx, r.state.Key)
+	if err != nil {
+		return nil, err
+	}
+	r.s3Reader = s3r
+	return r.s3Reader, nil
 }
 
 func (r *CacheReader) upgradeFromPrehydration() {
@@ -178,6 +214,16 @@ func (r *CacheReader) recordRead(off int64, n int) {
 			_ = r.state.MaterializeDiskFile()
 		}
 		r.upgradeFromPrehydration()
+		if r.state != nil && GlobalS3Index != nil {
+			r.chainTouchedOnce.Do(func() {
+				r.state.Lock.Lock()
+				next := append([]string(nil), r.state.NextURLs...)
+				r.state.Lock.Unlock()
+				if len(next) > 0 {
+					GlobalS3Index.TouchChain(next)
+				}
+			})
+		}
 	} else if r.state != nil && !r.state.IsDiskMaterialized() && GlobalRegistry != nil {
 		GlobalRegistry.RecordProbeActivity()
 	}
@@ -191,6 +237,13 @@ func (r *CacheReader) Close() error {
 		r.file = nil
 	}
 	r.fileMu.Unlock()
+
+	r.s3ReaderMu.Lock()
+	if r.s3Reader != nil {
+		_ = r.s3Reader.Close()
+		r.s3Reader = nil
+	}
+	r.s3ReaderMu.Unlock()
 
 	r.state.Lock.Lock()
 
@@ -217,8 +270,14 @@ func (r *CacheReader) Close() error {
 	isDiskMat := r.state.DiskMaterialized || FileExists(r.state.PartPath)
 	isProbe := !isCompleted && !isDiskMat && totalRead < minThreshold && maxOffset < minThreshold
 
-	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !FileExists(r.state.Path)
-	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
+	alreadyCommittedS3 := GlobalStorage != nil && GlobalStorage.Type() == "s3" && r.state.ChunkManager != nil && r.state.ChunkManager.IsRecomposed()
+	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommittedS3 && !FileExists(r.state.Path)
+	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
+
+	if shouldFinalize {
+		r.state.IsCommitting = true
+		r.state.UpstreamStatus = "Committing"
+	}
 
 	var fileToClose *os.File
 	var pipelineToClose StorageSink
@@ -311,6 +370,12 @@ func (r *CacheReader) Close() error {
 }
 
 func (r *CacheReader) finalizeCache() {
+	defer func() {
+		r.state.Lock.Lock()
+		r.state.IsCommitting = false
+		r.state.Lock.Unlock()
+	}()
+
 	// Close write handle if open
 	r.state.Lock.Lock()
 	fileToClose := r.state.File
@@ -331,6 +396,55 @@ func (r *CacheReader) finalizeCache() {
 		_ = fileToClose.Close()
 	}
 
+	meta := FileMeta{
+		URL:           r.state.URL,
+		TotalSize:     r.state.TotalSize,
+		ContentType:   r.state.ContentType,
+		ETag:          r.state.ETag,
+		LastModified:  r.state.LastModified,
+		LastValidated: time.Now().Unix(),
+		Completed:     true,
+	}
+
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		var commitErr error
+		if cm := r.state.GetChunkManager(); cm != nil {
+			commitErr = cm.WaitAndRecompose(context.Background())
+		} else {
+			commitErr = GlobalStorage.CommitLocalFile(context.Background(), r.state.Key, r.state.PartPath, meta)
+		}
+		_ = os.Remove(r.state.PartPath)
+		_ = os.Remove(r.state.MetaPath)
+
+		accounted := atomic.SwapInt64(&r.state.TotalBytesDownloaded, 0)
+		if accounted > 0 && GlobalRegistry != nil {
+			GlobalRegistry.UpdateSize(-accounted)
+		}
+
+		GlobalRegistry.MarkConnectionsAsInCache(r.state.Key)
+		if commitErr != nil {
+			log.Printf("[Reader] S3 commit/recomposition failed on client exit for %s: %v", r.state.Key, commitErr)
+			r.state.SetUpstreamStatus("Error")
+		} else {
+			r.state.SetUpstreamStatus("Completed")
+			log.Printf("[Reader] Cache file finalized and committed to S3 on last client exit: %s", r.state.Key)
+		}
+
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, r.state.Key)
+		GlobalRegistry.Lock.Unlock()
+
+		if GlobalLogBroker != nil {
+			go GlobalLogBroker.BroadcastStateUpdate()
+		}
+		if commitErr == nil && GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(r.state)
+		}
+
+		debug.FreeOSMemory()
+		return
+	}
+
 	// Rename temporary file to final cache path
 	err := os.Rename(r.state.PartPath, r.state.Path)
 	if err != nil {
@@ -345,7 +459,7 @@ func (r *CacheReader) finalizeCache() {
 
 	// Save final metadata JSON confirming completion
 	metaPath := r.state.Path + ".json"
-	meta := FileMeta{
+	meta = FileMeta{
 		URL:           r.state.URL,
 		TotalSize:     r.state.TotalSize,
 		ContentType:   r.state.ContentType,
@@ -526,12 +640,14 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 
 	r.state.Lock.Lock()
 	lb := r.state.LiveBuffer
+	cm := r.state.ChunkManager
 	r.state.Lock.Unlock()
 
 	// 1. LiveBuffer Fast-Path: check in-memory buffer first for zero-copy playback
 	if lb != nil {
 		if memN, ok := lb.ReadAt(p[:toRead], off); ok && memN > 0 {
-			if memN < int(toRead) && (r.state.IsDiskMaterialized() || FileExists(r.state.PartPath) || FileExists(r.state.Path)) {
+			isS3Chunked := GlobalStorage != nil && GlobalStorage.Type() == "s3" && cm != nil
+			if memN < int(toRead) && !isS3Chunked && (r.state.IsDiskMaterialized() || FileExists(r.state.PartPath) || FileExists(r.state.Path)) {
 				if f, ferr := r.getFile(); ferr == nil {
 					diskN, _ := f.ReadAt(p[memN:toRead], off+int64(memN))
 					memN += diskN
@@ -546,7 +662,114 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 
-	// 2. Fall back to reading from disk
+	// 2. S3 Storage Tier
+	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		// A. Recomposed Monolithic Object: If all parts have been stitched and sealed, read via s3ReadSeeker
+		isRecomposed := false
+		if cm != nil && cm.IsRecomposed() {
+			isRecomposed = true
+		} else if !FileExists(r.state.PartPath) && r.state.RangeSet.IsComplete(r.state.TotalSize) {
+			isRecomposed = true
+		}
+
+		if isRecomposed {
+			s3Reader, err := r.getS3Reader()
+			if err == nil {
+				s3N, rerr := s3Reader.ReadAt(p[:toRead], off)
+				if s3N > 0 {
+					GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
+					GlobalRegistry.SetConnectionInCache(r.clientID, true)
+					return s3N, nil
+				}
+				if rerr != nil {
+					return 0, rerr
+				}
+			}
+		}
+
+		// B. In-flight Chunks: If chunk is in S3 prior to recomposition, read using sliding chunk buffer
+		if cm != nil {
+			chunkSize := cm.ChunkSize()
+			chunkIdx := int(off / chunkSize)
+			if cm.IsChunkUploaded(chunkIdx) {
+				chunkStart := int64(chunkIdx) * chunkSize
+				offsetInChunk := off - chunkStart
+				chunkRemaining := chunkSize - offsetInChunk
+				readLen := toRead
+				if readLen > chunkRemaining {
+					readLen = chunkRemaining
+				}
+
+				// Check chunk sliding buffer
+				r.chunkBufMu.Lock()
+				bufEnd := r.chunkBufOff + int64(len(r.chunkBuf))
+				if r.chunkBuf != nil && r.chunkBufIdx == chunkIdx && offsetInChunk >= r.chunkBufOff && offsetInChunk < bufEnd {
+					relStart := offsetInChunk - r.chunkBufOff
+					avail := int64(len(r.chunkBuf)) - relStart
+					n := readLen
+					if n > avail {
+						n = avail
+					}
+					copy(p[:n], r.chunkBuf[relStart:relStart+n])
+					r.chunkBufMu.Unlock()
+					GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
+					return int(n), nil
+				}
+
+				// Buffer miss: fetch sliding read-ahead window (2MB) from chunk
+				fetchSize := int64(2 * 1024 * 1024)
+				if readLen > fetchSize {
+					fetchSize = readLen
+				}
+				if offsetInChunk+fetchSize > chunkSize {
+					fetchSize = chunkSize - offsetInChunk
+				}
+
+				s3ChunkReader, err := GlobalStorage.OpenChunkRange(r.ctx, r.state.Key, chunkIdx, offsetInChunk, fetchSize)
+				if err == nil {
+					buf, rerr := io.ReadAll(s3ChunkReader)
+					_ = s3ChunkReader.Close()
+					if (rerr == nil || rerr == io.EOF) && len(buf) > 0 {
+						r.chunkBuf = buf
+						r.chunkBufIdx = chunkIdx
+						r.chunkBufOff = offsetInChunk
+
+						n := readLen
+						if n > int64(len(buf)) {
+							n = int64(len(buf))
+						}
+						copy(p[:n], buf[:n])
+						r.chunkBufMu.Unlock()
+						GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
+						return int(n), nil
+					}
+				}
+				r.chunkBufMu.Unlock()
+
+				// Chunk was already uploaded to S3 and hole-punched locally: NEVER fall back to reading zeroes from .part!
+				// If OpenChunkRange failed (e.g. DeleteObjects ran milliseconds before m.recomposed=true),
+				// immediately try opening the sealed monolithic S3 object (CompleteMultipartUpload finishes before DeleteObjects).
+				s3Reader, s3Err := r.getS3Reader()
+				if s3Err == nil {
+					s3N, rerr := s3Reader.ReadAt(p[:toRead], off)
+					if s3N > 0 {
+						GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
+						GlobalRegistry.SetConnectionInCache(r.clientID, true)
+						return s3N, nil
+					}
+					if rerr != nil {
+						return 0, rerr
+					}
+				}
+				if err != nil {
+					return 0, err
+				}
+				return 0, s3Err
+			}
+		}
+	}
+
+	// 3. Fall back to reading from disk
 	file, err := r.getFile()
 	if err != nil {
 		return 0, err

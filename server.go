@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -21,6 +22,62 @@ import (
 )
 
 var b64RouteRegex = regexp.MustCompile(`^/u/([-_A-Za-z0-9=]+)$`)
+
+func parseHeaderIP(raw string) net.IP {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		raw = host
+	}
+	raw = strings.Trim(raw, "[]")
+	return net.ParseIP(raw)
+}
+
+func isTrustedProxyIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+// getClientAddr resolves the originating client IP when requests arrive through
+// a trusted reverse proxy (e.g. Traefik), falling back to r.RemoteAddr.
+func getClientAddr(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	peerIP := parseHeaderIP(r.RemoteAddr)
+	if !isTrustedProxyIP(peerIP) {
+		return r.RemoteAddr
+	}
+
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		var validIPs []net.IP
+		for _, part := range parts {
+			if ip := parseHeaderIP(part); ip != nil {
+				validIPs = append(validIPs, ip)
+			}
+		}
+		if len(validIPs) > 0 {
+			for i := len(validIPs) - 1; i >= 0; i-- {
+				if !isTrustedProxyIP(validIPs[i]) {
+					return validIPs[i].String()
+				}
+			}
+			// All forwarded hops are private/LAN IPs (e.g. Emby on LAN -> Traefik on Docker bridge).
+			return validIPs[0].String()
+		}
+	}
+
+	if realIP := parseHeaderIP(r.Header.Get("X-Real-IP")); realIP != nil {
+		return realIP.String()
+	}
+
+	return r.RemoteAddr
+}
 
 func StartServer() {
 	mux := http.NewServeMux()
@@ -140,35 +197,60 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Cache HIT Path with Revalidation
-	if FileExists(cacheFilePath) {
+	var cacheHit bool
+	var cacheMeta *FileMeta
+	if GlobalStorage != nil {
+		if meta, exists, err := GlobalStorage.Stat(r.Context(), cacheFileName); err != nil {
+			log.Printf("[Server] Storage Stat error for %s: %v (falling back to hydration check)", cacheFileName, err)
+		} else if exists {
+			cacheHit = true
+			cacheMeta = meta
+		}
+	} else if FileExists(cacheFilePath) {
+		cacheHit = true
+	}
+
+	if cacheHit {
 		valid, err := Revalidate(cacheFileName, targetURL, r.Header)
-		if err == nil && valid {
-			file, err := os.Open(cacheFilePath)
-			if err == nil {
-				defer func() {
-					FadviseDontNeed(file.Fd(), 0, 0)
-					_ = file.Close()
-				}()
+		if err != nil {
+			log.Printf("[Server] Revalidate error for %s: %v", cacheFileName, err)
+		} else if valid {
+			var reader StorageReadSeeker
+			if GlobalStorage != nil {
+				reader, err = GlobalStorage.Open(r.Context(), cacheFileName)
+			} else {
+				f, ferr := os.Open(cacheFilePath)
+				if ferr == nil {
+					stat, _ := f.Stat()
+					reader = &localFileReadSeeker{file: f, size: stat.Size()}
+				} else {
+					err = ferr
+				}
+			}
+
+			if err != nil {
+				log.Printf("[Server] Cache HIT Open failed for %s: %v", cacheFileName, err)
+			} else {
+				defer reader.Close()
 
 				// Generate unique client ID using atomic counter
 				connID := fmt.Sprintf("client-%d", atomic.AddUint64(&globalClientIDSeq, 1))
-				remoteAddr := r.RemoteAddr
+				remoteAddr := getClientAddr(r)
 				userAgent := r.Header.Get("User-Agent")
 				if userAgent == "" {
 					userAgent = "Unknown"
 				}
 
-				// Fetch total size of completed file
-				var totalSize int64
-				if stat, err := file.Stat(); err == nil {
-					totalSize = stat.Size()
-				}
-
+				totalSize := reader.Size()
 				var startOffset int64
 				if r != nil {
 					startOffset = parseRangeStart(r.Header.Get("Range"))
 				}
 
+				cacheSource := "disk"
+				if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+					cacheSource = "s3"
+				}
 				conn := &ClientConnection{
 					ID:             connID,
 					Key:            cacheFileName,
@@ -181,6 +263,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					TotalSize:      totalSize,
 					StartTime:      time.Now().Unix(),
 					InCache:        true,
+					CacheSource:    cacheSource,
 					StarvingOffset: -1,
 				}
 				GlobalRegistry.RegisterConnection(connID, conn)
@@ -193,21 +276,26 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 				if GlobalConfig != nil {
 					minThreshold = GlobalConfig.GetMinReadThresholdBytes()
 				}
-				fileSize := int64(0)
-				if stat, serr := file.Stat(); serr == nil {
-					fileSize = stat.Size()
-				}
+				fileSize := totalSize
 
 				tracker := &trackingReader{
-					file:              file,
+					reader:            reader,
 					lastEvictedOffset: startOffset,
 					onRead: func(off int64, n int) {
 						GlobalRegistry.UpdateConnectionOffset(connID, off+int64(n))
-						if r.Method != http.MethodHead && GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
+						if r.Method != http.MethodHead {
 							newRead := atomic.AddInt64(&hitTotalRead, int64(n))
 							if newRead >= minThreshold || (fileSize > 0 && newRead >= fileSize) {
 								hitPrehydrateOnce.Do(func() {
-									GlobalPrehydrationManager.OnCacheHit(targetURL, nextURLs)
+									if GlobalS3Index != nil {
+										GlobalS3Index.RecordAccess(cacheFileName, targetURL, fileSize)
+										if len(nextURLs) > 0 {
+											GlobalS3Index.TouchChain(nextURLs)
+										}
+									}
+									if GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
+										GlobalPrehydrationManager.OnCacheHit(targetURL, nextURLs)
+									}
 								})
 							}
 						}
@@ -217,12 +305,15 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("X-Cache", "HIT")
 				w.Header().Set("Accept-Ranges", "bytes")
 
-				// Set Content-Type from metadata if available, otherwise extension fallback
-				metaPath := cacheFilePath + ".json"
-				if metaBytes, err := os.ReadFile(metaPath); err == nil {
-					var meta FileMeta
-					if json.Unmarshal(metaBytes, &meta) == nil && meta.ContentType != "" {
-						w.Header().Set("Content-Type", meta.ContentType)
+				if cacheMeta != nil && cacheMeta.ContentType != "" {
+					w.Header().Set("Content-Type", cacheMeta.ContentType)
+				} else {
+					metaPath := cacheFilePath + ".json"
+					if metaBytes, err := os.ReadFile(metaPath); err == nil {
+						var meta FileMeta
+						if json.Unmarshal(metaBytes, &meta) == nil && meta.ContentType != "" {
+							w.Header().Set("Content-Type", meta.ContentType)
+						}
 					}
 				}
 				http.ServeContent(w, r, cacheFileName, time.Now(), tracker)
@@ -382,6 +473,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		ActiveWriter    bool             `json:"active_writer"`
 		ActiveClients   int              `json:"active_clients"`
 		StarvingList    map[string]int64 `json:"starving_clients"`
+		CommitProgress  *CommitProgress  `json:"commit_progress,omitempty"`
 	}
 
 	type debugProbeBuffer struct {
@@ -466,6 +558,11 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			starvingCopy[clientID] = offset
 		}
 
+		var commitProgress *CommitProgress
+		if fileState.UpstreamStatus == "Committing" && fileState.ChunkManager != nil {
+			commitProgress = fileState.ChunkManager.GetCommitProgress()
+		}
+
 		activeFiles = append(activeFiles, debugFile{
 			Key:             k,
 			URL:             fileState.URL,
@@ -475,6 +572,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			ActiveWriter:    fileState.WriterActive,
 			ActiveClients:   len(fileState.Clients),
 			StarvingList:    starvingCopy,
+			CommitProgress:  commitProgress,
 		})
 		fileState.Lock.Unlock()
 	}
@@ -519,6 +617,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
 
 	data := map[string]interface{}{
+		"storage_backend":        GlobalConfig.GetStorageBackend(),
 		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
 		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
 		"disk_free_bytes":        freeSpace,
@@ -535,6 +634,13 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		if capReport := GlobalPrehydrationManager.GetLatestCapacity(); capReport != nil {
 			data["provider_capacity"] = capReport
 		}
+	}
+
+	if GlobalS3Index != nil {
+		s3Count, s3Bytes := GlobalS3Index.Stats()
+		data["s3_cached_objects"] = s3Count
+		data["s3_cached_bytes"] = s3Bytes
+		data["s3_max_idle_age_seconds"] = int64(GlobalConfig.GetS3MaxIdleAge().Seconds())
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -612,31 +718,22 @@ func base64DecodeSafe(str string) ([]byte, error) {
 }
 
 type trackingReader struct {
-	file              *os.File
+	reader            StorageReadSeeker
 	onRead            func(off int64, n int)
 	currOffset        int64
 	lastEvictedOffset int64
 }
 
 func (tr *trackingReader) ReadAt(p []byte, off int64) (n int, err error) {
-	n, err = tr.file.ReadAt(p, off)
+	n, err = tr.reader.ReadAt(p, off)
 	if n > 0 {
 		tr.onRead(off, n)
-		curEnd := off + int64(n)
-		lastEvict := atomic.LoadInt64(&tr.lastEvictedOffset)
-		if curEnd-lastEvict >= 16*1024*1024 {
-			evictLen := curEnd - lastEvict - 8*1024*1024
-			if evictLen > 0 {
-				FadviseDontNeed(tr.file.Fd(), lastEvict, evictLen)
-				atomic.AddInt64(&tr.lastEvictedOffset, evictLen)
-			}
-		}
 	}
 	return n, err
 }
 
 func (tr *trackingReader) Seek(offset int64, whence int) (int64, error) {
-	newPos, err := tr.file.Seek(offset, whence)
+	newPos, err := tr.reader.Seek(offset, whence)
 	if err == nil {
 		atomic.StoreInt64(&tr.currOffset, newPos)
 		atomic.StoreInt64(&tr.lastEvictedOffset, newPos)
@@ -646,19 +743,10 @@ func (tr *trackingReader) Seek(offset int64, whence int) (int64, error) {
 
 func (tr *trackingReader) Read(p []byte) (n int, err error) {
 	startOff := atomic.LoadInt64(&tr.currOffset)
-	n, err = tr.file.Read(p)
+	n, err = tr.reader.Read(p)
 	if n > 0 {
 		atomic.AddInt64(&tr.currOffset, int64(n))
 		tr.onRead(startOff, n)
-		curEnd := startOff + int64(n)
-		lastEvict := atomic.LoadInt64(&tr.lastEvictedOffset)
-		if curEnd-lastEvict >= 16*1024*1024 {
-			evictLen := curEnd - lastEvict - 8*1024*1024
-			if evictLen > 0 {
-				FadviseDontNeed(tr.file.Fd(), lastEvict, evictLen)
-				atomic.AddInt64(&tr.lastEvictedOffset, evictLen)
-			}
-		}
 	}
 	return n, err
 }
