@@ -392,12 +392,14 @@ func NewWritebackPipeline(file *os.File, state *FileCacheState, bufferBytes int6
 	}
 
 	var lb *LiveBuffer
+	var cm *S3ChunkManager
 	if state != nil {
 		state.Lock.Lock()
 		if state.LiveBuffer == nil {
 			state.LiveBuffer = NewLiveBuffer(bufferBytes)
 		}
 		lb = state.LiveBuffer
+		cm = state.ChunkManager
 		state.Lock.Unlock()
 	} else {
 		lb = NewLiveBuffer(bufferBytes)
@@ -412,8 +414,8 @@ func NewWritebackPipeline(file *os.File, state *FileCacheState, bufferBytes int6
 		windows:    make([]writeWindow, 0, 4),
 	}
 
-	if state != nil && state.ChunkManager != nil {
-		state.ChunkManager.SetTrackDiskFlushes(true)
+	if cm != nil {
+		cm.SetTrackDiskFlushes(true)
 	}
 
 	wp.wg.Add(1)
@@ -522,8 +524,8 @@ func (wp *WritebackPipeline) storageConsumer() {
 				wp.errMu.Unlock()
 			} else if wp.state != nil && wp.state.DiskRangeSet != nil {
 				wp.state.DiskRangeSet.Add(writeOffset, writeOffset+int64(length))
-				if wp.state.ChunkManager != nil {
-					wp.state.ChunkManager.CheckAndTriggerUploads()
+				if cm := wp.state.GetChunkManager(); cm != nil {
+					cm.CheckAndTriggerUploads()
 				}
 			}
 		}
@@ -675,8 +677,8 @@ func (wp *WritebackPipeline) FlushAndClose() error {
 
 	wp.wg.Wait()
 
-	if wp.state != nil && wp.state.ChunkManager != nil {
-		wp.state.ChunkManager.SetTrackDiskFlushes(false)
+	if cm := wp.state.GetChunkManager(); cm != nil {
+		cm.SetTrackDiskFlushes(false)
 	}
 
 	if wp.liveBuffer != nil {

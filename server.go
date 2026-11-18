@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -21,6 +22,62 @@ import (
 )
 
 var b64RouteRegex = regexp.MustCompile(`^/u/([-_A-Za-z0-9=]+)$`)
+
+func parseHeaderIP(raw string) net.IP {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		raw = host
+	}
+	raw = strings.Trim(raw, "[]")
+	return net.ParseIP(raw)
+}
+
+func isTrustedProxyIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+}
+
+// getClientAddr resolves the originating client IP when requests arrive through
+// a trusted reverse proxy (e.g. Traefik), falling back to r.RemoteAddr.
+func getClientAddr(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	peerIP := parseHeaderIP(r.RemoteAddr)
+	if !isTrustedProxyIP(peerIP) {
+		return r.RemoteAddr
+	}
+
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		var validIPs []net.IP
+		for _, part := range parts {
+			if ip := parseHeaderIP(part); ip != nil {
+				validIPs = append(validIPs, ip)
+			}
+		}
+		if len(validIPs) > 0 {
+			for i := len(validIPs) - 1; i >= 0; i-- {
+				if !isTrustedProxyIP(validIPs[i]) {
+					return validIPs[i].String()
+				}
+			}
+			// All forwarded hops are private/LAN IPs (e.g. Emby on LAN -> Traefik on Docker bridge).
+			return validIPs[0].String()
+		}
+	}
+
+	if realIP := parseHeaderIP(r.Header.Get("X-Real-IP")); realIP != nil {
+		return realIP.String()
+	}
+
+	return r.RemoteAddr
+}
 
 func StartServer() {
 	mux := http.NewServeMux()
@@ -178,7 +235,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 				// Generate unique client ID using atomic counter
 				connID := fmt.Sprintf("client-%d", atomic.AddUint64(&globalClientIDSeq, 1))
-				remoteAddr := r.RemoteAddr
+				remoteAddr := getClientAddr(r)
 				userAgent := r.Header.Get("User-Agent")
 				if userAgent == "" {
 					userAgent = "Unknown"
@@ -416,6 +473,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		ActiveWriter    bool             `json:"active_writer"`
 		ActiveClients   int              `json:"active_clients"`
 		StarvingList    map[string]int64 `json:"starving_clients"`
+		CommitProgress  *CommitProgress  `json:"commit_progress,omitempty"`
 	}
 
 	type debugProbeBuffer struct {
@@ -500,6 +558,11 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			starvingCopy[clientID] = offset
 		}
 
+		var commitProgress *CommitProgress
+		if fileState.UpstreamStatus == "Committing" && fileState.ChunkManager != nil {
+			commitProgress = fileState.ChunkManager.GetCommitProgress()
+		}
+
 		activeFiles = append(activeFiles, debugFile{
 			Key:             k,
 			URL:             fileState.URL,
@@ -509,6 +572,7 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 			ActiveWriter:    fileState.WriterActive,
 			ActiveClients:   len(fileState.Clients),
 			StarvingList:    starvingCopy,
+			CommitProgress:  commitProgress,
 		})
 		fileState.Lock.Unlock()
 	}

@@ -32,6 +32,11 @@
             padding: 0;
         }
 
+        html {
+            max-width: 100%;
+            overflow-x: hidden;
+        }
+
         body {
             background-color: var(--bg-color);
             background-image: radial-gradient(circle at 10% 20%, rgba(138, 43, 226, 0.15) 0%, transparent 40%),
@@ -40,8 +45,19 @@
             color: var(--text-main);
             font-family: var(--font-family);
             min-height: 100vh;
+            max-width: 100%;
             padding: 2rem;
             overflow-x: hidden;
+        }
+
+        main,
+        .dashboard-grid,
+        .card,
+        .download-item,
+        .download-header,
+        .connection-header {
+            min-width: 0;
+            max-width: 100%;
         }
 
         header {
@@ -71,7 +87,7 @@
             border-radius: 50%;
             display: inline-block;
             box-shadow: 0 0 10px var(--accent-secondary);
-            animation: pulse 2s infinite;
+            animation: pulse 2s ease-in-out infinite;
         }
 
         @keyframes pulse {
@@ -207,7 +223,7 @@
             background: rgba(189, 94, 255, 0.18);
             color: #bd5eff;
             border: 1px solid rgba(189, 94, 255, 0.4);
-            animation: pulse-glow-purple 1.5s infinite;
+            animation: pulse-glow-purple 2s ease-in-out infinite;
         }
 
         .download-badge.throttled,
@@ -218,7 +234,7 @@
             background: rgba(255, 159, 28, 0.15);
             color: var(--accent-orange);
             border: 1px solid rgba(255, 159, 28, 0.35);
-            animation: pulse-glow-orange 1.5s infinite;
+            animation: pulse-glow-orange 2s ease-in-out infinite;
         }
 
         .download-badge.idle {
@@ -287,7 +303,7 @@
 
         .download-speed-badge.stalled {
             border-color: rgba(255, 159, 28, 0.7);
-            animation: pulse-glow-orange 1.5s infinite;
+            animation: pulse-glow-orange 2s ease-in-out infinite;
         }
 
         .collapsible-header-btn {
@@ -379,7 +395,7 @@
 
         .download-meta-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(min(130px, 100%), 1fr));
             gap: 0.5rem;
             margin-top: 0.75rem;
             margin-bottom: 0.5rem;
@@ -617,13 +633,15 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
+            flex-wrap: wrap;
+            gap: 0.5rem;
             border-bottom: 1px solid rgba(255, 255, 255, 0.05);
             padding-bottom: 0.5rem;
         }
 
         .connection-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
             gap: 0.6rem;
         }
 
@@ -708,7 +726,7 @@
             background: rgba(255, 159, 28, 0.15);
             color: var(--accent-orange);
             border: 1px solid rgba(255, 159, 28, 0.3);
-            animation: pulse-glow-orange 1.5s infinite;
+            animation: pulse-glow-orange 2s ease-in-out infinite;
         }
 
         .connection-status-badge.hydrating {
@@ -721,7 +739,7 @@
             background: rgba(255, 159, 28, 0.1);
             color: var(--accent-orange);
             border: 1px solid rgba(255, 159, 28, 0.3);
-            animation: pulse-glow-orange 1.5s infinite;
+            animation: pulse-glow-orange 2s ease-in-out infinite;
         }
 
         @keyframes pulse-glow-orange {
@@ -755,14 +773,14 @@
             background: rgba(255, 159, 28, 0.15);
             color: var(--accent-orange);
             border: 1px solid rgba(255, 159, 28, 0.3);
-            animation: pulse-glow-orange 1.5s infinite;
+            animation: pulse-glow-orange 2s ease-in-out infinite;
         }
 
         .upstream-status-badge.retrying {
             background: rgba(255, 159, 28, 0.15);
             color: var(--accent-orange);
             border: 1px solid rgba(255, 159, 28, 0.35);
-            animation: pulse-glow-orange 1.5s infinite;
+            animation: pulse-glow-orange 2s ease-in-out infinite;
         }
 
         .upstream-status-badge.downloading {
@@ -775,7 +793,7 @@
             background: rgba(255, 159, 28, 0.15);
             color: var(--accent-orange);
             border: 1px solid rgba(255, 159, 28, 0.35);
-            animation: pulse-glow-orange 1.5s infinite;
+            animation: pulse-glow-orange 2s ease-in-out infinite;
         }
 
         .upstream-status-badge.completed {
@@ -840,11 +858,46 @@
                 word-break: break-all;
             }
 
-            .download-badge-container {
-                align-items: flex-start !important;
+            .download-controls {
                 width: 100%;
-                flex-direction: row !important;
-                justify-content: space-between;
+                flex-wrap: wrap;
+                justify-content: flex-start;
+                align-items: center;
+                gap: 6px;
+                max-width: 100%;
+            }
+
+            .download-badge,
+            .download-speed-badge,
+            .cancel-hydration-btn {
+                font-size: 0.78rem;
+                max-width: 100%;
+            }
+
+            .download-speed-badge {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .card {
+                padding: 1rem;
+                margin-bottom: 1.25rem;
+            }
+
+            .card-title,
+            .console-header {
+                flex-wrap: wrap;
+                gap: 0.5rem;
+            }
+
+            .download-item,
+            .connection-item {
+                padding: 0.75rem;
+            }
+
+            .console-container {
+                height: 280px;
             }
         }
 
@@ -1174,7 +1227,7 @@
             font-weight: 600;
             padding: 6px 14px;
             border-radius: 12px;
-            animation: probe-pulse 1.2s infinite ease-in-out;
+            animation: probe-pulse 2s infinite ease-in-out;
             cursor: default;
         }
 
@@ -1551,6 +1604,16 @@
                 }
             }
 
+            // Overlay S3 commit phase progress (purple) when committing/recomposing/finalizing
+            if (fileData.upstream_status === 'Committing' && fileData.commit_progress && fileData.commit_progress.total > 0) {
+                const cp = fileData.commit_progress;
+                const commitRatio = Math.min(1, Math.max(0, (cp.completed || 0) / cp.total));
+                if (commitRatio > 0) {
+                    ctx.fillStyle = '#bd5eff';
+                    ctx.fillRect(0, trackY, commitRatio * displayWidth, trackHeight);
+                }
+            }
+
             // Draw starving markers (accent orange)
             if (fileData.starving_queue && fileData.starving_queue.length > 0) {
                 ctx.fillStyle = '#ff9f1c';
@@ -1652,19 +1715,46 @@
             });
         }
 
-        function updateFileBadgeAndMeta(key) {
-            const fileData = fileStore[key];
-            if (!fileData) return;
-            
+        function setTextIfChanged(el, text) {
+            if (el && el.textContent !== text) {
+                el.textContent = text;
+            }
+        }
+
+        function setClassIfChanged(el, cls) {
+            if (el && el.className !== cls) {
+                el.className = cls;
+            }
+        }
+
+        function formatHydrationStatus(fileData) {
             const downloaded = fileData.downloaded_bytes || 0;
             const total = fileData.total_size || 1;
             const percent = ((downloaded / total) * 100).toFixed(1);
             let rawStatus = fileData.upstream_status || 'Downloading';
-            
-            // Refine status label for intuitive clarity
+
             if (rawStatus === 'Committing') {
-                rawStatus = 'Committing';
-            } else if (fileData.is_yielding || rawStatus === 'Yielding') {
+                const cp = fileData.commit_progress;
+                if (cp && cp.stage) {
+                    const phaseTotal = cp.total || 0;
+                    const phaseDone = cp.completed || 0;
+                    const phasePct = phaseTotal > 0 ? ((phaseDone / phaseTotal) * 100).toFixed(1) : '0.0';
+                    if (cp.stage === 'uploading') {
+                        const countStr = phaseTotal > 0 ? ` (${phaseDone}/${phaseTotal})` : '';
+                        return { text: `S3 Upload ${phasePct}%${countStr}`, statusLower: 'committing' };
+                    }
+                    if (cp.stage === 'recomposing') {
+                        const countStr = phaseTotal > 0 ? ` (${phaseDone}/${phaseTotal})` : '';
+                        return { text: `S3 Recompose ${phasePct}%${countStr}`, statusLower: 'committing' };
+                    }
+                    if (cp.stage === 'finalizing') {
+                        return { text: `S3 Finalize ${phasePct}%`, statusLower: 'committing' };
+                    }
+                }
+                return { text: `Committing ${percent}%`, statusLower: 'committing' };
+            }
+
+            if (fileData.is_yielding || rawStatus === 'Yielding') {
                 rawStatus = 'Yielding';
             } else if (fileData.is_prehydrating || rawStatus === 'Prehydrating') {
                 rawStatus = 'Prehydrating';
@@ -1673,13 +1763,23 @@
             } else if (rawStatus === 'Downloading' && fileData.is_stalled) {
                 rawStatus = 'Stalled';
             }
-            const statusLower = rawStatus.toLowerCase();
-            let statusText = `${rawStatus} ${percent}%`;
+            return {
+                text: `${rawStatus} ${percent}%`,
+                statusLower: rawStatus.toLowerCase(),
+            };
+        }
+
+        function updateFileBadgeAndMeta(key) {
+            const fileData = fileStore[key];
+            if (!fileData) return;
+
+            const downloaded = fileData.downloaded_bytes || 0;
+            const badgeState = formatHydrationStatus(fileData);
 
             const badgeEl = document.getElementById(`badge-${key}`);
             if (badgeEl) {
-                badgeEl.innerText = statusText;
-                badgeEl.className = `download-badge ${statusLower}`;
+                setTextIfChanged(badgeEl, badgeState.text);
+                setClassIfChanged(badgeEl, `download-badge ${badgeState.statusLower}`);
             }
 
             const speedEl = document.getElementById(`speed-badge-${key}`);
@@ -1805,7 +1905,8 @@
                         is_prehydrating: file.is_prehydrating,
                         is_yielding: file.is_yielding,
                         queued_prehydrations: file.queued_prehydrations || 0,
-                        next_urls: file.next_urls || []
+                        next_urls: file.next_urls || [],
+                        commit_progress: file.commit_progress || null
                     };
                     fileStore[file.key] = fileData;
                 } else {
@@ -1830,6 +1931,7 @@
                     fileData.is_yielding = file.is_yielding;
                     fileData.queued_prehydrations = file.queued_prehydrations || 0;
                     fileData.next_urls = file.next_urls || [];
+                    fileData.commit_progress = file.commit_progress || null;
                 }
                 
                 let card = document.getElementById(`download-card-${file.key}`);
@@ -1923,26 +2025,28 @@
                     statusText = `Starving (${formatBytes(conn.starving_offset)})`;
                 }
 
-                let originBadge = '';
-                let hydrationBadge = '';
+                let originClass = 'cdn';
+                let originText = 'CDN';
+                let showHydration = false;
+                let hydrationText = '';
+                let hydrationStatusClass = 'downloading';
                 if (conn.in_cache) {
                     const defaultBackend = (latestServerState && latestServerState.storage_backend) ? latestServerState.storage_backend : 'disk';
                     const cacheBackend = (conn.cache_source || defaultBackend || 'disk').toLowerCase();
                     if (cacheBackend === 's3') {
-                        originBadge = `<span class="session-origin-badge s3">S3</span>`;
+                        originClass = 's3';
+                        originText = 'S3';
                     } else {
-                        originBadge = `<span class="session-origin-badge disk">DISK</span>`;
+                        originClass = 'disk';
+                        originText = 'DISK';
                     }
                 } else {
-                    originBadge = `<span class="session-origin-badge cdn">CDN</span>`;
                     const fileData = fileStore[conn.key];
                     if (fileData && fileData.total_size > 0) {
-                        const downloaded = fileData.downloaded_bytes || 0;
-                        const percent = ((downloaded / fileData.total_size) * 100).toFixed(1);
-                        const rawStatus = fileData.upstream_status || 'Downloading';
-                        const statusLower = rawStatus.toLowerCase();
-                        let badgeText = `${rawStatus} ${percent}%`;
-                        hydrationBadge = `<span class="download-badge ${statusLower}" style="font-size: 0.72rem; padding: 2px 7px;">${badgeText}</span>`;
+                        const badgeState = formatHydrationStatus(fileData);
+                        showHydration = true;
+                        hydrationText = badgeState.text;
+                        hydrationStatusClass = badgeState.statusLower;
                     }
                 }
 
@@ -1962,43 +2066,81 @@
                     card = document.createElement('div');
                     card.className = 'connection-item';
                     card.id = `conn-card-${conn.id}`;
+                    card.innerHTML = `
+                        <div class="connection-header">
+                            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                                <span class="connection-client-id" data-role="client-id"></span>
+                                <span class="session-origin-badge" data-role="origin-badge"></span>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                                <span class="download-badge" data-role="hydration-badge" style="font-size: 0.72rem; padding: 2px 7px; display: none;"></span>
+                                <span class="connection-status-badge" data-role="status-badge"></span>
+                            </div>
+                        </div>
+                        <div class="connection-grid">
+                            <div class="connection-metric-card">
+                                <span class="connection-metric-label">IP Address</span>
+                                <span class="connection-metric-value"><span data-role="ip-addr"></span> <span class="user-badge" data-role="user-badge" style="color: #60a5fa; font-weight: 600; display: none;"></span></span>
+                            </div>
+                            <div class="connection-metric-card">
+                                <span class="connection-metric-label">User Agent</span>
+                                <span class="connection-metric-value" data-role="user-agent"></span>
+                            </div>
+                            <div class="connection-metric-card">
+                                <span class="connection-metric-label">Elapsed Time</span>
+                                <span class="connection-metric-value" data-role="elapsed"></span>
+                            </div>
+                            <div class="connection-metric-card">
+                                <span class="connection-metric-label">Playback Pos</span>
+                                <span class="connection-metric-value" data-role="offset"></span>
+                            </div>
+                        </div>
+                        <div class="connection-url-card">
+                            <span class="connection-metric-label">Streaming File</span>
+                            <span class="connection-url-value" data-role="url"></span>
+                        </div>
+                    `;
+                    card._refs = {
+                        clientId: card.querySelector('[data-role="client-id"]'),
+                        originBadge: card.querySelector('[data-role="origin-badge"]'),
+                        hydrationBadge: card.querySelector('[data-role="hydration-badge"]'),
+                        statusBadge: card.querySelector('[data-role="status-badge"]'),
+                        ipAddr: card.querySelector('[data-role="ip-addr"]'),
+                        userBadge: card.querySelector('[data-role="user-badge"]'),
+                        userAgent: card.querySelector('[data-role="user-agent"]'),
+                        elapsed: card.querySelector('[data-role="elapsed"]'),
+                        offset: card.querySelector('[data-role="offset"]'),
+                        url: card.querySelector('[data-role="url"]'),
+                    };
                     connectionsContainer.appendChild(card);
                 }
-                
-                card.innerHTML = `
-                    <div class="connection-header">
-                        <div style="display: flex; align-items: center; gap: 8px;">
-                            <span class="connection-client-id">${conn.id}</span>
-                            ${originBadge}
-                        </div>
-                        <div style="display: flex; align-items: center; gap: 6px;">
-                            ${hydrationBadge}
-                            <span class="connection-status-badge ${statusClass}">${statusText}</span>
-                        </div>
-                    </div>
-                    <div class="connection-grid">
-                        <div class="connection-metric-card">
-                            <span class="connection-metric-label">IP Address</span>
-                            <span class="connection-metric-value">${conn.remote_addr} ${conn.username ? `<span class="user-badge" style="color: #60a5fa; font-weight: 600;">(${conn.username})</span>` : ''}</span>
-                        </div>
-                        <div class="connection-metric-card">
-                            <span class="connection-metric-label">User Agent</span>
-                            <span class="connection-metric-value" title="${conn.user_agent}">${uaDisplay}</span>
-                        </div>
-                        <div class="connection-metric-card">
-                            <span class="connection-metric-label">Elapsed Time</span>
-                            <span class="connection-metric-value">${durationStr}</span>
-                        </div>
-                        <div class="connection-metric-card">
-                            <span class="connection-metric-label">Playback Pos</span>
-                            <span class="connection-metric-value">${formatBytes(conn.offset)}${percentageStr}</span>
-                        </div>
-                    </div>
-                    <div class="connection-url-card">
-                        <span class="connection-metric-label">Streaming File</span>
-                        <span class="connection-url-value" title="${conn.url}">${conn.url}</span>
-                    </div>
-                `;
+
+                const refs = card._refs;
+                setTextIfChanged(refs.clientId, conn.id);
+                setClassIfChanged(refs.originBadge, `session-origin-badge ${originClass}`);
+                setTextIfChanged(refs.originBadge, originText);
+                if (showHydration) {
+                    if (refs.hydrationBadge.style.display !== '') refs.hydrationBadge.style.display = '';
+                    setClassIfChanged(refs.hydrationBadge, `download-badge ${hydrationStatusClass}`);
+                    setTextIfChanged(refs.hydrationBadge, hydrationText);
+                } else if (refs.hydrationBadge.style.display !== 'none') {
+                    refs.hydrationBadge.style.display = 'none';
+                }
+                setClassIfChanged(refs.statusBadge, `connection-status-badge ${statusClass}`);
+                setTextIfChanged(refs.statusBadge, statusText);
+                setTextIfChanged(refs.ipAddr, conn.remote_addr || '');
+                if (conn.username) {
+                    if (refs.userBadge.style.display !== '') refs.userBadge.style.display = '';
+                    setTextIfChanged(refs.userBadge, `(${conn.username})`);
+                } else if (refs.userBadge.style.display !== 'none') {
+                    refs.userBadge.style.display = 'none';
+                }
+                setTextIfChanged(refs.userAgent, uaDisplay);
+                if (refs.userAgent.title !== (conn.user_agent || '')) refs.userAgent.title = conn.user_agent || '';
+                setTextIfChanged(refs.elapsed, durationStr);
+                setTextIfChanged(refs.offset, `${formatBytes(conn.offset)}${percentageStr}`);
+                setTextIfChanged(refs.url, conn.url || '');
+                if (refs.url.title !== (conn.url || '')) refs.url.title = conn.url || '';
             });
         }
 
@@ -2006,7 +2148,7 @@
             if (!probesContainer || !probesCountEl) return;
             const totalRAM = (probeBuffers || []).reduce((acc, p) => acc + (p.ram_bytes || 0), 0);
             const ramText = totalRAM > 0 ? ` (${formatBytes(totalRAM)} RAM)` : '';
-            probesCountEl.innerText = `${(probeBuffers || []).length} Buffers${ramText}`;
+            setTextIfChanged(probesCountEl, `${(probeBuffers || []).length} Buffers${ramText}`);
 
             if (!probeBuffers || probeBuffers.length === 0) {
                 probesContainer.innerHTML = `<div class="empty-state">No in-memory probe buffers.</div>`;
@@ -2031,51 +2173,69 @@
                 const idleSecs = (probe.idle_seconds || 0) % 60;
                 const idleStr = idleMins > 0 ? `${idleMins}m ${idleSecs}s` : `${idleSecs}s`;
                 const chainedCount = probe.next_urls ? probe.next_urls.length : 0;
-                const chainedBadge = chainedCount > 0 ? `<span style="font-size: 0.75rem; background: rgba(59, 130, 246, 0.2); color: var(--accent-cyan); padding: 2px 6px; border-radius: 4px; font-weight: 600;">Chained: ${chainedCount}</span>` : '';
-
-                const cardHTML = `
-                    <div class="connection-header">
-                        <div style="display: flex; align-items: center; gap: 8px; overflow: hidden;">
-                            <span class="connection-client-id" style="color: var(--accent-cyan); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${probe.key}">${probe.key}</span>
-                            ${chainedBadge}
-                        </div>
-                        <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
-                            <span class="status-pill" style="font-size: 0.75rem; padding: 2px 8px; border-radius: 4px; background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3);">Probed (Idle)</span>
-                        </div>
-                    </div>
-                    <div class="connection-grid">
-                        <div class="connection-metric-card">
-                            <span class="connection-metric-label">RAM Buffer</span>
-                            <span class="connection-metric-value" style="color: var(--accent-green); font-weight: 600;">${formatBytes(probe.ram_bytes || 0)}</span>
-                        </div>
-                        <div class="connection-metric-card">
-                            <span class="connection-metric-label">Total Media Size</span>
-                            <span class="connection-metric-value">${formatBytes(probe.total_size || 0)}</span>
-                        </div>
-                        <div class="connection-metric-card">
-                            <span class="connection-metric-label">Idle Inactivity</span>
-                            <span class="connection-metric-value">${idleStr} (15m exp)</span>
-                        </div>
-                        <div class="connection-metric-card">
-                            <span class="connection-metric-label">Upstream Workers</span>
-                            <span class="connection-metric-value" style="color: var(--text-sub);">0 (Standby)</span>
-                        </div>
-                    </div>
-                    <div class="connection-url-card">
-                        <span class="connection-metric-label">Target Media URL</span>
-                        <span class="connection-url-value" title="${probe.url}">${probe.url}</span>
-                    </div>
-                `;
 
                 if (!card) {
                     card = document.createElement('div');
                     card.className = 'connection-item';
                     card.id = cardId;
-                    card.innerHTML = cardHTML;
+                    card.innerHTML = `
+                        <div class="connection-header">
+                            <div style="display: flex; align-items: center; gap: 8px; overflow: hidden; flex-wrap: wrap;">
+                                <span class="connection-client-id" data-role="probe-key" style="color: var(--accent-cyan); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></span>
+                                <span data-role="chained-badge" style="font-size: 0.75rem; background: rgba(59, 130, 246, 0.2); color: var(--accent-cyan); padding: 2px 6px; border-radius: 4px; font-weight: 600; display: none;"></span>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+                                <span class="status-pill" style="font-size: 0.75rem; padding: 2px 8px; border-radius: 4px; background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3);">Probed (Idle)</span>
+                            </div>
+                        </div>
+                        <div class="connection-grid">
+                            <div class="connection-metric-card">
+                                <span class="connection-metric-label">RAM Buffer</span>
+                                <span class="connection-metric-value" data-role="ram-bytes" style="color: var(--accent-green); font-weight: 600;"></span>
+                            </div>
+                            <div class="connection-metric-card">
+                                <span class="connection-metric-label">Total Media Size</span>
+                                <span class="connection-metric-value" data-role="total-size"></span>
+                            </div>
+                            <div class="connection-metric-card">
+                                <span class="connection-metric-label">Idle Inactivity</span>
+                                <span class="connection-metric-value" data-role="idle-str"></span>
+                            </div>
+                            <div class="connection-metric-card">
+                                <span class="connection-metric-label">Upstream Workers</span>
+                                <span class="connection-metric-value" style="color: var(--text-sub);">0 (Standby)</span>
+                            </div>
+                        </div>
+                        <div class="connection-url-card">
+                            <span class="connection-metric-label">Target Media URL</span>
+                            <span class="connection-url-value" data-role="url"></span>
+                        </div>
+                    `;
+                    card._refs = {
+                        probeKey: card.querySelector('[data-role="probe-key"]'),
+                        chainedBadge: card.querySelector('[data-role="chained-badge"]'),
+                        ramBytes: card.querySelector('[data-role="ram-bytes"]'),
+                        totalSize: card.querySelector('[data-role="total-size"]'),
+                        idleStr: card.querySelector('[data-role="idle-str"]'),
+                        url: card.querySelector('[data-role="url"]'),
+                    };
                     probesContainer.appendChild(card);
-                } else {
-                    card.innerHTML = cardHTML;
                 }
+
+                const refs = card._refs;
+                setTextIfChanged(refs.probeKey, probe.key);
+                if (refs.probeKey.title !== probe.key) refs.probeKey.title = probe.key;
+                if (chainedCount > 0) {
+                    if (refs.chainedBadge.style.display !== '') refs.chainedBadge.style.display = '';
+                    setTextIfChanged(refs.chainedBadge, `Chained: ${chainedCount}`);
+                } else if (refs.chainedBadge.style.display !== 'none') {
+                    refs.chainedBadge.style.display = 'none';
+                }
+                setTextIfChanged(refs.ramBytes, formatBytes(probe.ram_bytes || 0));
+                setTextIfChanged(refs.totalSize, formatBytes(probe.total_size || 0));
+                setTextIfChanged(refs.idleStr, `${idleStr} (15m exp)`);
+                setTextIfChanged(refs.url, probe.url || '');
+                if (refs.url.title !== (probe.url || '')) refs.url.title = probe.url || '';
             });
         }
 

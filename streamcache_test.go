@@ -4842,6 +4842,99 @@ func TestLivePlaybackDownshiftThenMidFileSeekSpawnsSecondWorkerAndTailProbe(t *t
 	}
 }
 
+func TestClientAddrForwardedHeaders(t *testing.T) {
+	cases := []struct {
+		name       string
+		remoteAddr string
+		xff        string
+		xRealIP    string
+		want       string
+	}{
+		{
+			name:       "trusted docker proxy uses X-Forwarded-For LAN IP",
+			remoteAddr: "172.20.0.2:37616",
+			xff:        "192.168.1.50",
+			xRealIP:    "192.168.1.50",
+			want:       "192.168.1.50",
+		},
+		{
+			name:       "trusted proxy picks rightmost public IP to block left spoof",
+			remoteAddr: "172.20.0.2:41000",
+			xff:        "1.2.3.4, 203.0.113.77",
+			want:       "203.0.113.77",
+		},
+		{
+			name:       "trusted proxy falls back to X-Real-IP when XFF absent",
+			remoteAddr: "127.0.0.1:5000",
+			xRealIP:    "10.0.5.12",
+			want:       "10.0.5.12",
+		},
+		{
+			name:       "trusted proxy handles IPv6 X-Forwarded-For",
+			remoteAddr: "172.20.0.2:5555",
+			xff:        "2001:db8::42",
+			want:       "2001:db8::42",
+		},
+		{
+			name:       "untrusted direct public peer ignores spoofed XFF",
+			remoteAddr: "198.51.100.9:12345",
+			xff:        "192.168.1.50",
+			xRealIP:    "10.0.0.5",
+			want:       "198.51.100.9:12345",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://streamcache.local/stream", nil)
+			req.RemoteAddr = tc.remoteAddr
+			if tc.xff != "" {
+				req.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			if tc.xRealIP != "" {
+				req.Header.Set("X-Real-IP", tc.xRealIP)
+			}
+			if got := getClientAddr(req); got != tc.want {
+				t.Fatalf("getClientAddr() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// Verify NewCacheReader records forwarded IP onto ClientConnection & ClientSession
+	GlobalRegistry.Lock.Lock()
+	if GlobalRegistry.Connections == nil {
+		GlobalRegistry.Connections = make(map[string]*ClientConnection)
+	}
+	if GlobalRegistry.Sessions == nil {
+		GlobalRegistry.Sessions = make(map[string]*ClientSession)
+	}
+	origSessions := make(map[string]*ClientSession, len(GlobalRegistry.Sessions))
+	for k, v := range GlobalRegistry.Sessions {
+		origSessions[k] = v
+	}
+	GlobalRegistry.Sessions = make(map[string]*ClientSession)
+	GlobalRegistry.Lock.Unlock()
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		GlobalRegistry.Sessions = origSessions
+		GlobalRegistry.Lock.Unlock()
+	}()
+
+	state := NewFileCacheState("forwarded_test.mkv", "http://origin/forwarded_test.mkv", "/tmp/x", "/tmp/x.part", "/tmp/x.json", "video/x-matroska", "", "", 1024*1024)
+	req := httptest.NewRequest(http.MethodGet, "http://streamcache.local/stream", nil)
+	req.RemoteAddr = "172.20.0.2:37616"
+	req.Header.Set("X-Forwarded-For", "192.168.1.50")
+	req.Header.Set("User-Agent", "Lavf/59.27.100")
+
+	reader := NewCacheReader(context.Background(), state, req)
+	defer reader.Close()
+
+	sessions := GlobalRegistry.GetActiveSessions()
+	if len(sessions) != 1 || sessions[0].RemoteAddr != "192.168.1.50" {
+		t.Fatalf("Expected session RemoteAddr 192.168.1.50, got %+v", sessions)
+	}
+}
+
 
 
 

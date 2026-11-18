@@ -21,12 +21,15 @@ type S3ChunkManager struct {
 	totalParts  int
 	isMultipart bool
 
-	mu           sync.RWMutex
-	uploaded     map[int]bool
-	uploading    map[int]bool
-	recomposing  bool
-	recomposed   bool
-	recomposeErr error
+	mu              sync.RWMutex
+	uploaded        map[int]bool
+	uploading       map[int]bool
+	recomposing     bool
+	recomposed      bool
+	recomposeErr    error
+	commitStage     string
+	commitCompleted int
+	commitTotal     int
 
 	// In-flight scratch budget & socket backpressure
 	maxInFlightBytes int64
@@ -378,6 +381,65 @@ func (m *S3ChunkManager) IsRecomposed() bool {
 	return m.recomposed
 }
 
+// setCommitProgress records the active commit stage and item progress under lock.
+func (m *S3ChunkManager) setCommitProgress(stage string, completed, total int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.commitStage = stage
+	m.commitCompleted = completed
+	m.commitTotal = total
+	m.mu.Unlock()
+}
+
+// GetCommitProgress returns the current S3 commit/recomposition stage and phase counts.
+func (m *S3ChunkManager) GetCommitProgress() *CommitProgress {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.recomposed {
+		total := m.commitTotal
+		if total <= 0 {
+			total = 1
+		}
+		return &CommitProgress{Stage: "finalizing", Completed: total, Total: total}
+	}
+
+	if m.commitStage == "recomposing" || m.commitStage == "finalizing" {
+		return &CommitProgress{
+			Stage:     m.commitStage,
+			Completed: m.commitCompleted,
+			Total:     m.commitTotal,
+		}
+	}
+
+	if m.isMultipart && m.totalParts > 0 {
+		uploaded := len(m.uploaded)
+		if uploaded < m.totalParts {
+			return &CommitProgress{
+				Stage:     "uploading",
+				Completed: uploaded,
+				Total:     m.totalParts,
+			}
+		}
+		return &CommitProgress{
+			Stage:     "recomposing",
+			Completed: 0,
+			Total:     m.totalParts,
+		}
+	}
+
+	return &CommitProgress{
+		Stage:     "finalizing",
+		Completed: 0,
+		Total:     1,
+	}
+}
+
 // AttemptRecompose stitches uploaded chunks into the monolithic S3 object
 func (m *S3ChunkManager) AttemptRecompose() {
 	m.mu.Lock()
@@ -391,6 +453,15 @@ func (m *S3ChunkManager) AttemptRecompose() {
 	}
 	m.recomposing = true
 	m.recomposeErr = nil
+	if m.isMultipart {
+		m.commitStage = "recomposing"
+		m.commitCompleted = 0
+		m.commitTotal = m.totalParts
+	} else {
+		m.commitStage = "finalizing"
+		m.commitCompleted = 0
+		m.commitTotal = 1
+	}
 	m.mu.Unlock()
 
 	m.recomposeWg.Add(1)
@@ -412,9 +483,25 @@ func (m *S3ChunkManager) AttemptRecompose() {
 			log.Printf("[S3ChunkManager] Non-multipart asset (%.2f MB). Committing direct to S3 for %s...",
 				float64(m.totalSize)/(1024*1024), m.key)
 			err = m.storage.CommitLocalFile(m.ctx, m.key, m.state.PartPath, meta)
+			if err == nil {
+				m.setCommitProgress("finalizing", 1, 1)
+			}
 		} else {
 			log.Printf("[S3ChunkManager] All %d chunks uploaded to S3. Starting server-side recomposition for %s...", m.totalParts, m.key)
-			err = m.storage.Recompose(m.ctx, m.key, m.totalParts, meta)
+			recomposeCtx := WithCommitProgress(m.ctx, CommitProgressFunc(m.setCommitProgress))
+			err = m.storage.Recompose(recomposeCtx, m.key, m.totalParts, meta)
+			if err == nil {
+				m.mu.RLock()
+				stage := m.commitStage
+				total := m.commitTotal
+				m.mu.RUnlock()
+				if stage != "finalizing" {
+					if total <= 0 {
+						total = 1
+					}
+					m.setCommitProgress("finalizing", total, total)
+				}
+			}
 		}
 
 		if err != nil {

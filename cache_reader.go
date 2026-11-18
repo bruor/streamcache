@@ -47,7 +47,7 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 
 	var remoteAddr, userAgent, username string
 	if req != nil {
-		remoteAddr = req.RemoteAddr
+		remoteAddr = getClientAddr(req)
 		userAgent = req.Header.Get("User-Agent")
 		username = req.URL.Query().Get("user")
 		if username == "" {
@@ -408,8 +408,8 @@ func (r *CacheReader) finalizeCache() {
 
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
 		var commitErr error
-		if r.state.ChunkManager != nil {
-			commitErr = r.state.ChunkManager.WaitAndRecompose(context.Background())
+		if cm := r.state.GetChunkManager(); cm != nil {
+			commitErr = cm.WaitAndRecompose(context.Background())
 		} else {
 			commitErr = GlobalStorage.CommitLocalFile(context.Background(), r.state.Key, r.state.PartPath, meta)
 		}
@@ -640,12 +640,13 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 
 	r.state.Lock.Lock()
 	lb := r.state.LiveBuffer
+	cm := r.state.ChunkManager
 	r.state.Lock.Unlock()
 
 	// 1. LiveBuffer Fast-Path: check in-memory buffer first for zero-copy playback
 	if lb != nil {
 		if memN, ok := lb.ReadAt(p[:toRead], off); ok && memN > 0 {
-			isS3Chunked := GlobalStorage != nil && GlobalStorage.Type() == "s3" && r.state.ChunkManager != nil
+			isS3Chunked := GlobalStorage != nil && GlobalStorage.Type() == "s3" && cm != nil
 			if memN < int(toRead) && !isS3Chunked && (r.state.IsDiskMaterialized() || FileExists(r.state.PartPath) || FileExists(r.state.Path)) {
 				if f, ferr := r.getFile(); ferr == nil {
 					diskN, _ := f.ReadAt(p[memN:toRead], off+int64(memN))
@@ -665,7 +666,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
 		// A. Recomposed Monolithic Object: If all parts have been stitched and sealed, read via s3ReadSeeker
 		isRecomposed := false
-		if r.state.ChunkManager != nil && r.state.ChunkManager.IsRecomposed() {
+		if cm != nil && cm.IsRecomposed() {
 			isRecomposed = true
 		} else if !FileExists(r.state.PartPath) && r.state.RangeSet.IsComplete(r.state.TotalSize) {
 			isRecomposed = true
@@ -687,10 +688,10 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 
 		// B. In-flight Chunks: If chunk is in S3 prior to recomposition, read using sliding chunk buffer
-		if r.state.ChunkManager != nil {
-			chunkSize := r.state.ChunkManager.ChunkSize()
+		if cm != nil {
+			chunkSize := cm.ChunkSize()
 			chunkIdx := int(off / chunkSize)
-			if r.state.ChunkManager.IsChunkUploaded(chunkIdx) {
+			if cm.IsChunkUploaded(chunkIdx) {
 				chunkStart := int64(chunkIdx) * chunkSize
 				offsetInChunk := off - chunkStart
 				chunkRemaining := chunkSize - offsetInChunk

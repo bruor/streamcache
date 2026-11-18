@@ -1650,8 +1650,8 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 		}
 
 		var commitErr error
-		if state.ChunkManager != nil {
-			commitErr = state.ChunkManager.WaitAndRecompose(context.Background())
+		if cm := state.GetChunkManager(); cm != nil {
+			commitErr = cm.WaitAndRecompose(context.Background())
 		} else {
 			commitErr = GlobalStorage.CommitLocalFile(context.Background(), state.Key, state.PartPath, meta)
 		}

@@ -200,6 +200,16 @@ type ConnectionInfo struct {
 	Closed time.Time // IsZero if still active
 }
 
+// GetChunkManager safely reads s.ChunkManager under s.Lock.
+func (s *FileCacheState) GetChunkManager() *S3ChunkManager {
+	if s == nil {
+		return nil
+	}
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	return s.ChunkManager
+}
+
 func (s *FileCacheState) SetUpstreamStatus(status string) {
 	targetStatus := status
 	if status == "Connecting" || status == "Retrying" {

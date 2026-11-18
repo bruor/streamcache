@@ -452,8 +452,18 @@ func (b *S3StorageBackend) UploadChunk(ctx context.Context, key string, chunkInd
 }
 
 func (b *S3StorageBackend) Recompose(ctx context.Context, key string, totalParts int, meta FileMeta) error {
+	return b.RecomposeWithProgress(ctx, key, totalParts, meta, commitProgressFromContext(ctx))
+}
+
+func (b *S3StorageBackend) RecomposeWithProgress(ctx context.Context, key string, totalParts int, meta FileMeta, onProgress CommitProgressFunc) error {
 	if totalParts <= 0 {
 		return errors.New("cannot recompose with 0 parts")
+	}
+
+	report := func(stage string, done, total int) {
+		if onProgress != nil {
+			onProgress(stage, done, total)
+		}
 	}
 
 	targetKey := b.monolithicKey(key)
@@ -484,6 +494,8 @@ func (b *S3StorageBackend) Recompose(ctx context.Context, key string, totalParts
 	completedParts := make([]types.CompletedPart, 0, totalParts)
 	chunkKeys := make([]types.ObjectIdentifier, 0, totalParts)
 
+	report("recomposing", 0, totalParts)
+
 	// 2. UploadPartCopy for each chunk
 	for i := 0; i < totalParts; i++ {
 		partNumber := int32(i + 1)
@@ -506,7 +518,13 @@ func (b *S3StorageBackend) Recompose(ctx context.Context, key string, totalParts
 			PartNumber: aws.Int32(partNumber),
 			ETag:       copyResp.CopyPartResult.ETag,
 		})
+		report("recomposing", i+1, totalParts)
 	}
+
+	const maxDeleteBatch = 1000
+	deleteBatches := (len(chunkKeys) + maxDeleteBatch - 1) / maxDeleteBatch
+	finalizeTotal := 1 + deleteBatches
+	report("finalizing", 0, finalizeTotal)
 
 	// 3. CompleteMultipartUpload
 	_, err = b.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
@@ -522,16 +540,24 @@ func (b *S3StorageBackend) Recompose(ctx context.Context, key string, totalParts
 	}
 
 	completedSuccessfully = true
+	finalizeStep := 1
+	report("finalizing", finalizeStep, finalizeTotal)
 
-	// 4. Clean up temporary chunk objects
-	if len(chunkKeys) > 0 {
+	// 4. Clean up temporary chunk objects (batched to stay within S3's 1000-key limit)
+	for start := 0; start < len(chunkKeys); start += maxDeleteBatch {
+		end := start + maxDeleteBatch
+		if end > len(chunkKeys) {
+			end = len(chunkKeys)
+		}
 		_, _ = b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(b.bucket),
 			Delete: &types.Delete{
-				Objects: chunkKeys,
+				Objects: chunkKeys[start:end],
 				Quiet:   aws.Bool(true),
 			},
 		})
+		finalizeStep++
+		report("finalizing", finalizeStep, finalizeTotal)
 	}
 
 	return nil

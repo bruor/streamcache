@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -1479,6 +1480,145 @@ func TestS3UploadWorkerPunchesHole(t *testing.T) {
 	}
 	if !bytes.Equal(localChunk1, data[chunkSize:]) {
 		t.Fatalf("Chunk 1 on disk was unexpectedly modified!")
+	}
+}
+
+func TestS3CommitProgressStagesAndPayloads(t *testing.T) {
+	mockS3 := NewMockS3Server("progress-bucket")
+	defer mockS3.Close()
+
+	backend, err := NewS3StorageBackend(S3Config{
+		Endpoint:     mockS3.URL(),
+		Bucket:       "progress-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    32 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	tempDir, err := os.MkdirTemp("", "sc2_s3_prog_*")
+	if err != nil {
+		t.Fatalf("MkdirTemp error: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	const chunkSize = int64(32 * 1024)
+	const totalParts = 3
+	totalSize := chunkSize * totalParts
+	key := "commit_progress_test.mkv"
+	partPath := filepath.Join(tempDir, key+".part")
+	if err := os.WriteFile(partPath, make([]byte, totalSize), 0644); err != nil {
+		t.Fatalf("WriteFile error: %v", err)
+	}
+
+	// Upload chunks directly so Recompose can report full recomposing -> finalizing phases
+	for i := 0; i < totalParts; i++ {
+		if err := backend.UploadChunk(context.Background(), key, i, bytes.NewReader(make([]byte, chunkSize)), chunkSize); err != nil {
+			t.Fatalf("UploadChunk %d error: %v", i, err)
+		}
+	}
+
+	var events []CommitProgress
+	ctxWithProg := WithCommitProgress(context.Background(), func(stage string, done, total int) {
+		events = append(events, CommitProgress{Stage: stage, Completed: done, Total: total})
+	})
+	if err := backend.Recompose(ctxWithProg, key, totalParts, FileMeta{TotalSize: totalSize}); err != nil {
+		t.Fatalf("Recompose error: %v", err)
+	}
+
+	want := []CommitProgress{
+		{Stage: "recomposing", Completed: 0, Total: 3},
+		{Stage: "recomposing", Completed: 1, Total: 3},
+		{Stage: "recomposing", Completed: 2, Total: 3},
+		{Stage: "recomposing", Completed: 3, Total: 3},
+		{Stage: "finalizing", Completed: 0, Total: 2},
+		{Stage: "finalizing", Completed: 1, Total: 2},
+		{Stage: "finalizing", Completed: 2, Total: 2},
+	}
+	if len(events) != len(want) {
+		t.Fatalf("Expected %d commit progress events %v, got %d: %v", len(want), want, len(events), events)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("Event %d = %+v, want %+v", i, events[i], want[i])
+		}
+	}
+
+	// Verify S3ChunkManager.GetCommitProgress() + SSE/Debug payload exposure
+	state := NewFileCacheState(key, "http://origin/"+key, filepath.Join(tempDir, key), partPath, partPath+".json", "video/x-matroska", "", "", totalSize)
+	cm := NewS3ChunkManager(state, backend, chunkSize)
+	cm.mu.Lock()
+	cm.uploaded[0] = true
+	cm.mu.Unlock()
+	state.ChunkManager = cm
+	state.Lock.Lock()
+	state.UpstreamStatus = "Committing"
+	state.IsCommitting = true
+	state.Lock.Unlock()
+
+	if cp := cm.GetCommitProgress(); cp == nil || cp.Stage != "uploading" || cp.Completed != 1 || cp.Total != 3 {
+		t.Fatalf("Expected uploading 1/3 progress, got %+v", cp)
+	}
+
+	cm.setCommitProgress("recomposing", 2, 3)
+	oldStorage := GlobalStorage
+	oldBackendType := GlobalConfig.GetStorageBackend()
+	GlobalConfig.SetStorageBackend("s3")
+	GlobalStorage = backend
+	GlobalRegistry.Lock.Lock()
+	if GlobalRegistry.Files == nil {
+		GlobalRegistry.Files = make(map[string]*FileCacheState)
+	}
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+	defer func() {
+		GlobalRegistry.Lock.Lock()
+		delete(GlobalRegistry.Files, key)
+		GlobalRegistry.Lock.Unlock()
+		GlobalStorage = oldStorage
+		GlobalConfig.SetStorageBackend(oldBackendType)
+	}()
+
+	payloadBytes, err := buildStatePayload()
+	if err != nil {
+		t.Fatalf("buildStatePayload error: %v", err)
+	}
+	var payload struct {
+		ActiveDownloads []struct {
+			Key            string          `json:"key"`
+			UpstreamStatus string          `json:"upstream_status"`
+			CommitProgress *CommitProgress `json:"commit_progress"`
+		} `json:"active_downloads"`
+	}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		t.Fatalf("Unmarshal SSE payload error: %v", err)
+	}
+	if len(payload.ActiveDownloads) != 1 || payload.ActiveDownloads[0].CommitProgress == nil {
+		t.Fatalf("Expected commit_progress in active_downloads, got %+v", payload.ActiveDownloads)
+	}
+	if got := *payload.ActiveDownloads[0].CommitProgress; got.Stage != "recomposing" || got.Completed != 2 || got.Total != 3 {
+		t.Fatalf("Expected recomposing 2/3 in SSE payload, got %+v", got)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/debug/state", nil)
+	rr := httptest.NewRecorder()
+	handleDebugState(rr, req)
+	var dbgPayload struct {
+		ActiveDownloads []struct {
+			Key            string          `json:"key"`
+			CommitProgress *CommitProgress `json:"commit_progress"`
+		} `json:"active_downloads"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &dbgPayload); err != nil {
+		t.Fatalf("Unmarshal /debug/state error: %v", err)
+	}
+	if len(dbgPayload.ActiveDownloads) != 1 || dbgPayload.ActiveDownloads[0].CommitProgress == nil || dbgPayload.ActiveDownloads[0].CommitProgress.Completed != 2 {
+		t.Fatalf("Expected commit_progress in /debug/state, got %+v", dbgPayload.ActiveDownloads)
 	}
 }
 

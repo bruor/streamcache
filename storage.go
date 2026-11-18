@@ -62,6 +62,36 @@ type StorageBackend interface {
 	List(ctx context.Context) ([]StorageObjectInfo, error)
 }
 
+// CommitProgress describes the active commit/recomposition phase and item progress.
+type CommitProgress struct {
+	Stage     string `json:"stage"`
+	Completed int    `json:"completed"`
+	Total     int    `json:"total"`
+}
+
+type commitProgressCtxKey struct{}
+
+// CommitProgressFunc receives (stage, completed, total) updates during S3 commit/recompose.
+type CommitProgressFunc func(stage string, done, total int)
+
+// WithCommitProgress attaches a progress callback to ctx for StorageBackend implementations.
+func WithCommitProgress(ctx context.Context, fn CommitProgressFunc) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, commitProgressCtxKey{}, fn)
+}
+
+func commitProgressFromContext(ctx context.Context) CommitProgressFunc {
+	if ctx == nil {
+		return nil
+	}
+	if fn, ok := ctx.Value(commitProgressCtxKey{}).(CommitProgressFunc); ok {
+		return fn
+	}
+	return nil
+}
+
 // GlobalStorage holds the active singleton storage backend
 var GlobalStorage StorageBackend
 
