@@ -255,7 +255,7 @@ func (pm *PrehydrationManager) pollLoop() {
 // Requires effective available streams >= PREHYDRATE_CAPACITY_RESERVATION + 1 so that after claiming 1 slot,
 // at least PREHYDRATE_CAPACITY_RESERVATION slots remain free for live viewers.
 func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
-	if GlobalConfig != nil && !GlobalConfig.GetEnableEpisodePrehydration() {
+	if GlobalConfig != nil && (!GlobalConfig.GetEnableEpisodePrehydration() || GlobalConfig.EffectiveStorageBackend() == "tmp") {
 		return false
 	}
 
@@ -714,6 +714,9 @@ func (pm *PrehydrationManager) OnCacheHit(currentURL string, nextURLs []string) 
 	if pm == nil || len(nextURLs) == 0 {
 		return
 	}
+	if GlobalConfig != nil && GlobalConfig.EffectiveStorageBackend() == "tmp" {
+		return
+	}
 	pm.OnPlayerPlayback(currentURL, nextURLs)
 	pm.AutoDiscoverDispatcharrURL(currentURL)
 	if GlobalS3Index != nil {
@@ -752,9 +755,12 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 	if pm == nil || state == nil {
 		return
 	}
+	if state.GetTargetTier() == TierTmp || (GlobalConfig != nil && GlobalConfig.EffectiveStorageBackend() == "tmp") {
+		return
+	}
 
 	if !state.IsDiskMaterialized() {
-		if GlobalRegistry != nil && state.TotalSize > 0 {
+		if GlobalRegistry != nil && state.TotalSize > 0 && state.GetTargetTier() == TierDisk {
 			GlobalRegistry.PreEvict(state.TotalSize)
 		}
 		_ = state.MaterializeDiskFile()
@@ -797,11 +803,16 @@ func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	if pm == nil || targetURL == "" {
 		return
 	}
+	if GlobalConfig != nil && GlobalConfig.EffectiveStorageBackend() == "tmp" {
+		return
+	}
 
 	key, ext := getCacheKeyAndExt(targetURL)
 	cacheFileName := key + ext
-	cacheDir := GlobalConfig.GetCacheDir()
-	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
+	cacheFilePath := ""
+	if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
+		cacheFilePath = filepath.Join(GlobalConfig.GetCacheDir(), cacheFileName)
+	}
 
 	// If already completed in storage (local disk or S3), chain immediately to the next one!
 	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
@@ -940,11 +951,16 @@ func (pm *PrehydrationManager) processNextTask() {
 }
 
 func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
+	if GlobalConfig != nil && GlobalConfig.EffectiveStorageBackend() == "tmp" {
+		return
+	}
 	targetURL := task.TargetURL
 	key, ext := getCacheKeyAndExt(targetURL)
 	cacheFileName := key + ext
-	cacheDir := GlobalConfig.GetCacheDir()
-	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
+	cacheFilePath := ""
+	if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
+		cacheFilePath = filepath.Join(GlobalConfig.GetCacheDir(), cacheFileName)
+	}
 
 	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
 		if len(task.NextURLs) > 0 {
@@ -1016,13 +1032,36 @@ func (pm *PrehydrationManager) executePrehydration(task *PrehydrationTask) {
 		contentType = getMimeTypeByExt(ext)
 	}
 
-	GlobalRegistry.PreEvict(totalSize)
-
 	partPath := filepath.Join(GlobalConfig.GetTmpDir(), cacheFileName+".part")
-	metaPath := cacheFilePath + ".json"
+	metaPath := ""
+	if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
+		metaPath = cacheFilePath + ".json"
+	}
+
+	state = NewFileCacheState(cacheFileName, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod, totalSize)
+	if state.GetTargetTier() == TierTmp {
+		pm.mu.Lock()
+		if pm.prehydrationsStartedSinceLastPoll > 0 {
+			pm.prehydrationsStartedSinceLastPoll--
+		}
+		pm.mu.Unlock()
+		log.Printf("[Prehydration] Skipping prehydration for %s: routed to ephemeral TierTmp", cacheFileName)
+		return
+	}
+	if state.GetTargetTier() == TierDisk && GlobalRegistry != nil {
+		GlobalRegistry.PreEvict(totalSize)
+	}
 
 	GlobalRegistry.Lock.Lock()
-	state = NewFileCacheState(cacheFileName, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod, totalSize)
+	if existing, exists := GlobalRegistry.Files[cacheFileName]; exists && existing != nil {
+		GlobalRegistry.Lock.Unlock()
+		pm.mu.Lock()
+		if pm.prehydrationsStartedSinceLastPoll > 0 {
+			pm.prehydrationsStartedSinceLastPoll--
+		}
+		pm.mu.Unlock()
+		return
+	}
 	state.IsPrehydrating = true
 	state.IsYielding = false
 	state.NextURLs = task.NextURLs

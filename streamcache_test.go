@@ -24,7 +24,9 @@ func TestMain(m *testing.M) {
 		Port:                    ":9999",
 		CacheDir:                "./test_cache/files",
 		TmpDir:                  "./test_cache/tmp",
-		CacheMaxBytes:           300,
+		StateDir:                "./test_cache/state",
+		CacheMaxBytes:           512 * 1024 * 1024,
+		CacheMaxItemPct:         50,
 		CacheMinDiskFreeBytes:   1000,
 		TmpMinDiskFreeBytes:     1000,
 		CacheRevalidateInterval: 50 * time.Millisecond, // short for test
@@ -37,6 +39,7 @@ func TestMain(m *testing.M) {
 
 	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
 	_ = os.MkdirAll(GlobalConfig.TmpDir, 0755)
+	_ = os.MkdirAll(GlobalConfig.StateDir, 0755)
 
 	GlobalRegistry = &CacheRegistry{
 		Files:       make(map[string]*FileCacheState),

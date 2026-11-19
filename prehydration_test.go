@@ -542,16 +542,21 @@ func TestGlobalRegistryAndFileStateNoLockInversionDeadlock(t *testing.T) {
 		notifyCh:            make(chan struct{}, 100),
 	}
 
-	GlobalRegistry.Lock.Lock()
-	oldFiles := GlobalRegistry.Files
-	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	preBuilt := make([]*FileCacheState, 0, 5)
 	for i := 0; i < 5; i++ {
 		key := fmt.Sprintf("test_file_%d.mkv", i)
 		fs := NewFileCacheState(key, "http://example.com/"+key, filepath.Join(tmpDir, key), filepath.Join(tmpDir, key+".part"), filepath.Join(tmpDir, key+".json"), "video/mp4", "", "", 10000000)
 		fs.IsPrehydrating = (i%2 == 0)
 		fs.IsYielding = (i%2 != 0)
 		fs.WriterActive = true
-		GlobalRegistry.Files[key] = fs
+		preBuilt = append(preBuilt, fs)
+	}
+
+	GlobalRegistry.Lock.Lock()
+	oldFiles := GlobalRegistry.Files
+	GlobalRegistry.Files = make(map[string]*FileCacheState)
+	for _, fs := range preBuilt {
+		GlobalRegistry.Files[fs.Key] = fs
 	}
 	GlobalRegistry.Lock.Unlock()
 

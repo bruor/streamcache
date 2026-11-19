@@ -128,9 +128,11 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	if GlobalStorage != nil {
 		_ = GlobalStorage.UpdateMetadata(context.Background(), key, meta)
 	}
-	newMetaBytes, err := json.Marshal(meta)
-	if err == nil {
-		_ = writeMetaFileAtomic(metaPath, newMetaBytes)
+	if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
+		newMetaBytes, err := json.Marshal(meta)
+		if err == nil {
+			_ = writeMetaFileAtomic(metaPath, newMetaBytes)
+		}
 	}
 
 	log.Printf("[Revalidate] Cache validated successfully. Serving HIT for: %s", key)

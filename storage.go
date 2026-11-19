@@ -26,6 +26,7 @@ type StorageReadSeeker interface {
 type StorageTier string
 
 const (
+	TierTmp   StorageTier = "tmp"
 	TierDisk  StorageTier = "disk"
 	TierS3    StorageTier = "s3"
 	TierProbe StorageTier = "probe"
@@ -113,16 +114,19 @@ var GlobalStorage StorageBackend
 
 // InitStorage initializes the global storage backend according to configuration
 func InitStorage() error {
-	backendType := GlobalConfig.GetStorageBackend()
-	if backendType == "s3" {
+	switch GlobalConfig.EffectiveStorageBackend() {
+	case "s3":
 		s3Backend, err := NewS3StorageBackend(GlobalConfig.GetS3Config())
 		if err != nil {
 			return err
 		}
 		GlobalStorage = s3Backend
 		return nil
+	case "tmp":
+		GlobalStorage = NewTmpStorageBackend(GlobalConfig.GetTmpDir())
+		return nil
+	default:
+		GlobalStorage = NewLocalStorageBackend(GlobalConfig.GetCacheDir(), GlobalConfig.GetTmpDir())
+		return nil
 	}
-
-	GlobalStorage = NewLocalStorageBackend(GlobalConfig.GetCacheDir(), GlobalConfig.GetTmpDir())
-	return nil
 }

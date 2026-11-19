@@ -178,8 +178,10 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// Generate cache key and extension (stripping query parameters)
 	key, ext := getCacheKeyAndExt(targetURL)
 	cacheFileName := key + ext
-	cacheDir := GlobalConfig.GetCacheDir()
-	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
+	cacheFilePath := ""
+	if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
+		cacheFilePath = filepath.Join(GlobalConfig.GetCacheDir(), cacheFileName)
+	}
 
 	// 3. Cache HIT Path with Revalidation
 	var cacheHit bool
@@ -191,7 +193,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			cacheHit = true
 			cacheMeta = meta
 		}
-	} else if FileExists(cacheFilePath) {
+	} else if cacheFilePath != "" && FileExists(cacheFilePath) {
 		cacheHit = true
 	}
 
@@ -292,7 +294,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 				if cacheMeta != nil && cacheMeta.ContentType != "" {
 					w.Header().Set("Content-Type", cacheMeta.ContentType)
-				} else {
+				} else if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
 					metaPath := cacheFilePath + ".json"
 					if metaBytes, err := os.ReadFile(metaPath); err == nil {
 						var meta FileMeta
@@ -357,19 +359,30 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		metaPath := cacheFilePath + ".json"
+		metaPath := ""
+		if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
+			metaPath = cacheFilePath + ".json"
+		}
 		partPath := filepath.Join(GlobalConfig.GetTmpDir(), cacheFileName+".part")
 
-		// Double-check if another concurrent request created FileCacheState during probe
+		// Construct candidate outside GlobalRegistry.Lock because NewFileCacheState calls CanAdmitToDiskL1.
+		candidate := NewFileCacheState(cacheFileName, targetURL, cacheFilePath, partPath, metaPath, probeContentType, etag, lastMod, totalSize)
+		candidate.NextURLs = nextURLs
+
+		// Double-check if another concurrent request created FileCacheState during probe or admission check
 		GlobalRegistry.Lock.Lock()
 		existingState, exists := GlobalRegistry.Files[cacheFileName]
 		if exists {
 			state = existingState
 			GlobalRegistry.Lock.Unlock()
+			if candidate.ChunkManager != nil {
+				candidate.ChunkManager.Close()
+			}
+			if candidate.LiveBuffer != nil {
+				candidate.LiveBuffer.Clear()
+			}
 		} else {
-			state = NewFileCacheState(cacheFileName, targetURL, cacheFilePath, partPath, metaPath, probeContentType, etag, lastMod, totalSize)
-			state.NextURLs = nextURLs
-
+			state = candidate
 			GlobalRegistry.Files[cacheFileName] = state
 			GlobalRegistry.Lock.Unlock()
 

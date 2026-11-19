@@ -180,11 +180,11 @@ func CancelCoordinator(state *FileCacheState) {
 			if FileExists(partPath) {
 				_ = os.Remove(partPath)
 			}
-			if FileExists(metaPath) {
+			if metaPath != "" && FileExists(metaPath) {
 				_ = os.Remove(metaPath)
 			}
 			if chunkManager == nil || !chunkManager.IsRecomposed() {
-				triggerAsyncChunkCleanup(GlobalStorage, key, "[Coord]")
+				triggerAsyncTargetCleanup(chunkManager, GlobalStorage, key, "[Coord]")
 			}
 			log.Printf("[Coord] Manually cancelled hydration and removed partial cache files: %s", key)
 		} else {
@@ -310,15 +310,19 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			go finalizeAndCommitCache(state, fileToClose, pipelineToClose)
 		} else {
 			var fileToClose *os.File
+			var cmToClose *ScratchChunkManager
 			pipelineToClose := state.Pipeline
 			state.Pipeline = nil
+			tier := state.targetTierLocked()
 			pm := GlobalPrehydrationManager
-			canSuspendToYield := state.DiskMaterialized && state.UpstreamStatus != "Cancelled" && pm != nil && (GlobalConfig == nil || (GlobalConfig.GetEnableEpisodePrehydration() && !GlobalConfig.GetEvictYieldedParts()))
+			canSuspendToYield := tier != TierTmp && state.DiskMaterialized && state.UpstreamStatus != "Cancelled" && pm != nil && (GlobalConfig == nil || (GlobalConfig.GetEnableEpisodePrehydration() && !GlobalConfig.GetEvictYieldedParts()))
 			shouldSuspendToYield := isCurrentGen && len(state.Clients) == 0 && !state.IsYielding && (state.IsPrehydrating || canSuspendToYield)
-			shouldCleanUpIncomplete := isCurrentGen && len(state.Clients) == 0 && !state.IsYielding && !state.IsPrehydrating && !shouldSuspendToYield
+			shouldCleanUpIncomplete := isCurrentGen && len(state.Clients) == 0 && !state.IsYielding && (!state.IsPrehydrating || tier == TierTmp) && !shouldSuspendToYield
 			if shouldCleanUpIncomplete {
 				fileToClose = state.File
 				state.File = nil
+				cmToClose = state.ChunkManager
+				state.ChunkManager = nil
 			}
 			if isCurrentGen {
 				state.WriterActive = false
@@ -330,6 +334,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 
 			if pipelineToClose != nil {
 				_ = pipelineToClose.FlushAndClose()
+			}
+			if cmToClose != nil {
+				cmToClose.Close()
 			}
 			if fileToClose != nil {
 				_ = fileToClose.Close()
@@ -345,8 +352,10 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 					GlobalRegistry.Lock.Unlock()
 					releaseAccountedCacheBytes(state)
 					_ = os.Remove(state.PartPath)
-					_ = os.Remove(state.MetaPath)
-					triggerAsyncChunkCleanup(GlobalStorage, state.Key, "[Coord]")
+					if state.MetaPath != "" {
+						_ = os.Remove(state.MetaPath)
+					}
+					triggerAsyncTargetCleanup(cmToClose, GlobalStorage, state.Key, "[Coord]")
 					log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
 				} else {
 					GlobalRegistry.Lock.Unlock()
@@ -1222,7 +1231,7 @@ func runDownloadWorker(
 
 			// If cumulative downloaded bytes in memory cross 32MB without being materialized yet, materialize to disk
 			if !state.IsDiskMaterialized() && state.RangeSet.TotalBytes() >= 32*1024*1024 {
-				if GlobalRegistry != nil && state.TotalSize > 0 {
+				if GlobalRegistry != nil && state.TotalSize > 0 && state.GetTargetTier() == TierDisk {
 					GlobalRegistry.PreEvict(state.TotalSize)
 				}
 				_ = state.MaterializeDiskFile()
@@ -1619,6 +1628,23 @@ func releaseAccountedCacheBytes(state *FileCacheState) {
 	}
 }
 
+func triggerAsyncTargetCleanup(cm *ScratchChunkManager, storage StorageBackend, key string, logPrefix string) {
+	if key == "" {
+		return
+	}
+	if cm != nil {
+		go func() {
+			delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := cm.Cleanup(delCtx); err != nil {
+				log.Printf("%s Async target cleanup (%s) failed for %s: %v", logPrefix, cm.TargetName(), key, err)
+			}
+		}()
+		return
+	}
+	triggerAsyncChunkCleanup(storage, key, logPrefix)
+}
+
 func triggerAsyncChunkCleanup(storage StorageBackend, key string, logPrefix string) {
 	cleaner, ok := storage.(ChunkCleanupBackend)
 	if !ok || key == "" {
@@ -1686,7 +1712,44 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 		Completed:     true,
 	}
 
-	if state.GetTargetTier() == TierS3 {
+	tier := state.GetTargetTier()
+
+	if tier == TierTmp {
+		state.Lock.Lock()
+		state.WriterActive = false
+		state.IsCommitting = false
+		state.UpstreamStatus = "Completed"
+		hasClients := len(state.Clients) > 0
+		state.Lock.Unlock()
+
+		if GlobalLogBroker != nil {
+			go GlobalLogBroker.BroadcastStateUpdate()
+		}
+
+		if !hasClients {
+			_ = os.Remove(state.PartPath)
+			if state.MetaPath != "" {
+				_ = os.Remove(state.MetaPath)
+			}
+			releaseAccountedCacheBytes(state)
+			if GlobalRegistry != nil {
+				GlobalRegistry.Lock.Lock()
+				if cur, exists := GlobalRegistry.Files[state.Key]; exists && cur == state {
+					delete(GlobalRegistry.Files, state.Key)
+				}
+				GlobalRegistry.Lock.Unlock()
+			}
+			log.Printf("%s Ephemeral TierTmp stream finalized and cleaned up: %s", logPrefix, state.Key)
+		} else {
+			log.Printf("%s Ephemeral TierTmp stream completed (%s); keeping temp file until active clients finish", logPrefix, state.Key)
+		}
+
+		runtime.GC()
+		debug.FreeOSMemory()
+		return
+	}
+
+	if tier == TierS3 {
 		// Release the prehydration chain before S3 recomposition when called from coordinator completion
 		// so the next queued episode can start downloading immediately instead of waiting for Recompose.
 		if earlyPrehydrateRelease && GlobalPrehydrationManager != nil {
@@ -1701,7 +1764,9 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 		}
 
 		_ = os.Remove(state.PartPath)
-		_ = os.Remove(state.MetaPath)
+		if state.MetaPath != "" {
+			_ = os.Remove(state.MetaPath)
+		}
 		releaseAccountedCacheBytes(state)
 
 		if GlobalRegistry != nil {
@@ -1718,6 +1783,13 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 			}
 		}
 
+		if !earlyPrehydrateRelease && commitErr == nil && GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(state)
+		}
+		if GlobalLogBroker != nil {
+			go GlobalLogBroker.BroadcastStateUpdate()
+		}
+
 		if GlobalRegistry != nil {
 			GlobalRegistry.Lock.Lock()
 			if cur, exists := GlobalRegistry.Files[state.Key]; exists && cur == state {
@@ -1726,11 +1798,43 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 			GlobalRegistry.Lock.Unlock()
 		}
 
+		runtime.GC()
+		debug.FreeOSMemory()
+		return
+	}
+
+	// Cross-FS NAS staging path (TierDisk + ScratchChunkManager)
+	if cm := state.GetChunkManager(); cm != nil {
+		commitErr := cm.WaitAndRecompose(context.Background())
+		cm.Close()
+		_ = os.Remove(state.PartPath)
+
+		if commitErr != nil {
+			log.Printf("%s NAS staging commit FAILED for %s: %v", logPrefix, state.Key, commitErr)
+			_ = cm.Cleanup(context.Background())
+			releaseAccountedCacheBytes(state)
+			state.SetUpstreamStatus("Error")
+		} else {
+			if GlobalRegistry != nil {
+				GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+			}
+			state.SetUpstreamStatus("Completed")
+			log.Printf("%s Cached file finalized and committed to NAS cache: %s", logPrefix, state.Key)
+		}
+
+		if commitErr == nil && GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(state)
+		}
 		if GlobalLogBroker != nil {
 			go GlobalLogBroker.BroadcastStateUpdate()
 		}
-		if !earlyPrehydrateRelease && commitErr == nil && GlobalPrehydrationManager != nil {
-			GlobalPrehydrationManager.OnHydrationCompleted(state)
+
+		if GlobalRegistry != nil {
+			GlobalRegistry.Lock.Lock()
+			if cur, exists := GlobalRegistry.Files[state.Key]; exists && cur == state {
+				delete(GlobalRegistry.Files, state.Key)
+			}
+			GlobalRegistry.Lock.Unlock()
 		}
 
 		runtime.GC()
@@ -1740,7 +1844,7 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 
 	renameOK := false
 	if !FileExists(state.Path) {
-		err := os.Rename(state.PartPath, state.Path)
+		err := moveFileCrossFS(state.PartPath, state.Path)
 		if err == nil {
 			renameOK = true
 			if cf, ferr := os.Open(state.Path); ferr == nil {

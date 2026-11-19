@@ -46,13 +46,16 @@ streamcache is configured using environment variables. Default fallback values a
 | Environment Variable | Default | Description |
 |---|---|---|
 | `PORT` | `:8080` | Port the proxy server listens on. |
-| `STORAGE_BACKEND` | `disk` | Storage backend (`disk` or `s3`). |
-| `CACHE_DIR` | `./cache/files` | Location where completed cached media files and JSON metadata are stored. |
+| `STORAGE_BACKEND` | `disk` | Storage backend (`tmp`, `disk`, or `s3`). Setting `disk` with `CACHE_DIR` empty/`none`/`off`/`disabled` routes automatically to `tmp` mode. |
+| `CACHE_DIR` | `./cache/files` | Location where completed cached media files and JSON metadata are stored (only created/used when `STORAGE_BACKEND=disk`). |
 | `TMP_DIR` | `./cache/tmp` | Location where active `.part` scratch downloads are assembled (keep bind-mounted on a native hole-punching host SSD/NVMe filesystem). |
-| `TMP_FILE_MAX_BYTES` | `512MB` | Per-file in-flight scratch budget in `TMP_DIR` before hole-punched upload catches up (floored to at least `2 × S3_CHUNK_SIZE`). |
-| `TMP_MIN_DISK_FREE_BYTES` | `1GB` | Hard physical free-space floor monitored on `TMP_DIR`. |
+| `STATE_DIR` | `TMP_DIR/state` | Durable internal state directory (e.g. `s3_index.json`), kept independent of `CACHE_DIR`. |
+| `TMP_FILE_MAX_BYTES` | `512MB` | Per-file in-flight scratch budget in `TMP_DIR` before hole-punched upload/staging catches up (floored to at least `2 × chunk size`). |
+| `TMP_MIN_DISK_FREE_BYTES` | `1GB` | Hard physical free-space floor monitored on `TMP_DIR` (auto-clamped to 25% of total mount size on small SSD/tmpfs mounts). |
 | `CACHE_MAX_BYTES` | `50GB` | Maximum size of the cache directory. Set to `0`, `none`, or `off` to disable the limit and rely solely on disk space checks. Supports size units (e.g. `50GB`, `1TB`). |
-| `CACHE_MIN_DISK_FREE_BYTES` | `10GB` | Safety buffer for physical disk space on `CACHE_DIR` that overrides the cache size limit to prevent disk filling. Supports size units (e.g. `10GB`). |
+| `CACHE_MAX_ITEM_PCT` | `50` | Maximum percentage of `CACHE_MAX_BYTES` allowed for any single L1 disk item (`0` disables; oversized or un-admissible items bypass L1 via `TierTmp`). |
+| `CACHE_MIN_DISK_FREE_BYTES` | `10GB` | Safety buffer for physical disk space on `CACHE_DIR` (auto-raised to `max(CACHE_MIN_DISK_FREE_BYTES, effectiveTmpMinFree + TMP_FILE_MAX_BYTES)` when `TMP_DIR` and `CACHE_DIR` share a volume). |
+| `NAS_SEQUENTIAL_STAGE` | `auto` | Cross-filesystem `TMP_DIR` -> `CACHE_DIR` chunk staging mode (`auto` forces sequential offset order on CIFS/SMB/FUSE shares; `true` / `false` overrides). |
 | `CACHE_MAX_IDLE_AGE` | `720h` | Maximum idle age before unused cached objects are evicted. |
 | `CACHE_EVICT_INTERVAL` | `6h` | Background interval for idle-age cache & stale chunk cleanup sweeps. |
 | `CACHE_REVALIDATE_INTERVAL` | `1h` | Cache expiration age before forcing an HTTP revalidation probe to the source host. |

@@ -15,9 +15,10 @@ services:
       - ./tmp:/var/cache/streamcache/tmp
     environment:
       - PORT=8080
-      - STORAGE_BACKEND=disk # Valid options: disk, s3
+      - STORAGE_BACKEND=disk # Valid options: tmp, disk, s3
       - CACHE_DIR=/var/cache/streamcache/files
       - TMP_DIR=/var/cache/streamcache/tmp
+      # - STATE_DIR=/var/cache/streamcache/tmp/state
 
       # Scratch Budget Guards (`TMP_DIR` mount)
       - TMP_FILE_MAX_BYTES=512MB
@@ -26,9 +27,11 @@ services:
       # Persistent Cache Bounds & Eviction (`CACHE_DIR` / S3)
       # CACHE_MAX_BYTES supports size units (e.g. 50GB, 1TB) or 0/none/off/disabled to rely solely on disk free space
       - CACHE_MAX_BYTES=50GB
+      - CACHE_MAX_ITEM_PCT=50
       - CACHE_MIN_DISK_FREE_BYTES=10GB
       - CACHE_MAX_IDLE_AGE=720h
       - CACHE_EVICT_INTERVAL=6h
+      # - NAS_SEQUENTIAL_STAGE=auto
 
       # Asynchronous writeback & LiveBuffer sliding window size (defaults to 64MB; min 16MB, max 256MB)
       # - WRITEBACK_BUFFER_SIZE=64MB

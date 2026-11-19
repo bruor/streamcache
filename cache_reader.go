@@ -22,6 +22,7 @@ type CacheReader struct {
 	clientID          string
 	ctx               context.Context
 	file              *os.File
+	fileFromPart      bool
 	fileMu            sync.Mutex
 	lastEvictedOffset int64
 	s3Reader   StorageReadSeeker
@@ -116,23 +117,56 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 }
 
 func (r *CacheReader) getFile() (*os.File, error) {
+	f, _, err := r.getFileWithOrigin()
+	return f, err
+}
+
+func (r *CacheReader) getFileWithOrigin() (*os.File, bool, error) {
 	r.fileMu.Lock()
 	defer r.fileMu.Unlock()
+
+	tier := r.state.GetTargetTier()
+	canUseFinal := tier == TierDisk && r.state.Path != "" && FileExists(r.state.Path)
 	if r.file != nil {
-		return r.file, nil
+		if r.fileFromPart && canUseFinal {
+			if f, err := os.Open(r.state.Path); err == nil {
+				_ = r.file.Close()
+				r.file = f
+				r.fileFromPart = false
+				return r.file, false, nil
+			}
+		}
+		return r.file, r.fileFromPart, nil
 	}
-	if !r.state.IsDiskMaterialized() && !FileExists(r.state.Path) {
-		_ = r.state.MaterializeDiskFile()
-	}
-	f, err := os.Open(r.state.PartPath)
-	if err != nil {
-		f, err = os.Open(r.state.Path)
-		if err != nil {
-			return nil, err
+
+	if canUseFinal {
+		if f, err := os.Open(r.state.Path); err == nil {
+			r.file = f
+			r.fileFromPart = false
+			return r.file, false, nil
 		}
 	}
-	r.file = f
-	return r.file, nil
+
+	if !r.state.IsDiskMaterialized() && !canUseFinal {
+		_ = r.state.MaterializeDiskFile()
+	}
+
+	f, err := os.Open(r.state.PartPath)
+	if err == nil {
+		r.file = f
+		r.fileFromPart = true
+		return r.file, true, nil
+	}
+
+	if tier == TierDisk && r.state.Path != "" {
+		f, err = os.Open(r.state.Path)
+		if err == nil {
+			r.file = f
+			r.fileFromPart = false
+			return r.file, false, nil
+		}
+	}
+	return nil, false, err
 }
 
 func (r *CacheReader) getS3Reader() (StorageReadSeeker, error) {
@@ -207,7 +241,7 @@ func (r *CacheReader) recordRead(off int64, n int) {
 	isWholeFile := r.state != nil && r.state.TotalSize > 0 && totalRead >= r.state.TotalSize
 	if totalRead >= minThreshold || (off >= minThreshold && !isTailSeek) || isWholeFile {
 		if r.state != nil && !r.state.IsDiskMaterialized() {
-			if GlobalRegistry != nil && r.state.TotalSize > 0 {
+			if GlobalRegistry != nil && r.state.TotalSize > 0 && r.state.GetTargetTier() == TierDisk {
 				GlobalRegistry.PreEvict(r.state.TotalSize)
 			}
 			_ = r.state.MaterializeDiskFile()
@@ -234,6 +268,7 @@ func (r *CacheReader) Close() error {
 		FadviseDontNeed(r.file.Fd(), 0, 0)
 		_ = r.file.Close()
 		r.file = nil
+		r.fileFromPart = false
 	}
 	r.fileMu.Unlock()
 
@@ -269,9 +304,12 @@ func (r *CacheReader) Close() error {
 	isDiskMat := r.state.DiskMaterialized || FileExists(r.state.PartPath)
 	isProbe := !isCompleted && !isDiskMat && totalRead < minThreshold && maxOffset < minThreshold
 
-	alreadyCommittedS3 := r.state.targetTierLocked() == TierS3 && r.state.ChunkManager != nil && r.state.ChunkManager.IsRecomposed()
-	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommittedS3 && !FileExists(r.state.Path)
-	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
+	tier := r.state.targetTierLocked()
+	cm := r.state.ChunkManager
+	alreadyCommitted := (cm != nil && cm.IsRecomposed()) || (tier == TierDisk && r.state.Path != "" && FileExists(r.state.Path))
+	shouldFinalize := tier != TierTmp && remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommitted
+	shouldCleanUpTmp := tier == TierTmp && remainingClients == 0 && !isProbe && !r.state.IsCommitting
+	shouldCleanUpIncomplete := tier != TierTmp && remainingClients == 0 && !isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
 
 	if shouldFinalize {
 		r.state.IsCommitting = true
@@ -280,6 +318,7 @@ func (r *CacheReader) Close() error {
 
 	var fileToClose *os.File
 	var pipelineToClose StorageSink
+	var cmToClose *ScratchChunkManager
 	var cancelFunc context.CancelFunc
 
 	if isProbe && remainingClients == 0 {
@@ -299,11 +338,23 @@ func (r *CacheReader) Close() error {
 		r.state.File = nil
 		pipelineToClose = r.state.Pipeline
 		r.state.Pipeline = nil
+	} else if shouldCleanUpTmp {
+		if r.state.WriterActive {
+			cancelFunc = r.state.Cancel
+			r.state.Cancel = nil
+		} else {
+			fileToClose = r.state.File
+			r.state.File = nil
+			pipelineToClose = r.state.Pipeline
+			r.state.Pipeline = nil
+		}
 	} else if remainingClients == 0 && !r.state.WriterActive && !shouldFinalize && shouldCleanUpIncomplete {
 		fileToClose = r.state.File
 		r.state.File = nil
 		pipelineToClose = r.state.Pipeline
 		r.state.Pipeline = nil
+		cmToClose = r.state.ChunkManager
+		r.state.ChunkManager = nil
 	}
 	r.state.Lock.Unlock()
 
@@ -332,9 +383,40 @@ func (r *CacheReader) Close() error {
 
 	if shouldFinalize {
 		r.finalizeCache()
+	} else if shouldCleanUpTmp {
+		if cancelFunc != nil {
+			cancelFunc()
+		} else {
+			if pipelineToClose != nil {
+				_ = pipelineToClose.FlushAndClose()
+			}
+			if fileToClose != nil {
+				FadviseDontNeed(fileToClose.Fd(), 0, 0)
+				_ = fileToClose.Close()
+			}
+			_ = os.Remove(r.state.PartPath)
+			if r.state.MetaPath != "" {
+				_ = os.Remove(r.state.MetaPath)
+			}
+			releaseAccountedCacheBytes(r.state)
+			if GlobalRegistry != nil {
+				GlobalRegistry.Lock.Lock()
+				if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
+					delete(GlobalRegistry.Files, r.state.Key)
+				}
+				GlobalRegistry.Lock.Unlock()
+			}
+			if GlobalLogBroker != nil {
+				go GlobalLogBroker.BroadcastStateUpdate()
+			}
+			log.Printf("[Reader] Cleaned up ephemeral TierTmp stream on last client exit: %s", r.state.Key)
+		}
 	} else {
 		if pipelineToClose != nil {
 			_ = pipelineToClose.FlushAndClose()
+		}
+		if cmToClose != nil {
+			cmToClose.Close()
 		}
 		if fileToClose != nil {
 			FadviseDontNeed(fileToClose.Fd(), 0, 0)
@@ -342,16 +424,18 @@ func (r *CacheReader) Close() error {
 		}
 		if shouldCleanUpIncomplete {
 			_ = os.Remove(r.state.PartPath)
-			_ = os.Remove(r.state.MetaPath)
+			if r.state.MetaPath != "" {
+				_ = os.Remove(r.state.MetaPath)
+			}
 			releaseAccountedCacheBytes(r.state)
-			triggerAsyncChunkCleanup(GlobalStorage, r.state.Key, "[Reader]")
+			triggerAsyncTargetCleanup(cmToClose, GlobalStorage, r.state.Key, "[Reader]")
 			GlobalRegistry.Lock.Lock()
 			if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
 				delete(GlobalRegistry.Files, r.state.Key)
 			}
 			GlobalRegistry.Lock.Unlock()
 			log.Printf("[Reader] Removed incomplete cache file on last client exit: %s", r.state.Key)
-		} else if remainingClients == 0 && !isCompleted && !isPrehydrating {
+		} else if remainingClients == 0 && !isCompleted && !isPrehydrating && tier != TierTmp {
 			// Downshift incomplete hydration to prehydration mode
 			if GlobalPrehydrationManager != nil {
 				GlobalPrehydrationManager.OnDownshift(r.state)
@@ -458,7 +542,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 					GlobalRegistry.UnregisterProbeBuffer(key)
 				}
 				if isMidSeek && !isDiskMat {
-					if GlobalRegistry != nil && totalSize > 0 {
+					if GlobalRegistry != nil && totalSize > 0 && r.state.GetTargetTier() == TierDisk {
 						GlobalRegistry.PreEvict(totalSize)
 					}
 					_ = r.state.MaterializeDiskFile()
@@ -646,13 +730,96 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 
+	// 2b. Cross-FS NAS Staged Chunks: read committed chunks from CACHE_DIR/<key>.staging before reading finalPath
+	if r.state.GetTargetTier() == TierDisk && cm != nil {
+		alreadyFinal := r.state.Path != "" && FileExists(r.state.Path)
+		if !cm.IsRecomposed() && !alreadyFinal {
+			chunkSize := cm.ChunkSize()
+			if chunkSize > 0 {
+				chunkIdx := int(off / chunkSize)
+				if cm.IsChunkUploaded(chunkIdx) {
+					chunkStart := int64(chunkIdx) * chunkSize
+					offsetInChunk := off - chunkStart
+					readLen := toRead
+					if rem := chunkSize - offsetInChunk; readLen > rem {
+						readLen = rem
+					}
+					rc, cerr := cm.ReadCommittedChunk(r.ctx, chunkIdx, offsetInChunk, readLen)
+					if cerr == nil {
+						readN, rerr := io.ReadFull(rc, p[:readLen])
+						_ = rc.Close()
+						if (rerr == nil || rerr == io.EOF || rerr == io.ErrUnexpectedEOF) && readN > 0 {
+							r.recordRead(off, readN)
+							GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(readN))
+							if r.state.RangeSet.IsComplete(r.state.TotalSize) {
+								GlobalRegistry.SetConnectionInCache(r.clientID, true)
+							}
+							return readN, nil
+						}
+						if !(r.state.Path != "" && FileExists(r.state.Path)) {
+							if rerr != nil {
+								return 0, rerr
+							}
+							return 0, io.EOF
+						}
+					} else if !(r.state.Path != "" && FileExists(r.state.Path)) {
+						// Never fall back to hole-punched PartPath when chunk is committed to NAS staging
+						return 0, cerr
+					}
+				}
+			}
+		}
+	}
+
 	// 3. Fall back to reading from disk
-	file, err := r.getFile()
+	file, fromPart, err := r.getFileWithOrigin()
 	if err != nil {
 		return 0, err
 	}
 
 	n, err = file.ReadAt(p[:toRead], off)
+	if cm != nil && fromPart && cm.ChunkSize() > 0 {
+		chunkSize := cm.ChunkSize()
+		startChunk := int(off / chunkSize)
+		endChunk := startChunk
+		if n > 0 {
+			endChunk = int((off + int64(n) - 1) / chunkSize)
+		}
+		anyUploaded := false
+		for c := startChunk; c <= endChunk; c++ {
+			if cm.IsChunkUploaded(c) {
+				anyUploaded = true
+				break
+			}
+		}
+		if anyUploaded {
+			chunkStart := int64(startChunk) * chunkSize
+			offsetInChunk := off - chunkStart
+			readLen := toRead
+			if rem := chunkSize - offsetInChunk; readLen > rem {
+				readLen = rem
+			}
+			if rc, cerr := cm.ReadCommittedChunk(r.ctx, startChunk, offsetInChunk, readLen); cerr == nil {
+				readN, rerr := io.ReadFull(rc, p[:readLen])
+				_ = rc.Close()
+				if (rerr == nil || rerr == io.EOF || rerr == io.ErrUnexpectedEOF) && readN > 0 {
+					n, err = readN, nil
+				} else if rerr != nil {
+					n, err = 0, rerr
+				}
+			} else if r.state.GetTargetTier() == TierS3 {
+				if s3Reader, s3Err := r.getS3Reader(); s3Err == nil {
+					n, err = s3Reader.ReadAt(p[:readLen], off)
+				} else {
+					n, err = 0, cerr
+				}
+			} else if f2, stillFromPart, fErr := r.getFileWithOrigin(); fErr == nil && !stillFromPart {
+				n, err = f2.ReadAt(p[:readLen], off)
+			} else {
+				n, err = 0, cerr
+			}
+		}
+	}
 	if n > 0 {
 		r.recordRead(off, n)
 		GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))

@@ -180,7 +180,7 @@ func (b *LocalStorageBackend) CommitLocalFile(ctx context.Context, key string, l
 	defer b.mu.Unlock()
 
 	targetPath := filepath.Join(b.cacheDir, key)
-	if err := os.Rename(localPartPath, targetPath); err != nil {
+	if err := moveFileCrossFS(localPartPath, targetPath); err != nil {
 		return err
 	}
 

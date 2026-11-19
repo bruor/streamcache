@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -123,6 +124,8 @@ type FileCacheState struct {
 	coordGen             uint64
 }
 
+// NewFileCacheState constructs a FileCacheState and evaluates L1 disk admission via GlobalRegistry.
+// Callers must NOT hold GlobalRegistry.Lock when calling this function.
 func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, contentType, etag, lastMod string, totalSize int64) *FileCacheState {
 	bufSize := int64(64 * 1024 * 1024)
 	if GlobalConfig != nil {
@@ -154,7 +157,18 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 	}
 	targetTier := TierDisk
 	useScratch := false
+
+	mode := "disk"
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		mode = "s3"
+	} else if GlobalConfig != nil {
+		mode = GlobalConfig.EffectiveStorageBackend()
+	} else if GlobalStorage != nil && GlobalStorage.Type() == "tmp" {
+		mode = "tmp"
+	}
+
+	switch mode {
+	case "s3":
 		targetTier = TierS3
 		useScratch = true
 		chunkSize := int64(64 * 1024 * 1024)
@@ -164,7 +178,47 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 			chunkSize = GlobalConfig.GetS3Config().ChunkSize
 		}
 		s.ChunkManager = NewScratchChunkManager(s, GlobalStorage, chunkSize)
+	case "tmp":
+		targetTier = TierTmp
+		useScratch = false
+	default:
+		admit := true
+		reason := ""
+		if GlobalRegistry != nil {
+			admit, reason = GlobalRegistry.CanAdmitToDiskL1(totalSize)
+		}
+		if !admit {
+			targetTier = TierTmp
+			useScratch = false
+			log.Printf("[Admission] Bypassing L1 disk cache for %s (%d bytes -> TierTmp): %s", key, totalSize, reason)
+		} else {
+			targetTier = TierDisk
+			topo := GetStorageTopology()
+			cacheDir := ""
+			if GlobalConfig != nil {
+				cacheDir = GlobalConfig.GetCacheDir()
+			}
+			if topo != nil && topo.CrossFSStaging && cacheDir != "" {
+				useScratch = true
+				chunkSize := int64(16 * 1024 * 1024)
+				if GlobalConfig != nil {
+					if s3cs := GlobalConfig.GetS3Config().ChunkSize; s3cs > 0 && s3cs < chunkSize {
+						chunkSize = s3cs
+					}
+					if maxTmp := GlobalConfig.GetTmpFileMaxBytes(); maxTmp > 0 && chunkSize > maxTmp/2 {
+						if half := maxTmp / 2; half > 0 {
+							chunkSize = half
+						}
+					}
+				}
+				nasTarget := NewNASStagingTarget(cacheDir, key, topo.SequentialNASStage)
+				s.ChunkManager = NewScratchChunkManagerWithTarget(s, nasTarget, chunkSize)
+				log.Printf("[Admission] Admitted %s (%d bytes) to TierDisk with cross-FS NAS staging (sequential=%v, punchHole=%v)",
+					key, totalSize, topo.SequentialNASStage, topo.TmpPunchHoleSupported)
+			}
+		}
 	}
+
 	s.TargetTier = targetTier
 	s.UseScratchManager = useScratch
 	s.Cond = sync.NewCond(&s.Lock)
@@ -175,8 +229,19 @@ func (s *FileCacheState) targetTierLocked() StorageTier {
 	if s.TargetTier != "" {
 		return s.TargetTier
 	}
-	if s.ChunkManager != nil || (GlobalStorage != nil && GlobalStorage.Type() == "s3") {
+	if s.ChunkManager != nil {
+		if s.ChunkManager.TargetName() == "nas" {
+			return TierDisk
+		}
 		return TierS3
+	}
+	if GlobalStorage != nil {
+		switch GlobalStorage.Type() {
+		case "s3":
+			return TierS3
+		case "tmp":
+			return TierTmp
+		}
 	}
 	return TierDisk
 }
@@ -341,10 +406,17 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 		return nil
 	}
 
+	var triggerCM *ScratchChunkManager
+	defer func() {
+		if triggerCM != nil {
+			triggerCM.CheckAndTriggerUploads()
+		}
+	}()
+
 	s.Lock.Lock()
 	defer s.Lock.Unlock()
 
-	if (s.DiskMaterialized && s.File != nil) || FileExists(s.Path) {
+	if (s.DiskMaterialized && s.File != nil) || (s.targetTierLocked() == TierDisk && s.Path != "" && FileExists(s.Path)) {
 		return nil
 	}
 
@@ -372,18 +444,20 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 		_ = file.Truncate(totalSize)
 	}
 
-	// Save initial sparse metadata atomically
-	meta := FileMeta{
-		URL:           url,
-		TotalSize:     totalSize,
-		ContentType:   contentType,
-		ETag:          etag,
-		LastModified:  lastMod,
-		LastValidated: time.Now().Unix(),
-		Completed:     false,
-	}
-	if metaBytes, merr := json.Marshal(meta); merr == nil {
-		_ = writeMetaFileAtomic(metaPath, metaBytes)
+	// Save initial sparse metadata atomically only for persistent TierDisk entries.
+	if s.targetTierLocked() == TierDisk && metaPath != "" && (GlobalConfig == nil || GlobalConfig.UsesCacheDir()) {
+		meta := FileMeta{
+			URL:           url,
+			TotalSize:     totalSize,
+			ContentType:   contentType,
+			ETag:          etag,
+			LastModified:  lastMod,
+			LastValidated: time.Now().Unix(),
+			Completed:     false,
+		}
+		if metaBytes, merr := json.Marshal(meta); merr == nil {
+			_ = writeMetaFileAtomic(metaPath, metaBytes)
+		}
 	}
 
 	if s.Pipeline != nil {
@@ -401,6 +475,7 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 	}
 	s.File = file
 	s.DiskMaterialized = true
+	triggerCM = s.ChunkManager
 	log.Printf("[State] Materialized part file on disk for %s (size: %d bytes)", key, totalSize)
 	return nil
 }
@@ -480,6 +555,11 @@ func (r *CacheRegistry) IsProbeActive() bool {
 }
 
 func InitRegistry() {
+	// Capture config reference on caller goroutine so background monitor never races on GlobalConfig replacement in tests.
+	cfg := GlobalConfig
+	if cfg != nil {
+		InitStorageTopology(cfg)
+	}
 	if GlobalStorage == nil {
 		_ = InitStorage()
 	}
@@ -504,11 +584,13 @@ func InitRegistry() {
 
 	GlobalRegistry.LoadExistingCache()
 
-	// Capture config reference on caller goroutine so background monitor never races on GlobalConfig replacement in tests.
-	cfg := GlobalConfig
 	// Initial population of disk free space
 	if cfg != nil {
-		space, _ := GetDiskFreeSpace(cfg.GetCacheDir())
+		diskDir := cfg.GetTmpDir()
+		if cfg.UsesCacheDir() {
+			diskDir = cfg.GetCacheDir()
+		}
+		space, _ := GetDiskFreeSpace(diskDir)
 		atomic.StoreUint64(&GlobalDiskFreeBytes, space)
 	}
 
@@ -517,7 +599,33 @@ func InitRegistry() {
 	go GlobalRegistry.startSpeedMonitor()
 
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-		indexPath := filepath.Join(GlobalConfig.GetCacheDir(), "s3_index.json")
+		stateDir := ""
+		legacyCacheDir := ""
+		if cfg != nil {
+			stateDir = cfg.GetStateDir()
+			if stateDir == "" {
+				stateDir = filepath.Join(cfg.GetTmpDir(), "state")
+			}
+			legacyCacheDir = cfg.GetCacheDir()
+		}
+		if stateDir != "" {
+			_ = os.MkdirAll(stateDir, 0755)
+		}
+		indexPath := filepath.Join(stateDir, "s3_index.json")
+
+		// Seamless upgrade migration: move legacy CACHE_DIR/s3_index.json if present and new STATE_DIR file does not exist.
+		normLegacy := strings.ToLower(strings.TrimSpace(legacyCacheDir))
+		if normLegacy != "" && normLegacy != "none" && normLegacy != "off" && normLegacy != "disabled" {
+			legacyPath := filepath.Join(legacyCacheDir, "s3_index.json")
+			if legacyPath != indexPath && !FileExists(indexPath) && FileExists(legacyPath) {
+				if err := moveFileCrossFS(legacyPath, indexPath); err != nil {
+					log.Printf("[S3Index] Warning: Failed to migrate legacy %s to %s: %v", legacyPath, indexPath, err)
+				} else {
+					log.Printf("[S3Index] Migrated legacy index %s -> %s", legacyPath, indexPath)
+				}
+			}
+		}
+
 		idx := NewS3AccessIndex(indexPath)
 		if err := idx.Load(); err != nil {
 			log.Printf("[S3Index] Warning: Failed to load %s: %v", indexPath, err)
@@ -694,12 +802,19 @@ func (r *CacheRegistry) startDiskFreeMonitor(cfg *Config) {
 			if cfg == nil {
 				continue
 			}
-			space, err := GetDiskFreeSpace(cfg.GetCacheDir())
+			usesCacheDir := cfg.UsesCacheDir()
+			diskDir := cfg.GetTmpDir()
+			if usesCacheDir {
+				diskDir = cfg.GetCacheDir()
+			}
+			space, err := GetDiskFreeSpace(diskDir)
 			if err == nil {
 				atomic.StoreUint64(&GlobalDiskFreeBytes, space)
-				minFree := cfg.GetCacheMinDiskFreeBytes()
-				if minFree > 0 && space < uint64(minFree) {
-					r.PreEvict(0)
+				if usesCacheDir {
+					minFree := EffectiveCacheMinDiskFreeBytes(cfg, GetStorageTopology())
+					if minFree > 0 && space < uint64(minFree) {
+						r.PreEvict(0)
+					}
 				}
 			}
 			r.SweepExpiredProbes()
@@ -1206,62 +1321,226 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 }
 
 // LoadExistingCache runs once at startup to calculate initial cache size
-// and delete any dangling .part files that don't have metadata.
+// and delete any dangling scratch/staging files from previous runs.
 func (r *CacheRegistry) LoadExistingCache() {
 	r.Lock.Lock()
 	defer r.Lock.Unlock()
 
-	cacheDir := GlobalConfig.GetCacheDir()
-	tmpDir := GlobalConfig.GetTmpDir()
+	usesCacheDir := GlobalConfig == nil || GlobalConfig.UsesCacheDir()
+	cacheDir := ""
+	tmpDir := ""
+	stateDir := ""
+	if GlobalConfig != nil {
+		cacheDir = GlobalConfig.GetCacheDir()
+		tmpDir = GlobalConfig.GetTmpDir()
+		stateDir = GlobalConfig.GetStateDir()
+	}
 
-	// Ensure directories exist
-	_ = os.MkdirAll(cacheDir, 0755)
-	_ = os.MkdirAll(tmpDir, 0755)
+	if tmpDir != "" {
+		_ = os.MkdirAll(tmpDir, 0755)
+	}
+	if stateDir != "" {
+		_ = os.MkdirAll(stateDir, 0755)
+	}
+	if usesCacheDir && cacheDir != "" {
+		_ = os.MkdirAll(cacheDir, 0755)
+	}
 
 	var totalSize int64
 
-	// 1. Scan completed cache files and clean up orphaned metadata files
-	_ = filepath.WalkDir(cacheDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !d.IsDir() {
-			base := filepath.Base(path)
-			if base == "s3_index.json" {
+	// 1. Scan completed cache files and clean up orphaned metadata/staging files (only when CACHE_DIR is enabled)
+	if usesCacheDir && cacheDir != "" {
+		_ = filepath.WalkDir(cacheDir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
 				return nil
 			}
-			if strings.HasPrefix(base, "s3_index.json.tmp.") {
-				_ = os.Remove(path)
-				return nil
-			}
-			ext := filepath.Ext(path)
-			if ext == ".json" {
-				// Check if the corresponding media file exists
-				mediaPath := strings.TrimSuffix(path, ".json")
-				if _, err := os.Stat(mediaPath); os.IsNotExist(err) {
+			if !d.IsDir() {
+				base := filepath.Base(path)
+				if base == "s3_index.json" {
+					return nil
+				}
+				if strings.HasPrefix(base, "s3_index.json.tmp.") {
 					_ = os.Remove(path)
+					return nil
 				}
-			} else {
-				info, err := d.Info()
-				if err == nil {
-					totalSize += info.Size()
+				ext := filepath.Ext(path)
+				if ext == ".staging" || ext == ".part" {
+					_ = os.Remove(path)
+					return nil
+				}
+				if ext == ".json" {
+					// Check if the corresponding media file exists
+					mediaPath := strings.TrimSuffix(path, ".json")
+					if _, err := os.Stat(mediaPath); os.IsNotExist(err) {
+						_ = os.Remove(path)
+					}
+				} else {
+					info, err := d.Info()
+					if err == nil {
+						totalSize += info.Size()
+					}
 				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
+	}
 
-	// 2. Clean up temporary directory on boot
-	// Any unfinished .part files on boot are abandoned; we can remove them.
-	files, err := os.ReadDir(tmpDir)
-	if err == nil {
-		for _, f := range files {
-			_ = os.Remove(filepath.Join(tmpDir, f.Name()))
+	// 2. Clean up temporary directory on boot, preserving subdirectories such as STATE_DIR (e.g. TMP_DIR/state).
+	if tmpDir != "" {
+		files, err := os.ReadDir(tmpDir)
+		if err == nil {
+			for _, f := range files {
+				if f.IsDir() {
+					continue
+				}
+				_ = os.Remove(filepath.Join(tmpDir, f.Name()))
+			}
 		}
 	}
 
 	atomic.StoreInt64(&r.TotalCacheSize, totalSize)
-	log.Printf("[Registry] Scan complete. Initial Cache Size: %.2f GB", float64(totalSize)/(1024*1024*1024))
+	log.Printf("[Registry] Scan complete. Initial Cache Size: %.2f GB (UsesCacheDir=%v)",
+		float64(totalSize)/(1024*1024*1024), usesCacheDir)
+}
+
+// CanAdmitToDiskL1 decides whether an incoming item of totalSize bytes can be admitted to the persistent
+// CACHE_DIR (TierDisk) without violating CACHE_MAX_ITEM_PCT, evicting active/pinned files, or breaching
+// CACHE_MAX_BYTES / EffectiveCacheMinDiskFreeBytes. Otherwise callers route the file to TierTmp.
+func (r *CacheRegistry) CanAdmitToDiskL1(totalSize int64) (bool, string) {
+	if GlobalConfig == nil {
+		return true, ""
+	}
+	if !GlobalConfig.UsesCacheDir() {
+		return false, "cache_dir_disabled"
+	}
+	if totalSize <= 0 {
+		return true, ""
+	}
+
+	maxBytes := GlobalConfig.GetCacheMaxBytes()
+	maxItemPct := GlobalConfig.GetCacheMaxItemPct()
+	if maxBytes > 0 && maxItemPct > 0 {
+		maxItemBytes := int64(math.Round(float64(maxBytes) * float64(maxItemPct) / 100.0))
+		if totalSize > maxItemBytes {
+			return false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_ITEM_PCT limit (%d%% of %d = %d bytes)",
+				totalSize, maxItemPct, maxBytes, maxItemBytes)
+		}
+	}
+
+	activeKeys := make(map[string]bool)
+	var activeFiles []*FileCacheState
+	if r != nil {
+		r.Lock.RLock()
+		activeFiles = make([]*FileCacheState, 0, len(r.Files))
+		for k, f := range r.Files {
+			activeKeys[k] = true
+			if f != nil {
+				activeFiles = append(activeFiles, f)
+			}
+		}
+		for _, conn := range r.Connections {
+			if conn != nil && conn.Key != "" {
+				activeKeys[conn.Key] = true
+			}
+		}
+		r.Lock.RUnlock()
+	}
+
+	cacheDir := GlobalConfig.GetCacheDir()
+	var pinnedL1Bytes int64
+	var inactiveEvictableBytes int64
+	pinnedHandled := make(map[string]bool)
+	stagedBytes := make(map[string]int64)
+
+	if entries, err := os.ReadDir(cacheDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if strings.HasPrefix(name, "s3_index.json") || filepath.Ext(name) == ".json" || filepath.Ext(name) == ".part" {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			if filepath.Ext(name) == ".staging" {
+				baseKey := strings.TrimSuffix(name, ".staging")
+				stagedBytes[baseKey] = info.Size()
+				continue
+			}
+			if activeKeys[name] {
+				pinnedL1Bytes += info.Size()
+				pinnedHandled[name] = true
+			} else {
+				inactiveEvictableBytes += info.Size()
+			}
+		}
+	}
+
+	var unwrittenActiveL1Bytes int64
+	for _, f := range activeFiles {
+		f.Lock.Lock()
+		key := f.Key
+		isMat := f.DiskMaterialized
+		isYield := f.IsYielding
+		totalSz := f.TotalSize
+		tier := f.targetTierLocked()
+		cm := f.ChunkManager
+		f.Lock.Unlock()
+
+		if isYield || tier != TierDisk || totalSz <= 0 || pinnedHandled[key] {
+			continue
+		}
+		pinnedL1Bytes += totalSz
+		if cm != nil && cm.TargetName() == "nas" {
+			rem := totalSz - stagedBytes[key]
+			if rem > 0 {
+				unwrittenActiveL1Bytes += rem
+			}
+		} else if isMat {
+			downloaded := atomic.LoadInt64(&f.TotalBytesDownloaded)
+			if rem := totalSz - downloaded; rem > 0 {
+				unwrittenActiveL1Bytes += rem
+			}
+		} else {
+			unwrittenActiveL1Bytes += totalSz
+		}
+	}
+
+	if maxBytes > 0 && (pinnedL1Bytes+totalSize) > maxBytes {
+		return false, fmt.Sprintf("pinned L1 bytes (%d) + item (%d) exceeds CACHE_MAX_BYTES (%d) even after evicting all inactive files (%d)",
+			pinnedL1Bytes, totalSize, maxBytes, inactiveEvictableBytes)
+	}
+
+	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
+	if freeSpace, spaceErr := GetDiskFreeSpace(cacheDir); spaceErr == nil {
+		var required uint64
+		if totalSize > 0 {
+			required += uint64(totalSize)
+		}
+		if unwrittenActiveL1Bytes > 0 {
+			required += uint64(unwrittenActiveL1Bytes)
+		}
+		if minDiskFree > 0 {
+			required += uint64(minDiskFree)
+		}
+		maxAvailable := freeSpace
+		if inactiveEvictableBytes > 0 {
+			if freeSpace > math.MaxUint64-uint64(inactiveEvictableBytes) {
+				maxAvailable = math.MaxUint64
+			} else {
+				maxAvailable += uint64(inactiveEvictableBytes)
+			}
+		}
+		if maxAvailable < required {
+			return false, fmt.Sprintf("insufficient L1 disk space (free %d + evictable %d < required %d)",
+				freeSpace, inactiveEvictableBytes, required)
+		}
+	}
+
+	return true, ""
 }
 
 func (r *CacheRegistry) UpdateSize(delta int64) {
@@ -1273,6 +1552,9 @@ func (r *CacheRegistry) GetTotalCacheSize() int64 {
 }
 
 func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
+	if GlobalConfig != nil && !GlobalConfig.UsesCacheDir() {
+		return
+	}
 	r.Lock.Lock()
 	if r.Evicting {
 		r.pendingEvict = true
@@ -1320,7 +1602,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 	// Calculate how much space we need to free based on cache limit if incoming + unwritten active bytes are added
 	var cacheBytesToFree int64
 	maxBytes := GlobalConfig.GetCacheMaxBytes()
-	minDiskFree := GlobalConfig.GetCacheMinDiskFreeBytes()
+	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
 	if maxBytes > 0 && (currentSize+totalPending) > maxBytes {
 		cacheBytesToFree = (currentSize + totalPending) - maxBytes
 	}
@@ -1364,7 +1646,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 
 	var availableFreeable int64
 	for _, entry := range entries {
-		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" || filepath.Ext(entry.Name()) == ".staging" {
 			continue
 		}
 		if !activeKeys[entry.Name()] {
@@ -1420,7 +1702,7 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 	var files []fileInfo
 
 	for _, entry := range entries {
-		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" || filepath.Ext(entry.Name()) == ".staging" {
 			continue
 		}
 		path := filepath.Join(cacheDir, entry.Name())

@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,7 +15,9 @@ type Config struct {
 	Port                          string
 	CacheDir                      string
 	TmpDir                        string
+	StateDir                      string
 	CacheMaxBytes                 int64
+	CacheMaxItemPct               int
 	CacheMinDiskFreeBytes         int64
 	TmpFileMaxBytes               int64
 	TmpMinDiskFreeBytes           int64
@@ -34,6 +37,7 @@ type Config struct {
 	LogVerbose                    bool
 	WritebackBufferSize           int64
 	StorageBackend                string
+	NASSequentialStage            string
 	S3Config                      S3Config
 	CacheMaxIdleAge               time.Duration
 	CacheEvictInterval            time.Duration
@@ -110,6 +114,84 @@ func (c *Config) GetTmpDir() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.TmpDir
+}
+
+func (c *Config) GetStateDir() string {
+	if c == nil {
+		return filepath.Join("./cache/tmp", "state")
+	}
+	c.mu.RLock()
+	stateDir := strings.TrimSpace(c.StateDir)
+	tmpDir := c.TmpDir
+	c.mu.RUnlock()
+	if stateDir != "" {
+		return stateDir
+	}
+	if strings.TrimSpace(tmpDir) == "" {
+		tmpDir = "./cache/tmp"
+	}
+	return filepath.Join(tmpDir, "state")
+}
+
+func (c *Config) SetStateDir(val string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.StateDir = val
+}
+
+func normalizeCacheMaxItemPct(val int) int {
+	if val < 0 {
+		return 50
+	}
+	if val > 100 {
+		return 100
+	}
+	return val
+}
+
+func (c *Config) GetCacheMaxItemPct() int {
+	if c == nil {
+		return 50
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return normalizeCacheMaxItemPct(c.CacheMaxItemPct)
+}
+
+func (c *Config) SetCacheMaxItemPct(val int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.CacheMaxItemPct = normalizeCacheMaxItemPct(val)
+}
+
+func (c *Config) GetNASSequentialStage() string {
+	if c == nil {
+		return "auto"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	mode := strings.ToLower(strings.TrimSpace(c.NASSequentialStage))
+	switch mode {
+	case "true", "false":
+		return mode
+	default:
+		return "auto"
+	}
+}
+
+func (c *Config) SetNASSequentialStage(val string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.NASSequentialStage = val
 }
 
 func (c *Config) GetMaxUpstreamWorkers() int {
@@ -375,6 +457,28 @@ func (c *Config) SetStorageBackend(b string) {
 	}
 }
 
+// EffectiveStorageBackend resolves the active mode ("tmp", "disk", or "s3"),
+// routing disk configs with empty/"none"/"off"/"disabled" CACHE_DIR to ephemeral "tmp" mode.
+func (c *Config) EffectiveStorageBackend() string {
+	switch c.GetStorageBackend() {
+	case "s3":
+		return "s3"
+	case "tmp":
+		return "tmp"
+	default:
+		cacheDir := strings.ToLower(strings.TrimSpace(c.GetCacheDir()))
+		if cacheDir == "" || cacheDir == "none" || cacheDir == "off" || cacheDir == "disabled" {
+			return "tmp"
+		}
+		return "disk"
+	}
+}
+
+// UsesCacheDir reports whether this runtime actually reads or writes persistent CACHE_DIR files.
+func (c *Config) UsesCacheDir() bool {
+	return c.EffectiveStorageBackend() == "disk"
+}
+
 // clampConcurrency normalizes concurrency values to [1, 16], falling back when val <= 0.
 func clampConcurrency(val, fallback int) int {
 	if val <= 0 {
@@ -598,7 +702,9 @@ func parseConfigFromEnv() *Config {
 		Port:                    getEnv("PORT", ":8080"),
 		CacheDir:                getEnv("CACHE_DIR", "./cache/files"),
 		TmpDir:                  getEnv("TMP_DIR", "./cache/tmp"),
+		StateDir:                getEnv("STATE_DIR", ""),
 		CacheMaxBytes:           getEnvSize("CACHE_MAX_BYTES", 50*1024*1024*1024),           // 50GB
+		CacheMaxItemPct:         getEnvPercent("CACHE_MAX_ITEM_PCT", 50),
 		CacheMinDiskFreeBytes:   getEnvSize("CACHE_MIN_DISK_FREE_BYTES", 10*1024*1024*1024), // 10GB
 		TmpFileMaxBytes:         getEnvSize("TMP_FILE_MAX_BYTES", 512*1024*1024),            // 512MB
 		TmpMinDiskFreeBytes:     getEnvSize("TMP_MIN_DISK_FREE_BYTES", 1*1024*1024*1024),    // 1GB
@@ -617,6 +723,7 @@ func parseConfigFromEnv() *Config {
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
 		StorageBackend:          getEnv("STORAGE_BACKEND", "disk"),
+		NASSequentialStage:      getEnv("NAS_SEQUENTIAL_STAGE", "auto"),
 		S3Config: S3Config{
 			Endpoint:             getEnv("S3_ENDPOINT", ""),
 			Bucket:               getEnv("S3_BUCKET", ""),
@@ -686,8 +793,15 @@ func detectLegacyConfigWarnings() []string {
 		norm := strings.ToLower(strings.TrimSpace(val))
 		if norm == "local" {
 			warnings = append(warnings, `STORAGE_BACKEND="local" is removed; set STORAGE_BACKEND="disk" instead`)
-		} else if norm != "disk" && norm != "s3" {
-			warnings = append(warnings, "STORAGE_BACKEND="+val+` is invalid; valid values are "disk" or "s3"`)
+		} else if norm != "tmp" && norm != "disk" && norm != "s3" {
+			warnings = append(warnings, "STORAGE_BACKEND="+val+` is invalid; valid values are "tmp", "disk", or "s3"`)
+		}
+	}
+
+	if val, ok := os.LookupEnv("NAS_SEQUENTIAL_STAGE"); ok && strings.TrimSpace(val) != "" {
+		norm := strings.ToLower(strings.TrimSpace(val))
+		if norm != "auto" && norm != "true" && norm != "false" {
+			warnings = append(warnings, "NAS_SEQUENTIAL_STAGE="+val+` is invalid; valid values are "auto", "true", or "false"`)
 		}
 	}
 
@@ -714,13 +828,17 @@ func LoadConfig() {
 	cfg := parseConfigFromEnv()
 	GlobalConfig = cfg
 	s3Cfg := cfg.GetS3Config()
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, TmpDir=%s, StorageBackend=%s, DispatcharrURL=%s, MaxCache=%dGB, CacheMinDiskFree=%dGB, TmpFileMax=%dMB, TmpMinDiskFree=%dMB, CacheMaxIdleAge=%s, CacheEvictInterval=%s, S3UploadConcurrency=%d, S3RecomposeConcurrency=%d, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, TmpDir=%s, StateDir=%s, StorageBackend=%s (Effective=%s), NASSequentialStage=%s, DispatcharrURL=%s, MaxCache=%dGB, CacheMaxItemPct=%d%%, CacheMinDiskFree=%dGB, TmpFileMax=%dMB, TmpMinDiskFree=%dMB, CacheMaxIdleAge=%s, CacheEvictInterval=%s, S3UploadConcurrency=%d, S3RecomposeConcurrency=%d, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.TmpDir,
+		cfg.GetStateDir(),
 		cfg.GetStorageBackend(),
+		cfg.EffectiveStorageBackend(),
+		cfg.GetNASSequentialStage(),
 		cfg.GetDispatcharrURL(),
 		cfg.CacheMaxBytes/(1024*1024*1024),
+		cfg.GetCacheMaxItemPct(),
 		cfg.GetCacheMinDiskFreeBytes()/(1024*1024*1024),
 		cfg.GetTmpFileMaxBytes()/(1024*1024),
 		cfg.GetTmpMinDiskFreeBytes()/(1024*1024),
@@ -740,6 +858,23 @@ func LoadConfig() {
 		cfg.GetMinReadThresholdBytes()/(1024*1024),
 		cfg.GetMaxProbeBuffers(),
 	)
+}
+
+func getEnvPercent(key string, fallback int) int {
+	valStr, ok := os.LookupEnv(key)
+	if !ok {
+		return normalizeCacheMaxItemPct(fallback)
+	}
+	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(valStr), "%"))
+	if trimmed == "" {
+		return normalizeCacheMaxItemPct(fallback)
+	}
+	val, err := strconv.Atoi(trimmed)
+	if err != nil {
+		log.Printf("[Config] Warning: Invalid percentage value for %s: %s. Using default %d%%", key, valStr, fallback)
+		return normalizeCacheMaxItemPct(fallback)
+	}
+	return normalizeCacheMaxItemPct(val)
 }
 
 func getEnv(key, fallback string) string {
