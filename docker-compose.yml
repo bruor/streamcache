@@ -26,10 +26,11 @@ services:
       # - STATE_DIR=/var/cache/streamcache/tmp/state
       # - NAS_SEQUENTIAL_STAGE=auto # Valid options: auto, true, false
 
-      # --- Scratch Budget & Writeback (`TMP_DIR` mount) ---
+      # --- Scratch Budget & In-Memory Writeback ---
       - TMP_FILE_MAX_BYTES=512MB
       - TMP_MIN_DISK_FREE_BYTES=1GB
-      # Asynchronous writeback & LiveBuffer sliding window size (min 16MB, max 256MB)
+      # Per-file in-memory RAM LiveBuffer sliding window for serving active client connections
+      # and coalescing async writes (separate from TMP_DIR disk scratch; min 16MB, max 256MB)
       # - WRITEBACK_BUFFER_SIZE=64MB
 
       # --- Persistent L1 Cache Bounds, Eviction & Revalidation (`CACHE_DIR` / `S3`) ---

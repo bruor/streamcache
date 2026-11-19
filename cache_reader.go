@@ -258,16 +258,18 @@ func (r *CacheReader) recordRead(off int64, n int) {
 		}
 		r.upgradeFromPrehydration()
 		if r.state != nil {
-			if idx := getGlobalCacheIndex(); idx != nil {
-				r.chainTouchedOnce.Do(func() {
-					r.state.Lock.Lock()
-					next := append([]string(nil), r.state.NextURLs...)
-					r.state.Lock.Unlock()
-					if len(next) > 0 {
-						idx.TouchChain(next)
-					}
-				})
-			}
+			r.chainTouchedOnce.Do(func() {
+				r.state.Lock.Lock()
+				fileURL := r.state.URL
+				next := append([]string(nil), r.state.NextURLs...)
+				r.state.Lock.Unlock()
+				if idx := getGlobalCacheIndex(); idx != nil && len(next) > 0 {
+					idx.TouchChain(next)
+				}
+				if GlobalPrehydrationManager != nil {
+					GlobalPrehydrationManager.OnPlayerPlayback(fileURL, next)
+				}
+			})
 		}
 	} else if r.state != nil && !r.state.IsDiskMaterialized() && GlobalRegistry != nil {
 		GlobalRegistry.RecordProbeActivity()

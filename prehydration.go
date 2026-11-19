@@ -721,9 +721,11 @@ func (pm *PrehydrationManager) OnCancelled(key string) {
 	pm.mu.Unlock()
 }
 
-// OnPlayerPlayback is called when a human viewer begins playing an asset.
-// It removes the played asset from the prehydration queue and clears NextURLs
-// on all other files to ensure only the active playing title controls the downstream binge chain.
+// OnPlayerPlayback is called when a human viewer confirms playback of an asset
+// (crossing MIN_READ_THRESHOLD_BYTES on HIT or graduating past probe on MISS/active hydration).
+// It removes the played asset from the prehydration queue and clears NextURLs only on
+// upstream predecessor files whose chain included targetURL (allowing forward chain migration
+// without wiping unrelated shows, earlier-episode hits, or start/stop/start of the same episode).
 func (pm *PrehydrationManager) OnPlayerPlayback(targetURL string, nextURLs []string) {
 	if pm == nil {
 		return
@@ -732,24 +734,27 @@ func (pm *PrehydrationManager) OnPlayerPlayback(targetURL string, nextURLs []str
 	cacheFileName := key + ext
 
 	pm.mu.Lock()
-	if pm.activePrehydrations[cacheFileName] {
-		delete(pm.activePrehydrations, cacheFileName)
-		if pm.prehydrationsStartedSinceLastPoll > 0 {
-			pm.prehydrationsStartedSinceLastPoll--
+	for activeKey := range pm.activePrehydrations {
+		if activeKey == cacheFileName || (key != "" && strings.HasPrefix(activeKey, key+".")) {
+			delete(pm.activePrehydrations, activeKey)
+			if pm.prehydrationsStartedSinceLastPoll > 0 {
+				pm.prehydrationsStartedSinceLastPoll--
+			}
 		}
 	}
 	for i := len(pm.queue) - 1; i >= 0; i-- {
-		if pm.queue[i].TargetURL == targetURL {
+		tKey, tExt := getCacheKeyAndExt(pm.queue[i].TargetURL)
+		if pm.queue[i].TargetURL == targetURL || (tKey != "" && tKey == key && (tExt == ext || tKey+tExt == cacheFileName)) {
 			pm.queue = append(pm.queue[:i], pm.queue[i+1:]...)
 		}
 	}
 	pm.mu.Unlock()
 
-	if len(nextURLs) > 0 {
+	if len(nextURLs) > 0 && GlobalRegistry != nil {
 		GlobalRegistry.Lock.RLock()
 		files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
 		for _, fs := range GlobalRegistry.Files {
-			if fs.URL != targetURL {
+			if fs.URL != targetURL && fs.Key != cacheFileName && !(key != "" && strings.HasPrefix(fs.Key, key+".")) {
 				files = append(files, fs)
 			}
 		}
@@ -757,7 +762,21 @@ func (pm *PrehydrationManager) OnPlayerPlayback(targetURL string, nextURLs []str
 
 		for _, fs := range files {
 			fs.Lock.Lock()
-			fs.NextURLs = nil
+			isPredecessor := false
+			for _, queuedNext := range fs.NextURLs {
+				if queuedNext == targetURL {
+					isPredecessor = true
+					break
+				}
+				nKey, _ := getCacheKeyAndExt(queuedNext)
+				if nKey != "" && nKey == key {
+					isPredecessor = true
+					break
+				}
+			}
+			if isPredecessor {
+				fs.NextURLs = nil
+			}
 			fs.Lock.Unlock()
 		}
 	}
@@ -898,7 +917,13 @@ func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	}
 
 	pm.mu.Lock()
-	// Deduplicate against queue
+	// Deduplicate against currently active prehydrations and queued tasks
+	for activeKey := range pm.activePrehydrations {
+		if activeKey == cacheFileName || (key != "" && strings.HasPrefix(activeKey, key+".")) {
+			pm.mu.Unlock()
+			return
+		}
+	}
 	for _, task := range pm.queue {
 		if task.TargetURL == targetURL {
 			pm.mu.Unlock()

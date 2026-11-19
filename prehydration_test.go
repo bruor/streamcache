@@ -2801,3 +2801,212 @@ func TestDashboardPayloadUpstreamAndCapacityAccounting(t *testing.T) {
 
 
 
+
+func TestOnPlayerPlaybackSelectivePredecessorClearingAndActiveDedup(t *testing.T) {
+	saveAndRestorePhase1Globals(t)
+
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "files")
+	partTmpDir := filepath.Join(tmpDir, "tmp")
+	_ = os.MkdirAll(cacheDir, 0755)
+	_ = os.MkdirAll(partTmpDir, 0755)
+
+	GlobalConfig = &Config{
+		CacheDir:                  cacheDir,
+		TmpDir:                    partTmpDir,
+		StorageBackend:            "disk",
+		EnableEpisodePrehydration: true,
+		CacheMaxBytes:             1024 * 1024 * 1024,
+	}
+	InitStorage()
+	InitRegistry()
+
+	ep4 := "http://dispatcharr:9191/proxy/vod/episode/44444444-4444-4444-4444-444444444444"
+	ep5 := "http://dispatcharr:9191/proxy/vod/episode/55555555-5555-5555-5555-555555555555"
+	ep6 := "http://dispatcharr:9191/proxy/vod/episode/66666666-6666-6666-6666-666666666666"
+	ep7 := "http://dispatcharr:9191/proxy/vod/episode/77777777-7777-7777-7777-777777777777"
+	ep8 := "http://dispatcharr:9191/proxy/vod/episode/88888888-8888-8888-8888-888888888888"
+	other1 := "http://dispatcharr:9191/proxy/vod/episode/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	other2 := "http://dispatcharr:9191/proxy/vod/episode/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+	k5, _ := getCacheKeyAndExt(ep5)
+	k6, ext6 := getCacheKeyAndExt(ep6)
+
+	pm := &PrehydrationManager{
+		activePrehydrations: map[string]bool{
+			k5 + ".mkv": true,
+		},
+		stopCh:   make(chan struct{}),
+		notifyCh: make(chan struct{}, 10),
+		queue: []*PrehydrationTask{
+			{TargetURL: ep7, NextURLs: []string{ep8}},
+		},
+	}
+	GlobalPrehydrationManager = pm
+
+	// Enqueue must skip items already actively prehydrating even when key matches extensionless URL prefix
+	pm.Enqueue(ep5, []string{ep6})
+	pm.mu.Lock()
+	qLen := len(pm.queue)
+	pm.mu.Unlock()
+	if qLen != 1 || pm.queue[0].TargetURL != ep7 {
+		t.Fatalf("Expected active prehydration %s not to be re-queued, got queue len=%d", ep5, qLen)
+	}
+
+	fsEp6 := NewFileCacheState(k6+ext6, ep6, filepath.Join(cacheDir, k6+ext6), filepath.Join(partTmpDir, k6+ext6+".part"), filepath.Join(cacheDir, k6+ext6+".json"), "video/x-matroska", "", "", 1000)
+	fsEp6.NextURLs = []string{ep7, ep8}
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[fsEp6.Key] = fsEp6
+	GlobalRegistry.Lock.Unlock()
+
+	// 1. Cache HIT on earlier episode (Ep 4 -> [Ep 5]) must NOT wipe Ep 6's [Ep 7, Ep 8] chain
+	pm.OnCacheHit(ep4, []string{ep5})
+	fsEp6.Lock.Lock()
+	gotChain := append([]string(nil), fsEp6.NextURLs...)
+	fsEp6.Lock.Unlock()
+	if len(gotChain) != 2 || gotChain[0] != ep7 || gotChain[1] != ep8 {
+		t.Fatalf("Expected earlier-episode Cache HIT not to clear Ep 6 NextURLs, got %v", gotChain)
+	}
+
+	// 2. Playback on an unrelated show must NOT wipe Ep 6's chain
+	pm.OnPlayerPlayback(other1, []string{other2})
+	fsEp6.Lock.Lock()
+	gotChain = append([]string(nil), fsEp6.NextURLs...)
+	fsEp6.Lock.Unlock()
+	if len(gotChain) != 2 {
+		t.Fatalf("Expected unrelated show playback not to clear Ep 6 NextURLs, got %v", gotChain)
+	}
+
+	// 3. Restarting/re-opening the SAME episode (Ep 6 -> [Ep 7, Ep 8]) must NOT clear Ep 6's chain
+	pm.OnPlayerPlayback(ep6, []string{ep7, ep8})
+	fsEp6.Lock.Lock()
+	gotChain = append([]string(nil), fsEp6.NextURLs...)
+	fsEp6.Lock.Unlock()
+	if len(gotChain) != 2 {
+		t.Fatalf("Expected same-episode playback not to clear Ep 6 NextURLs, got %v", gotChain)
+	}
+
+	// 4. Playing downstream Ep 7 -> [Ep 8] (forward migration) MUST prune Ep 7 and clear Ep 6's NextURLs
+	pm.OnPlayerPlayback(ep7, []string{ep8})
+	pm.mu.Lock()
+	qLenAfter := len(pm.queue)
+	pm.mu.Unlock()
+	if qLenAfter != 0 {
+		t.Fatalf("Expected Ep 7 to be pruned from queue on forward playback, got %d", qLenAfter)
+	}
+	fsEp6.Lock.Lock()
+	gotChainAfter := append([]string(nil), fsEp6.NextURLs...)
+	fsEp6.Lock.Unlock()
+	if len(gotChainAfter) != 0 {
+		t.Fatalf("Expected Ep 6 predecessor NextURLs to be cleared on forward Ep 7 playback, got %v", gotChainAfter)
+	}
+}
+
+func TestCacheMissProbeDoesNotClearPredecessorOrPruneQueue(t *testing.T) {
+	saveAndRestorePhase1Globals(t)
+
+	tmpDir := t.TempDir()
+	cacheDir := filepath.Join(tmpDir, "files")
+	partTmpDir := filepath.Join(tmpDir, "tmp")
+	_ = os.MkdirAll(cacheDir, 0755)
+	_ = os.MkdirAll(partTmpDir, 0755)
+
+	payload := bytes.Repeat([]byte("V"), 512*1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/x-matroska")
+		w.Header().Set("Accept-Ranges", "bytes")
+		http.ServeContent(w, r, "ep.mkv", time.Now(), bytes.NewReader(payload))
+	}))
+	defer upstream.Close()
+
+	GlobalConfig = &Config{
+		CacheDir:                  cacheDir,
+		TmpDir:                    partTmpDir,
+		StorageBackend:            "disk",
+		CacheMaxBytes:             1024 * 1024 * 1024,
+		MinReadThresholdBytes:     256 * 1024,
+		MaxUpstreamWorkers:        1,
+		WritebackBufferSize:       1024 * 1024,
+		EnableEpisodePrehydration: true,
+		SchedulerMinTime:          50 * time.Millisecond,
+		ClientHydrationWait:       200 * time.Millisecond,
+	}
+	InitStorage()
+	InitRegistry()
+
+	ep6URL := upstream.URL + "/ep6.mkv"
+	ep7URL := upstream.URL + "/ep7.mkv"
+	ep8URL := upstream.URL + "/ep8.mkv"
+
+	pm := &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		queue: []*PrehydrationTask{
+			{TargetURL: ep7URL, NextURLs: []string{ep8URL}},
+		},
+	}
+	GlobalPrehydrationManager = pm
+
+	k6, ext6 := getCacheKeyAndExt(ep6URL)
+	fsEp6 := NewFileCacheState(k6+ext6, ep6URL, filepath.Join(cacheDir, k6+ext6), filepath.Join(partTmpDir, k6+ext6+".part"), filepath.Join(cacheDir, k6+ext6+".json"), "video/x-matroska", "", "", int64(len(payload)))
+	fsEp6.NextURLs = []string{ep7URL, ep8URL}
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[fsEp6.Key] = fsEp6
+	GlobalRegistry.Lock.Unlock()
+
+	proxySrv := httptest.NewServer(http.HandlerFunc(handleMediaStream))
+	defer proxySrv.Close()
+
+	// 1. Small GET range probe (4 KB < 256 KB threshold) on uncached ep7 must NOT clear ep6.NextURLs or prune ep7
+	probeReq, _ := http.NewRequest("GET", fmt.Sprintf("%s/stream?url=%s&next_url=%s", proxySrv.URL, url.QueryEscape(ep7URL), url.QueryEscape(ep8URL)), nil)
+	probeReq.Header.Set("Range", "bytes=0-4095")
+	probeResp, err := http.DefaultClient.Do(probeReq)
+	if err != nil {
+		t.Fatalf("Probe GET error: %v", err)
+	}
+	_, _ = io.ReadAll(probeResp.Body)
+	_ = probeResp.Body.Close()
+
+	pm.mu.Lock()
+	qLenProbe := len(pm.queue)
+	pm.mu.Unlock()
+	if qLenProbe != 1 {
+		t.Fatalf("Expected small GET probe on uncached ep7 NOT to prune ep7 from queue, got qLen=%d", qLenProbe)
+	}
+	fsEp6.Lock.Lock()
+	chainLenProbe := len(fsEp6.NextURLs)
+	fsEp6.Lock.Unlock()
+	if chainLenProbe != 2 {
+		t.Fatalf("Expected small GET probe NOT to clear predecessor ep6 NextURLs, got %d entries", chainLenProbe)
+	}
+
+	// 2. Full GET playback (>= 256 KB threshold) on ep7 MUST prune ep7 from queue, clear ep6.NextURLs,
+	//    and (once ep7 commits) enqueue ep8 instead of ep7.
+	playResp, err := http.Get(fmt.Sprintf("%s/stream?url=%s&next_url=%s", proxySrv.URL, url.QueryEscape(ep7URL), url.QueryEscape(ep8URL)))
+	if err != nil {
+		t.Fatalf("Full GET error: %v", err)
+	}
+	body, _ := io.ReadAll(playResp.Body)
+	_ = playResp.Body.Close()
+	if len(body) != len(payload) {
+		t.Fatalf("Expected full %d bytes, got %d", len(payload), len(body))
+	}
+
+	if !waitForPhase1Condition(3*time.Second, func() bool {
+		pm.mu.Lock()
+		defer pm.mu.Unlock()
+		return len(pm.queue) == 1 && pm.queue[0].TargetURL == ep8URL
+	}) {
+		pm.mu.Lock()
+		t.Fatalf("Expected confirmed playback on ep7 to prune ep7 and chain ep8, got queue=%+v", pm.queue)
+		pm.mu.Unlock()
+	}
+	fsEp6.Lock.Lock()
+	chainLenPlay := len(fsEp6.NextURLs)
+	fsEp6.Lock.Unlock()
+	if chainLenPlay != 0 {
+		t.Fatalf("Expected confirmed playback on ep7 to clear predecessor ep6 NextURLs, got %d entries", chainLenPlay)
+	}
+}
