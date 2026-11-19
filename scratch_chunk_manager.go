@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -115,6 +116,10 @@ type ScratchChunkManager struct {
 	uploadSem        chan struct{}
 	trackDiskFlushes atomic.Bool
 	activeUploads    int32
+	ringBufferMode   atomic.Bool
+	degradedErr      error
+	ringPunchedCount atomic.Int64
+	ringPunchedBytes atomic.Int64
 	ctx              context.Context
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup // tracks chunk upload workers
@@ -241,6 +246,97 @@ func NewScratchChunkManagerWithTarget(state *FileCacheState, target ChunkTarget,
 	}
 }
 
+// NewRingBufferScratchChunkManager creates a targetless sliding ring-buffer ScratchChunkManager
+// bounded by TMP_FILE_MAX_BYTES and EffectiveTmpMinDiskFreeBytes.
+func NewRingBufferScratchChunkManager(state *FileCacheState) *ScratchChunkManager {
+	maxInFlight := int64(512 * 1024 * 1024)
+	minFreeDisk := int64(1 * 1024 * 1024 * 1024)
+	chunkSize := int64(16 * 1024 * 1024)
+	if GlobalConfig != nil {
+		if tmpMax := GlobalConfig.GetTmpFileMaxBytes(); tmpMax > 0 {
+			maxInFlight = tmpMax
+		}
+		minFreeDisk = EffectiveTmpMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
+		if sc := GlobalConfig.GetS3Config().ChunkSize; sc > 0 && sc < chunkSize {
+			chunkSize = sc
+		}
+	}
+	if maxInFlight > 0 && chunkSize > maxInFlight/4 {
+		chunkSize = maxInFlight / 4
+	}
+	chunkSize = (chunkSize / 4096) * 4096
+	if chunkSize < 4096 {
+		chunkSize = 4096
+	}
+	if maxInFlight < 2*chunkSize {
+		maxInFlight = 2 * chunkSize
+	}
+
+	var totalSize int64
+	var key string
+	if state != nil {
+		totalSize = state.TotalSize
+		key = state.Key
+	}
+	totalParts := int((totalSize + chunkSize - 1) / chunkSize)
+	if totalParts <= 0 {
+		totalParts = 1
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &ScratchChunkManager{
+		key:                     key,
+		state:                   state,
+		chunkSize:               chunkSize,
+		totalSize:               totalSize,
+		totalParts:              totalParts,
+		isMultipart:             false,
+		maxInFlightBytes:        maxInFlight,
+		minFreeDiskBytes:        minFreeDisk,
+		defaultMinFreeDiskBytes: minFreeDisk,
+		budgetChan:              make(chan struct{}, 1),
+		uploadSem:               make(chan struct{}, 1),
+		uploaded:                make(map[int]bool),
+		uploading:               make(map[int]bool),
+		ctx:                     ctx,
+		cancel:                  cancel,
+	}
+	m.ringBufferMode.Store(true)
+	return m
+}
+
+// IsRingBufferMode reports whether this manager is operating as an ephemeral ring buffer.
+func (m *ScratchChunkManager) IsRingBufferMode() bool {
+	return m != nil && m.ringBufferMode.Load()
+}
+
+// RingPunchedCount returns the number of ring-buffer chunks punched to reclaim scratch space.
+func (m *ScratchChunkManager) RingPunchedCount() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.ringPunchedCount.Load()
+}
+
+// RingPunchedBytes returns total bytes freed by ring-buffer hole-punching.
+func (m *ScratchChunkManager) RingPunchedBytes() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.ringPunchedBytes.Load()
+}
+
+// SignalBudget wakes any download workers blocked in WaitScratchBudget.
+func (m *ScratchChunkManager) SignalBudget() {
+	if m == nil || m.budgetChan == nil {
+		return
+	}
+	select {
+	case m.budgetChan <- struct{}{}:
+	default:
+	}
+}
+
 // TargetName returns the active ChunkTarget identifier ("s3", "nas", or "").
 func (m *ScratchChunkManager) TargetName() string {
 	if m == nil || m.target == nil {
@@ -275,6 +371,8 @@ func (m *ScratchChunkManager) IsMultipart() bool {
 }
 
 // WaitScratchBudget pauses the caller if in-flight un-uploaded bytes exceed budget or disk free space is low.
+// In ring-buffer mode (or when sequential NAS staging is blocked on an out-of-order seek), it punches the
+// oldest safe chunk behind readers before waiting.
 func (m *ScratchChunkManager) WaitScratchBudget(ctx context.Context) error {
 	if m == nil {
 		return nil
@@ -297,16 +395,27 @@ func (m *ScratchChunkManager) WaitScratchBudget(ctx context.Context) error {
 		if minFree == m.defaultMinFreeDiskBytes && GlobalConfig != nil {
 			minFree = EffectiveTmpMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
 		}
-		diskPath := m.state.PartPath
+		diskPath := ""
+		if m.state != nil {
+			diskPath = m.state.PartPath
+		}
 		if dir := filepath.Dir(diskPath); dir != "" && dir != "." {
 			diskPath = dir
 		}
-		diskFree, err := GetDiskFreeSpace(diskPath)
-		diskOK := err != nil || diskFree >= uint64(minFree)
+		diskOK := true
+		if diskPath != "" && minFree > 0 {
+			diskFree, err := GetDiskFreeSpace(diskPath)
+			diskOK = err != nil || diskFree >= uint64(minFree)
+		}
 		budgetOK := inFlight < m.maxInFlightBytes
 
 		if budgetOK && diskOK {
 			return nil
+		}
+
+		allowPunch := m.IsRingBufferMode() || (m.target != nil && m.target.IsSequential() && atomic.LoadInt32(&m.activeUploads) == 0)
+		if allowPunch && m.tryPunchBackRingBuffer() {
+			continue
 		}
 
 		select {
@@ -315,7 +424,7 @@ func (m *ScratchChunkManager) WaitScratchBudget(ctx context.Context) error {
 		case <-m.ctx.Done():
 			return m.ctx.Err()
 		case <-m.budgetChan:
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
@@ -386,7 +495,7 @@ func (m *ScratchChunkManager) activeRangeSet() *RangeSet {
 
 // CheckAndTriggerUploads inspects RangeSet (or DiskRangeSet when pipelined) to see if any new chunks can be queued to the target.
 func (m *ScratchChunkManager) CheckAndTriggerUploads() {
-	if m == nil || m.target == nil {
+	if m == nil || m.target == nil || m.IsRingBufferMode() {
 		return
 	}
 
@@ -394,7 +503,7 @@ func (m *ScratchChunkManager) CheckAndTriggerUploads() {
 	sequential := m.target.IsSequential()
 
 	m.mu.Lock()
-	if m.recomposed || m.permanentErr != nil {
+	if m.IsRingBufferMode() || m.recomposed || m.permanentErr != nil {
 		m.mu.Unlock()
 		return
 	}
@@ -457,6 +566,13 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 	}
 	defer func() { <-m.uploadSem }()
 
+	if m.IsRingBufferMode() {
+		m.mu.Lock()
+		m.uploading[chunkIndex] = false
+		m.mu.Unlock()
+		return
+	}
+
 	chunkStart := int64(chunkIndex) * m.chunkSize
 	chunkLen := m.chunkSize
 	if chunkStart+chunkLen > m.totalSize {
@@ -478,9 +594,15 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 	targetName := m.target.Name()
 	var uploadErr error
 	for attempt := 1; attempt <= 3; attempt++ {
+		if m.IsRingBufferMode() || m.ctx.Err() != nil {
+			m.mu.Lock()
+			m.uploading[chunkIndex] = false
+			m.mu.Unlock()
+			return
+		}
 		sectionReader := io.NewSectionReader(f, chunkStart, chunkLen)
 		uploadErr = m.target.PushChunk(m.ctx, m.key, chunkIndex, chunkStart, sectionReader, chunkLen)
-		if uploadErr == nil || m.ctx.Err() != nil {
+		if uploadErr == nil || m.ctx.Err() != nil || m.IsRingBufferMode() {
 			break
 		}
 		backoff := time.Duration(1<<(attempt-1)) * 500 * time.Millisecond
@@ -498,6 +620,13 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 		}
 	}
 
+	if m.IsRingBufferMode() {
+		m.mu.Lock()
+		m.uploading[chunkIndex] = false
+		m.mu.Unlock()
+		return
+	}
+
 	if uploadErr != nil {
 		if m.ctx.Err() != nil {
 			m.mu.Lock()
@@ -505,6 +634,18 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 			m.mu.Unlock()
 			return
 		}
+		if targetName == "s3" {
+			RecordS3Failure(uploadErr)
+		} else if targetName == "nas" {
+			RecordNASFailure(uploadErr)
+		}
+		if m.state != nil && m.state.HasActiveClients() {
+			log.Printf("[ScratchChunkManager] PushChunk (%s) failed for %s chunk %d (%v); degrading active stream to TMP_DIR ring buffer",
+				targetName, m.key, chunkIndex, uploadErr)
+			m.enterRingBufferMode(uploadErr)
+			return
+		}
+
 		log.Printf("[ScratchChunkManager] PushChunk (%s) permanently failed for %s chunk %d after 3 attempts: %v",
 			targetName, m.key, chunkIndex, uploadErr)
 		m.mu.Lock()
@@ -514,10 +655,7 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 		}
 		m.mu.Unlock()
 		m.cancel()
-		select {
-		case m.budgetChan <- struct{}{}:
-		default:
-		}
+		m.SignalBudget()
 		target := m.target
 		key := m.key
 		go func() {
@@ -531,10 +669,21 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 	}
 
 	m.mu.Lock()
+	if m.IsRingBufferMode() {
+		m.uploading[chunkIndex] = false
+		m.mu.Unlock()
+		return
+	}
 	m.uploaded[chunkIndex] = true
 	m.uploading[chunkIndex] = false
 	completedCount := len(m.uploaded)
 	m.mu.Unlock()
+
+	if targetName == "s3" {
+		RecordS3Success()
+	} else if targetName == "nas" {
+		RecordNASSuccess()
+	}
 
 	// 1. Deallocate physical disk blocks (Linux hole punching)
 	if punchErr := PunchHole(f.Fd(), chunkStart, chunkLen); punchErr != nil {
@@ -559,9 +708,252 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 	}
 }
 
+func (m *ScratchChunkManager) chunkBounds(chunkIndex int) (int64, int64) {
+	cStart := int64(chunkIndex) * m.chunkSize
+	cEnd := cStart + m.chunkSize
+	if m.totalSize > 0 && cEnd > m.totalSize {
+		cEnd = m.totalSize
+	}
+	return cStart, cEnd
+}
+
+func (m *ScratchChunkManager) clearStateRange(cStart, cEnd int64) int64 {
+	if m.state == nil || cStart >= cEnd {
+		return 0
+	}
+	var removed int64
+	if m.state.RangeSet != nil {
+		removed = m.state.RangeSet.Remove(cStart, cEnd)
+	}
+	if m.state.DiskRangeSet != nil {
+		m.state.DiskRangeSet.Remove(cStart, cEnd)
+	}
+	if m.state.LiveBuffer != nil {
+		m.state.LiveBuffer.RemoveRange(cStart, cEnd)
+	}
+	return removed
+}
+
+// enterRingBufferMode transitions an active target upload mid-stream into an ephemeral TMP_DIR ring buffer
+// so active playback completes smoothly despite S3 or NAS outages.
+func (m *ScratchChunkManager) enterRingBufferMode(err error) {
+	if m == nil {
+		return
+	}
+
+	m.mu.Lock()
+	if m.ringBufferMode.Load() {
+		m.mu.Unlock()
+		return
+	}
+	m.ringBufferMode.Store(true)
+	if m.degradedErr == nil {
+		m.degradedErr = err
+	}
+	var uploadedIndices []int
+	for idx, ok := range m.uploaded {
+		if ok {
+			uploadedIndices = append(uploadedIndices, idx)
+		}
+	}
+	m.uploaded = make(map[int]bool)
+	m.uploading = make(map[int]bool)
+	target := m.target
+	key := m.key
+	m.mu.Unlock()
+
+	if m.state != nil {
+		minOff, _, _, hasReaders := m.state.GetReaderOffsetBounds()
+		for _, idx := range uploadedIndices {
+			cStart, cEnd := m.chunkBounds(idx)
+			m.clearStateRange(cStart, cEnd)
+			if hasReaders && cEnd <= minOff {
+				m.state.AdvanceRingFloorOffset(cEnd)
+			}
+		}
+		m.state.SetTargetTier(TierTmp)
+		releaseAccountedCacheBytes(m.state)
+
+		m.state.Lock.Lock()
+		for _, ch := range m.state.Clients {
+			safeSignal(ch)
+		}
+		m.state.Lock.Unlock()
+		select {
+		case m.state.NotifyChan <- struct{}{}:
+		default:
+		}
+	}
+
+	m.SignalBudget()
+
+	if target != nil {
+		targetName := target.Name()
+		skipCleanup := (targetName == "s3" && !IsS3Healthy()) || (targetName == "nas" && !IsNASHealthy())
+		if !skipCleanup {
+			go func() {
+				delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if cerr := target.Cleanup(delCtx, key); cerr != nil && !errors.Is(cerr, ErrStorageCircuitOpen) {
+					log.Printf("[ScratchChunkManager] Async Cleanup (%s) after ring degradation failed for %s: %v", targetName, key, cerr)
+				}
+			}()
+		}
+	}
+}
+
+// InvalidateUploadedChunk marks chunkIndex un-uploaded and removes its range so readers can re-fetch from upstream.
+func (m *ScratchChunkManager) InvalidateUploadedChunk(chunkIndex int) {
+	if m == nil || chunkIndex < 0 {
+		return
+	}
+	m.mu.Lock()
+	delete(m.uploaded, chunkIndex)
+	delete(m.uploading, chunkIndex)
+	m.mu.Unlock()
+
+	cStart, cEnd := m.chunkBounds(chunkIndex)
+	m.clearStateRange(cStart, cEnd)
+
+	if m.state != nil {
+		m.state.LowerRingFloorOffset(cStart)
+		m.state.Lock.Lock()
+		for _, ch := range m.state.Clients {
+			safeSignal(ch)
+		}
+		m.state.Lock.Unlock()
+		select {
+		case m.state.NotifyChan <- struct{}{}:
+		default:
+		}
+	}
+	m.SignalBudget()
+}
+
+func (m *ScratchChunkManager) tryPunchBackRingBuffer() bool {
+	if m == nil || m.state == nil || m.chunkSize <= 0 {
+		return false
+	}
+
+	minOff, maxOff, protectedOffsets, hasReaders := m.state.GetReaderOffsetBounds()
+	if !hasReaders {
+		return false
+	}
+
+	protectedChunks := make(map[int]bool, len(protectedOffsets))
+	for _, off := range protectedOffsets {
+		if off < 0 {
+			off = 0
+		}
+		protectedChunks[int(off/m.chunkSize)] = true
+	}
+
+	m.mu.RLock()
+	uploadedSnap := make(map[int]bool, len(m.uploaded))
+	for k, v := range m.uploaded {
+		uploadedSnap[k] = v
+	}
+	uploadingSnap := make(map[int]bool, len(m.uploading))
+	for k, v := range m.uploading {
+		uploadingSnap[k] = v
+	}
+	m.mu.RUnlock()
+
+	isDiskMat := m.state.IsDiskMaterialized()
+	diskRS := m.state.DiskRangeSet
+	rs := m.state.RangeSet
+	if rs == nil {
+		return false
+	}
+
+	lookback := m.chunkSize
+	if m.maxInFlightBytes > 0 && m.maxInFlightBytes/4 < lookback {
+		lookback = m.maxInFlightBytes / 4
+	}
+
+	type punchCand struct {
+		start int64
+		end   int64
+	}
+	var p1, p2, p3 *punchCand
+
+	for _, r := range rs.Clone() {
+		if r.End <= r.Start {
+			continue
+		}
+		startIdx := int(r.Start / m.chunkSize)
+		endIdx := int((r.End - 1) / m.chunkSize)
+		for idx := startIdx; idx <= endIdx; idx++ {
+			if protectedChunks[idx] || uploadedSnap[idx] || uploadingSnap[idx] {
+				continue
+			}
+			cStart, cEnd := m.chunkBounds(idx)
+			if cStart < r.Start || cEnd > r.End || cEnd <= cStart {
+				continue
+			}
+			if isDiskMat && diskRS != nil && !diskRS.HasAvailable(cStart, cEnd-cStart) {
+				continue
+			}
+
+			if cEnd <= minOff-lookback {
+				if p1 == nil || cStart < p1.start {
+					p1 = &punchCand{start: cStart, end: cEnd}
+				}
+			} else if cEnd <= minOff {
+				if p2 == nil || cStart < p2.start {
+					p2 = &punchCand{start: cStart, end: cEnd}
+				}
+			} else if m.IsRingBufferMode() && cStart >= maxOff+m.chunkSize {
+				if p3 == nil || cStart > p3.start {
+					p3 = &punchCand{start: cStart, end: cEnd}
+				}
+			}
+		}
+	}
+
+	var chosen *punchCand
+	advanceFloor := false
+	switch {
+	case p1 != nil:
+		chosen = p1
+		advanceFloor = true
+	case p2 != nil:
+		chosen = p2
+		advanceFloor = true
+	case p3 != nil:
+		chosen = p3
+		advanceFloor = false
+	default:
+		return false
+	}
+
+	removed := m.clearStateRange(chosen.start, chosen.end)
+	if advanceFloor {
+		m.state.AdvanceRingFloorOffset(chosen.end)
+	}
+
+	if m.state.PartPath != "" && FileExists(m.state.PartPath) {
+		if f, err := os.OpenFile(m.state.PartPath, os.O_RDWR, 0644); err == nil {
+			_ = PunchHole(f.Fd(), chosen.start, chosen.end-chosen.start)
+			FadviseDontNeed(f.Fd(), chosen.start, chosen.end-chosen.start)
+			_ = f.Close()
+		}
+	}
+
+	m.ringPunchedCount.Add(1)
+	freedLen := chosen.end - chosen.start
+	m.ringPunchedBytes.Add(freedLen)
+	if removed > 0 {
+		m.SubInFlightBytes(removed)
+	} else {
+		m.SubInFlightBytes(freedLen)
+	}
+	return true
+}
+
 // IsRecomposed returns true if the monolithic S3 object has been sealed.
 func (m *ScratchChunkManager) IsRecomposed() bool {
-	if m == nil {
+	if m == nil || m.IsRingBufferMode() {
 		return false
 	}
 	m.mu.RLock()
@@ -583,7 +975,7 @@ func (m *ScratchChunkManager) setCommitProgress(stage string, completed, total i
 
 // GetCommitProgress returns the current S3 commit/recomposition stage and phase counts.
 func (m *ScratchChunkManager) GetCommitProgress() *CommitProgress {
-	if m == nil {
+	if m == nil || m.IsRingBufferMode() {
 		return nil
 	}
 	m.mu.RLock()
@@ -639,13 +1031,13 @@ func (m *ScratchChunkManager) GetCommitProgress() *CommitProgress {
 
 // AttemptRecompose commits uploaded chunks or staged files to the target destination.
 func (m *ScratchChunkManager) AttemptRecompose() {
-	if m == nil || m.target == nil {
+	if m == nil || m.target == nil || m.IsRingBufferMode() {
 		return
 	}
 	isNAS := m.target.Name() == "nas"
 
 	m.mu.Lock()
-	if m.recomposing || m.recomposed || m.permanentErr != nil {
+	if m.IsRingBufferMode() || m.recomposing || m.recomposed || m.permanentErr != nil {
 		m.mu.Unlock()
 		return
 	}
@@ -733,6 +1125,12 @@ func (m *ScratchChunkManager) AttemptRecompose() {
 func (m *ScratchChunkManager) WaitAndRecompose(ctx context.Context) error {
 	if m == nil {
 		return nil
+	}
+	if m.IsRingBufferMode() {
+		m.mu.RLock()
+		dErr := m.degradedErr
+		m.mu.RUnlock()
+		return dErr
 	}
 	if m.IsRecomposed() {
 		return nil

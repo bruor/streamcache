@@ -39,11 +39,20 @@ type CacheReader struct {
 }
 
 func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Request) *CacheReader {
+	var startOffset int64
+	if req != nil {
+		startOffset = parseRangeStart(req.Header.Get("Range"))
+	}
+
 	state.Lock.Lock()
 
 	// Generate a unique client ID using atomic counter
 	clientID := fmt.Sprintf("client-%d", atomic.AddUint64(&globalClientIDSeq, 1))
 	state.Clients[clientID] = make(chan struct{}, 1)
+	if state.ClientOffsets == nil {
+		state.ClientOffsets = make(map[string]int64)
+	}
+	state.ClientOffsets[clientID] = startOffset
 
 	var remoteAddr, userAgent, username string
 	if req != nil {
@@ -69,11 +78,6 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 	key := state.Key
 	url := state.URL
 	state.Lock.Unlock()
-
-	var startOffset int64
-	if req != nil {
-		startOffset = parseRangeStart(req.Header.Get("Range"))
-	}
 
 	cacheSource := ""
 	if isCompleted {
@@ -296,6 +300,9 @@ func (r *CacheReader) Close() error {
 	}
 	delete(r.state.Starving, r.clientID)
 	delete(r.state.StarvingSince, r.clientID)
+	if r.state.ClientOffsets != nil {
+		delete(r.state.ClientOffsets, r.clientID)
+	}
 
 	log.Printf("[Reader] Unregistered client %s from media %s", r.clientID, r.state.Key)
 
@@ -317,7 +324,7 @@ func (r *CacheReader) Close() error {
 	alreadyCommitted := (cm != nil && cm.IsRecomposed()) || (tier == TierDisk && r.state.Path != "" && FileExists(r.state.Path))
 	shouldFinalize := tier != TierTmp && remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommitted
 	shouldCleanUpTmp := tier == TierTmp && remainingClients == 0 && !isProbe && !r.state.IsCommitting
-	shouldCleanUpIncomplete := tier != TierTmp && remainingClients == 0 && !isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
+	shouldCleanUpIncomplete := tier != TierTmp && remainingClients == 0 && !isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !isPrehydrating && (!HasHealthyPersistentTier(GlobalConfig, GlobalStorage) || (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts()))
 
 	if shouldFinalize {
 		r.state.IsCommitting = true
@@ -355,6 +362,8 @@ func (r *CacheReader) Close() error {
 			r.state.File = nil
 			pipelineToClose = r.state.Pipeline
 			r.state.Pipeline = nil
+			cmToClose = r.state.ChunkManager
+			r.state.ChunkManager = nil
 		}
 	} else if remainingClients == 0 && !r.state.WriterActive && !shouldFinalize && shouldCleanUpIncomplete {
 		fileToClose = r.state.File
@@ -397,6 +406,9 @@ func (r *CacheReader) Close() error {
 		} else {
 			if pipelineToClose != nil {
 				_ = pipelineToClose.FlushAndClose()
+			}
+			if cmToClose != nil {
+				cmToClose.Close()
 			}
 			if fileToClose != nil {
 				FadviseDontNeed(fileToClose.Fd(), 0, 0)
@@ -462,7 +474,7 @@ func (r *CacheReader) finalizeCache() {
 	commitCompletedFile(r.state, nil, nil, false, "[Reader]")
 }
 
-func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
+func (r *CacheReader) ReadAt(p []byte, off int64) (int, error) {
 	if off >= r.state.TotalSize {
 		return 0, io.EOF
 	}
@@ -471,6 +483,26 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	if off+int64(len(p)) > r.state.TotalSize {
 		p = p[:r.state.TotalSize-off]
 	}
+
+	for {
+		n, retry, err := r.readAtAttempt(p, off)
+		if !retry {
+			if n > 0 {
+				r.state.SetClientOffset(r.clientID, off+int64(n))
+				if cm := r.state.GetChunkManager(); cm != nil && cm.IsRingBufferMode() {
+					cm.SignalBudget()
+				}
+			}
+			return n, err
+		}
+		if cerr := r.ctx.Err(); cerr != nil {
+			return 0, cerr
+		}
+	}
+}
+
+func (r *CacheReader) readAtAttempt(p []byte, off int64) (n int, retry bool, err error) {
+	r.state.SetClientOffset(r.clientID, off)
 
 	// Wait until at least some bytes are available from `off`
 	for {
@@ -498,7 +530,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			delete(r.state.StarvingSince, r.clientID)
 			r.state.Lock.Unlock()
 			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
-			return int(toZero), nil
+			return int(toZero), false, nil
 		}
 
 		select {
@@ -508,7 +540,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			delete(r.state.StarvingSince, r.clientID)
 			r.state.Lock.Unlock()
 			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
-			return 0, r.ctx.Err()
+			return 0, false, r.ctx.Err()
 		default:
 		}
 
@@ -525,11 +557,16 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			r.state.StarvingSince[r.clientID] = time.Now()
 		}
 		r.state.Starving[r.clientID] = off
+		if r.state.ClientOffsets == nil {
+			r.state.ClientOffsets = make(map[string]int64)
+		}
+		r.state.ClientOffsets[r.clientID] = off
 
 		isTailSeek := r.state.TotalSize > 0 && off >= (r.state.TotalSize-2*1024*1024)
 		isMidSeek := off >= minThreshold && !isTailSeek
 		needsResuscitation := !r.state.WriterActive
 		shouldUpgrade := (needsResuscitation || isMidSeek) && (r.state.IsYielding || r.state.IsPrehydrating || r.state.IsProbe)
+		cmStarve := r.state.ChunkManager
 
 		if needsResuscitation || shouldUpgrade {
 			wasYielding := r.state.IsYielding
@@ -576,6 +613,9 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		r.state.Lock.Unlock()
 
 		GlobalRegistry.UpdateConnectionStarvation(r.clientID, off)
+		if cmStarve != nil && cmStarve.IsRingBufferMode() {
+			cmStarve.SignalBudget()
+		}
 
 		select {
 		case r.state.NotifyChan <- struct{}{}:
@@ -583,13 +623,13 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 
 		if clientChan == nil {
-			return 0, errors.New("client unregistered")
+			return 0, false, errors.New("client unregistered")
 		}
 
 		select {
 		case _, ok := <-clientChan:
 			if !ok {
-				return 0, errors.New("client channel closed")
+				return 0, false, errors.New("client channel closed")
 			}
 		case <-r.ctx.Done():
 			r.state.Lock.Lock()
@@ -597,7 +637,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			delete(r.state.StarvingSince, r.clientID)
 			r.state.Lock.Unlock()
 			GlobalRegistry.UpdateConnectionStarvation(r.clientID, -1)
-			return 0, r.ctx.Err()
+			return 0, false, r.ctx.Err()
 		}
 	}
 
@@ -610,6 +650,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	r.state.Lock.Lock()
 	lb := r.state.LiveBuffer
 	cm := r.state.ChunkManager
+	tier := r.state.targetTierLocked()
 	r.state.Lock.Unlock()
 
 	// 1. LiveBuffer Fast-Path: check in-memory buffer first for zero-copy playback
@@ -627,12 +668,12 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			if r.state.RangeSet.IsComplete(r.state.TotalSize) {
 				GlobalRegistry.SetConnectionInCache(r.clientID, true)
 			}
-			return memN, nil
+			return memN, false, nil
 		}
 	}
 
 	// 2. S3 Storage Tier
-	if r.state.GetTargetTier() == TierS3 {
+	if tier == TierS3 {
 		// A. Recomposed Monolithic Object: If all parts have been stitched and sealed, read via s3ReadSeeker
 		isRecomposed := false
 		if cm != nil && cm.IsRecomposed() {
@@ -648,16 +689,16 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 				if s3N > 0 {
 					GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
 					GlobalRegistry.SetConnectionInCache(r.clientID, true)
-					return s3N, nil
+					return s3N, false, nil
 				}
 				if rerr != nil {
-					return 0, rerr
+					return 0, false, rerr
 				}
 			}
 		}
 
 		// B. In-flight Chunks: If chunk is in S3 prior to recomposition, read using sliding chunk buffer
-		if cm != nil {
+		if cm != nil && cm.ChunkSize() > 0 {
 			chunkSize := cm.ChunkSize()
 			chunkIdx := int(off / chunkSize)
 			if cm.IsChunkUploaded(chunkIdx) {
@@ -682,7 +723,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 					copy(p[:n], r.chunkBuf[relStart:relStart+n])
 					r.chunkBufMu.Unlock()
 					GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
-					return int(n), nil
+					return int(n), false, nil
 				}
 
 				// Buffer miss: fetch sliding read-ahead window (2MB) from chunk
@@ -710,36 +751,45 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 						copy(p[:n], buf[:n])
 						r.chunkBufMu.Unlock()
 						GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(n))
-						return int(n), nil
+						return int(n), false, nil
+					}
+					if rerr != nil {
+						err = rerr
 					}
 				}
 				r.chunkBufMu.Unlock()
 
 				// Chunk was already uploaded to S3 and hole-punched locally: NEVER fall back to reading zeroes from .part!
 				// If OpenChunkRange failed (e.g. DeleteObjects ran milliseconds before m.recomposed=true),
-				// immediately try opening the sealed monolithic S3 object (CompleteMultipartUpload finishes before DeleteObjects).
+				// immediately try opening the sealed monolithic S3 object.
 				s3Reader, s3Err := r.getS3Reader()
 				if s3Err == nil {
 					s3N, rerr := s3Reader.ReadAt(p[:toRead], off)
 					if s3N > 0 {
 						GlobalRegistry.UpdateConnectionOffset(r.clientID, off+int64(s3N))
 						GlobalRegistry.SetConnectionInCache(r.clientID, true)
-						return s3N, nil
+						return s3N, false, nil
 					}
 					if rerr != nil {
-						return 0, rerr
+						s3Err = rerr
 					}
 				}
-				if err != nil {
-					return 0, err
+				if r.ctx.Err() == nil {
+					RecordS3Failure(err)
+					RecordS3Failure(s3Err)
+					cm.InvalidateUploadedChunk(chunkIdx)
+					return 0, true, nil
 				}
-				return 0, s3Err
+				if err != nil {
+					return 0, false, err
+				}
+				return 0, false, s3Err
 			}
 		}
 	}
 
 	// 2b. Cross-FS NAS Staged Chunks: read committed chunks from CACHE_DIR/<key>.staging before reading finalPath
-	if r.state.GetTargetTier() == TierDisk && cm != nil {
+	if tier == TierDisk && cm != nil {
 		alreadyFinal := r.state.Path != "" && FileExists(r.state.Path)
 		if !cm.IsRecomposed() && !alreadyFinal {
 			chunkSize := cm.ChunkSize()
@@ -762,17 +812,27 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 							if r.state.RangeSet.IsComplete(r.state.TotalSize) {
 								GlobalRegistry.SetConnectionInCache(r.clientID, true)
 							}
-							return readN, nil
+							return readN, false, nil
 						}
 						if !(r.state.Path != "" && FileExists(r.state.Path)) {
-							if rerr != nil {
-								return 0, rerr
+							if r.ctx.Err() == nil {
+								RecordNASFailure(rerr)
+								cm.InvalidateUploadedChunk(chunkIdx)
+								return 0, true, nil
 							}
-							return 0, io.EOF
+							if rerr != nil {
+								return 0, false, rerr
+							}
+							return 0, false, io.EOF
 						}
 					} else if !(r.state.Path != "" && FileExists(r.state.Path)) {
 						// Never fall back to hole-punched PartPath when chunk is committed to NAS staging
-						return 0, cerr
+						if r.ctx.Err() == nil {
+							RecordNASFailure(cerr)
+							cm.InvalidateUploadedChunk(chunkIdx)
+							return 0, true, nil
+						}
+						return 0, false, cerr
 					}
 				}
 			}
@@ -782,10 +842,13 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	// 3. Fall back to reading from disk
 	file, fromPart, err := r.getFileWithOrigin()
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	n, err = file.ReadAt(p[:toRead], off)
+	if cm != nil && fromPart && cm.IsRingBufferMode() && n > 0 && !r.state.RangeSet.HasAvailable(off, int64(n)) {
+		return 0, true, nil
+	}
 	if cm != nil && fromPart && cm.ChunkSize() > 0 {
 		chunkSize := cm.ChunkSize()
 		startChunk := int(off / chunkSize)
@@ -813,16 +876,34 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 				if (rerr == nil || rerr == io.EOF || rerr == io.ErrUnexpectedEOF) && readN > 0 {
 					n, err = readN, nil
 				} else if rerr != nil {
+					if r.ctx.Err() == nil {
+						if tier == TierS3 {
+							RecordS3Failure(rerr)
+						} else {
+							RecordNASFailure(rerr)
+						}
+						cm.InvalidateUploadedChunk(startChunk)
+						return 0, true, nil
+					}
 					n, err = 0, rerr
 				}
 			} else if r.state.GetTargetTier() == TierS3 {
 				if s3Reader, s3Err := r.getS3Reader(); s3Err == nil {
 					n, err = s3Reader.ReadAt(p[:readLen], off)
+				} else if r.ctx.Err() == nil {
+					RecordS3Failure(cerr)
+					RecordS3Failure(s3Err)
+					cm.InvalidateUploadedChunk(startChunk)
+					return 0, true, nil
 				} else {
 					n, err = 0, cerr
 				}
 			} else if f2, stillFromPart, fErr := r.getFileWithOrigin(); fErr == nil && !stillFromPart {
 				n, err = f2.ReadAt(p[:readLen], off)
+			} else if r.ctx.Err() == nil {
+				RecordNASFailure(cerr)
+				cm.InvalidateUploadedChunk(startChunk)
+				return 0, true, nil
 			} else {
 				n, err = 0, cerr
 			}
@@ -846,7 +927,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 			GlobalRegistry.SetConnectionInCache(r.clientID, true)
 		}
 	}
-	return n, err
+	return n, false, err
 }
 
 func (r *CacheReader) Read(p []byte) (int, error) {

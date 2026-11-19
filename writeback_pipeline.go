@@ -287,6 +287,39 @@ func (lb *LiveBuffer) GetCurBytes() int64 {
 	return lb.curBytes
 }
 
+// RemoveRange releases any non-in-flight chunks intersecting [start, end) from the in-memory ring.
+func (lb *LiveBuffer) RemoveRange(start, end int64) {
+	if lb == nil || start >= end {
+		return
+	}
+
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	if len(lb.chunks) == 0 {
+		return
+	}
+
+	kept := make([]*pooledChunk, 0, len(lb.chunks))
+	for _, c := range lb.chunks {
+		if c == nil {
+			continue
+		}
+		cStart := c.offset
+		cEnd := c.offset + int64(c.length)
+		if cEnd > start && cStart < end && atomic.LoadInt32(&c.refCount) <= 1 {
+			lb.curBytes -= int64(c.length)
+			c.release()
+			continue
+		}
+		kept = append(kept, c)
+	}
+	if lb.curBytes < 0 {
+		lb.curBytes = 0
+	}
+	lb.chunks = kept
+}
+
 // Clear releases all chunks currently retained in LiveBuffer
 func (lb *LiveBuffer) Clear() {
 	if lb == nil {
@@ -526,6 +559,9 @@ func (wp *WritebackPipeline) storageConsumer() {
 				wp.state.DiskRangeSet.Add(writeOffset, writeOffset+int64(length))
 				if cm := wp.state.GetChunkManager(); cm != nil {
 					cm.CheckAndTriggerUploads()
+					if cm.IsRingBufferMode() {
+						cm.SignalBudget()
+					}
 				}
 			}
 		}

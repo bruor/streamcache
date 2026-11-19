@@ -387,10 +387,17 @@ func TestS3PrehydrationChainsBeforeRecomposeCompletes(t *testing.T) {
 	oldStorage := GlobalStorage
 	oldRegistry := GlobalRegistry
 	oldPM := GlobalPrehydrationManager
+	oldS3Index := GlobalS3Index
+	oldHealth := getGlobalStorageHealth()
 	defer func() {
-		if GlobalS3Index != nil {
+		if h := getGlobalStorageHealth(); h != nil && h != oldHealth {
+			h.Stop()
+		}
+		setGlobalStorageHealth(oldHealth)
+		if GlobalS3Index != nil && GlobalS3Index != oldS3Index {
 			GlobalS3Index.Stop()
 		}
+		GlobalS3Index = oldS3Index
 		GlobalConfig = oldConfig
 		GlobalStorage = oldStorage
 		GlobalRegistry = oldRegistry
@@ -487,15 +494,36 @@ func TestS3PrehydrationChainsBeforeRecomposeCompletes(t *testing.T) {
 		t.Fatalf("Timed out waiting for Recompose to start")
 	}
 
-	// While S3 Recompose is still blocked, next episode MUST already be queued and ep1 cleared from activePrehydrations
-	GlobalPrehydrationManager.mu.Lock()
-	stillActive := GlobalPrehydrationManager.activePrehydrations[key]
-	qLen := len(GlobalPrehydrationManager.queue)
+	// While S3 Recompose is still blocked, next episode MUST already be queued and ep1 cleared from activePrehydrations.
+	// Poll briefly because ScratchChunkManager's upload worker can enter delayed.Recompose asynchronously
+	// a moment before OnHydrationCompleted's isAssetCached S3 Stat roundtrip finishes enqueuing ep2.mkv.
+	deadline := time.Now().Add(2 * time.Second)
+	var stillActive bool
+	var qLen int
 	var queuedURL string
-	if qLen > 0 {
-		queuedURL = GlobalPrehydrationManager.queue[0].TargetURL
+	for {
+		GlobalPrehydrationManager.mu.Lock()
+		stillActive = GlobalPrehydrationManager.activePrehydrations[key]
+		qLen = len(GlobalPrehydrationManager.queue)
+		queuedURL = ""
+		if qLen > 0 {
+			queuedURL = GlobalPrehydrationManager.queue[0].TargetURL
+		}
+		GlobalPrehydrationManager.mu.Unlock()
+		if !stillActive && qLen == 1 && queuedURL == "http://origin.example.com/ep2.mkv" {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	GlobalPrehydrationManager.mu.Unlock()
+
+	select {
+	case <-commitDone:
+		t.Fatalf("Expected finalizeAndCommitCache to still be blocked in Recompose")
+	default:
+	}
 
 	if stillActive {
 		t.Errorf("Expected %s to be cleared from activePrehydrations before Recompose finishes", key)

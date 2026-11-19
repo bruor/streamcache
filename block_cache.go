@@ -119,7 +119,9 @@ type FileCacheState struct {
 	NextURLs             []string
 	DiskMaterialized     bool
 	LastProgressTimeNano int64            // Unix nano timestamp of last net-new unique byte added to RangeSet (atomic)
+	ringFloorOffset      int64            // Lowest un-punched byte offset for forward workers (atomic)
 	StalledGaps          map[int64]int64  // Map of [corruptStartOffset]readableGoodOffset for zero-fill synthesis
+	ClientOffsets        map[string]int64 // Per-client current/requested byte offsets guarded by Lock
 	coordMu              sync.Mutex
 	coordGen             uint64
 }
@@ -148,6 +150,7 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		Clients:                   make(map[string]chan struct{}),
 		Starving:                  make(map[string]int64),
 		StarvingSince:             make(map[string]time.Time),
+		ClientOffsets:             make(map[string]int64),
 		NotifyChan:                make(chan struct{}, 20),
 		UpstreamStatus:            "Idle",
 		PendingTailPrefetchOffset: -1,
@@ -169,35 +172,79 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 
 	switch mode {
 	case "s3":
-		targetTier = TierS3
-		useScratch = true
-		s3Target, chunkSize := resolveS3TargetBackend()
-		s.ChunkManager = NewScratchChunkManager(s, s3Target, chunkSize)
+		if !IsS3Healthy() {
+			targetTier = TierTmp
+			useScratch = true
+			s.ChunkManager = NewRingBufferScratchChunkManager(s)
+			log.Printf("[Admission] S3 circuit breaker open; routing %s (%d bytes) to TierTmp ring buffer", key, totalSize)
+		} else {
+			targetTier = TierS3
+			useScratch = true
+			s3Target, chunkSize := resolveS3TargetBackend()
+			s.ChunkManager = NewScratchChunkManager(s, s3Target, chunkSize)
+		}
 	case "tmp":
 		targetTier = TierTmp
-		useScratch = false
+		useScratch = true
+		s.ChunkManager = NewRingBufferScratchChunkManager(s)
 	case "hybrid":
-		admit := true
-		reason := ""
-		if GlobalRegistry != nil {
-			admit, reason = GlobalRegistry.CanAdmitToHybridL1(totalSize)
+		nasOK := IsNASHealthy() && (GlobalConfig == nil || GlobalConfig.UsesCacheDir())
+		s3OK := IsS3Healthy()
+		s3Target, chunkSize := resolveS3TargetBackend()
+		if s3Target == nil {
+			s3OK = false
 		}
-		if admit {
-			targetTier = TierDisk
-			s.TargetTier = targetTier
-			s.configureNASStagingTarget()
-			useScratch = s.UseScratchManager
-		} else {
-			s3Target, chunkSize := resolveS3TargetBackend()
-			if s3Target == nil {
-				targetTier = TierTmp
-				useScratch = false
+		switch {
+		case !nasOK && !s3OK:
+			targetTier = TierTmp
+			useScratch = true
+			s.ChunkManager = NewRingBufferScratchChunkManager(s)
+			log.Printf("[Admission] Both NAS and S3 unavailable; routing %s (%d bytes) to TierTmp ring buffer", key, totalSize)
+		case !nasOK && s3OK:
+			targetTier = TierS3
+			useScratch = true
+			s.ChunkManager = NewScratchChunkManager(s, s3Target, chunkSize)
+			log.Printf("[Admission] NAS circuit breaker open; bypassing L1 for %s (%d bytes -> TierS3)", key, totalSize)
+		case nasOK && !s3OK:
+			admit := true
+			reason := ""
+			if GlobalRegistry != nil {
+				admit, reason = GlobalRegistry.CanAdmitToDiskL1(totalSize)
+			}
+			if admit {
+				targetTier = TierDisk
+				s.TargetTier = targetTier
+				s.configureNASStagingTarget()
+				useScratch = s.UseScratchManager
+				log.Printf("[Admission] S3 circuit breaker open; caching %s (%d bytes) to L1 TierDisk", key, totalSize)
 			} else {
+				targetTier = TierTmp
+				useScratch = true
+				s.ChunkManager = NewRingBufferScratchChunkManager(s)
+				log.Printf("[Admission] S3 circuit open and L1 declined %s (%s); routing to TierTmp ring buffer", key, reason)
+			}
+		default:
+			admit := true
+			reason := ""
+			if GlobalRegistry != nil {
+				admit, reason = GlobalRegistry.CanAdmitToHybridL1(totalSize)
+			}
+			if admit {
+				targetTier = TierDisk
+				s.TargetTier = targetTier
+				s.configureNASStagingTarget()
+				useScratch = s.UseScratchManager
+			} else if s3Target != nil {
 				targetTier = TierS3
 				useScratch = true
 				s.ChunkManager = NewScratchChunkManager(s, s3Target, chunkSize)
+				log.Printf("[Admission] Bypassing hybrid L1 for %s (%d bytes -> %s): %s", key, totalSize, targetTier, reason)
+			} else {
+				targetTier = TierTmp
+				useScratch = true
+				s.ChunkManager = NewRingBufferScratchChunkManager(s)
+				log.Printf("[Admission] Bypassing hybrid L1 for %s (%d bytes -> TierTmp): %s", key, totalSize, reason)
 			}
-			log.Printf("[Admission] Bypassing hybrid L1 for %s (%d bytes -> %s): %s", key, totalSize, targetTier, reason)
 		}
 	default:
 		admit := true
@@ -207,7 +254,8 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		}
 		if !admit {
 			targetTier = TierTmp
-			useScratch = false
+			useScratch = true
+			s.ChunkManager = NewRingBufferScratchChunkManager(s)
 			log.Printf("[Admission] Bypassing L1 disk cache for %s (%d bytes -> TierTmp): %s", key, totalSize, reason)
 		} else {
 			targetTier = TierDisk
@@ -221,6 +269,166 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 	s.UseScratchManager = useScratch
 	s.Cond = sync.NewCond(&s.Lock)
 	return s
+}
+
+// GetRingFloorOffset returns the lowest byte offset that forward workers should still fill.
+func (s *FileCacheState) GetRingFloorOffset() int64 {
+	if s == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&s.ringFloorOffset)
+}
+
+// AdvanceRingFloorOffset atomically raises ringFloorOffset to at least floor.
+func (s *FileCacheState) AdvanceRingFloorOffset(floor int64) {
+	if s == nil || floor <= 0 {
+		return
+	}
+	for {
+		cur := atomic.LoadInt64(&s.ringFloorOffset)
+		if floor <= cur {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&s.ringFloorOffset, cur, floor) {
+			return
+		}
+	}
+}
+
+// LowerRingFloorOffset atomically lowers ringFloorOffset (e.g. on backward seek) to at most floor.
+func (s *FileCacheState) LowerRingFloorOffset(floor int64) {
+	if s == nil {
+		return
+	}
+	if floor < 0 {
+		floor = 0
+	}
+	for {
+		cur := atomic.LoadInt64(&s.ringFloorOffset)
+		if floor >= cur {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&s.ringFloorOffset, cur, floor) {
+			return
+		}
+	}
+}
+
+// SetTargetTier safely updates the active storage tier for this state.
+func (s *FileCacheState) SetTargetTier(tier StorageTier) {
+	if s == nil {
+		return
+	}
+	s.Lock.Lock()
+	s.TargetTier = tier
+	s.Lock.Unlock()
+}
+
+// SetClientOffset records a connected reader's active offset for ring-buffer punch protection.
+func (s *FileCacheState) SetClientOffset(clientID string, off int64) {
+	if s == nil || clientID == "" {
+		return
+	}
+	if off < 0 {
+		off = 0
+	}
+	s.Lock.Lock()
+	if s.ClientOffsets == nil {
+		s.ClientOffsets = make(map[string]int64)
+	}
+	s.ClientOffsets[clientID] = off
+	s.Lock.Unlock()
+}
+
+// RemoveClientOffset removes clientID's tracked read offset when the reader closes.
+func (s *FileCacheState) RemoveClientOffset(clientID string) {
+	if s == nil || clientID == "" {
+		return
+	}
+	s.Lock.Lock()
+	if s.ClientOffsets != nil {
+		delete(s.ClientOffsets, clientID)
+	}
+	s.Lock.Unlock()
+}
+
+// HasActiveClients reports whether at least one client reader or connection is currently attached.
+func (s *FileCacheState) HasActiveClients() bool {
+	if s == nil {
+		return false
+	}
+	s.Lock.Lock()
+	hasClients := len(s.Clients) > 0
+	key := s.Key
+	s.Lock.Unlock()
+	if hasClients {
+		return true
+	}
+	if reg := GlobalRegistry; reg != nil && key != "" {
+		reg.Lock.RLock()
+		for _, conn := range reg.Connections {
+			if conn != nil && conn.Key == key {
+				reg.Lock.RUnlock()
+				return true
+			}
+		}
+		reg.Lock.RUnlock()
+	}
+	return false
+}
+
+// GetReaderOffsetBounds returns the min/max and full slice of active reader offsets without nested locks.
+func (s *FileCacheState) GetReaderOffsetBounds() (minOff int64, maxOff int64, protectedOffsets []int64, hasReaders bool) {
+	if s == nil {
+		return 0, 0, nil, false
+	}
+	s.Lock.Lock()
+	key := s.Key
+	clientOffsetsCopy := make(map[string]int64, len(s.ClientOffsets))
+	for id, off := range s.ClientOffsets {
+		clientOffsetsCopy[id] = off
+		if !hasReaders || off < minOff {
+			minOff = off
+		}
+		if !hasReaders || off > maxOff {
+			maxOff = off
+		}
+		protectedOffsets = append(protectedOffsets, off)
+		hasReaders = true
+	}
+	for _, off := range s.Starving {
+		if !hasReaders || off < minOff {
+			minOff = off
+		}
+		if !hasReaders || off > maxOff {
+			maxOff = off
+		}
+		protectedOffsets = append(protectedOffsets, off)
+		hasReaders = true
+	}
+	s.Lock.Unlock()
+
+	if reg := GlobalRegistry; reg != nil && key != "" {
+		reg.Lock.RLock()
+		for _, conn := range reg.Connections {
+			if conn != nil && conn.Key == key {
+				if _, tracked := clientOffsetsCopy[conn.ID]; tracked {
+					continue
+				}
+				off := atomic.LoadInt64(&conn.Offset)
+				if !hasReaders || off < minOff {
+					minOff = off
+				}
+				if !hasReaders || off > maxOff {
+					maxOff = off
+				}
+				protectedOffsets = append(protectedOffsets, off)
+				hasReaders = true
+			}
+		}
+		reg.Lock.RUnlock()
+	}
+	return minOff, maxOff, protectedOffsets, hasReaders
 }
 
 func resolveS3TargetBackend() (StorageBackend, int64) {
@@ -483,8 +691,8 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 		_ = file.Truncate(totalSize)
 	}
 
-	// Save initial sparse metadata atomically only for persistent TierDisk entries.
-	if s.targetTierLocked() == TierDisk && metaPath != "" && (GlobalConfig == nil || GlobalConfig.UsesCacheDir()) {
+	// Save initial sparse metadata atomically only for healthy persistent TierDisk entries.
+	if s.targetTierLocked() == TierDisk && IsNASHealthy() && metaPath != "" && (GlobalConfig == nil || GlobalConfig.UsesCacheDir()) {
 		meta := FileMeta{
 			URL:           url,
 			TotalSize:     totalSize,
@@ -607,6 +815,11 @@ func InitRegistry() {
 		GlobalRegistry.Stop()
 	}
 
+	if h := getGlobalStorageHealth(); h != nil {
+		h.Stop()
+		setGlobalStorageHealth(nil)
+	}
+
 	if d := getGlobalHybridDemoter(); d != nil {
 		d.Stop()
 		setGlobalHybridDemoter(nil)
@@ -697,6 +910,12 @@ func InitRegistry() {
 		if tb, ok := GlobalStorage.(*TieredStorageBackend); ok {
 			setGlobalHybridDemoter(NewHybridDemoter(tb, idx, GlobalRegistry, cfg))
 		}
+	}
+
+	if cfg != nil {
+		hm := NewStorageHealthMonitor(cfg, GlobalStorage)
+		setGlobalStorageHealth(hm)
+		hm.Start()
 	}
 }
 
@@ -872,13 +1091,15 @@ func (r *CacheRegistry) startDiskFreeMonitor(cfg *Config) {
 			if usesCacheDir {
 				diskDir = cfg.GetCacheDir()
 			}
-			space, err := GetDiskFreeSpace(diskDir)
-			if err == nil {
-				atomic.StoreUint64(&GlobalDiskFreeBytes, space)
-				if usesCacheDir {
-					minFree := EffectiveCacheMinDiskFreeBytes(cfg, GetStorageTopology())
-					if minFree > 0 && space < uint64(minFree) {
-						r.PreEvict(0)
+			if !(usesCacheDir && !IsNASHealthy()) {
+				space, err := GetDiskFreeSpace(diskDir)
+				if err == nil {
+					atomic.StoreUint64(&GlobalDiskFreeBytes, space)
+					if usesCacheDir {
+						minFree := EffectiveCacheMinDiskFreeBytes(cfg, GetStorageTopology())
+						if minFree > 0 && space < uint64(minFree) {
+							r.PreEvict(0)
+						}
 					}
 				}
 			}
@@ -1501,6 +1722,9 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 	if !GlobalConfig.UsesCacheDir() {
 		return false, "cache_dir_disabled"
 	}
+	if !IsNASHealthy() {
+		return false, "nas_circuit_open"
+	}
 	if totalSize <= 0 {
 		if !allowEviction {
 			return false, "unknown_size_bypass"
@@ -1897,8 +2121,8 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 		}
 
 		// In hybrid mode, attempt to preserve un-backed L1 assets by uploading to S3 before deleting locally.
-		// If S3 is unreachable during emergency PreEvict, log and STILL remove local file to prevent disk deadlock.
-		if !file.AlreadyOnS3 && tieredStorage != nil && tieredStorage.S3() != nil {
+		// If S3 is unreachable (or circuit already open) during emergency PreEvict, log and STILL remove local file to prevent disk deadlock.
+		if !file.AlreadyOnS3 && tieredStorage != nil && tieredStorage.S3() != nil && IsS3Healthy() {
 			if _, existsInS3, s3Err := tieredStorage.S3().Stat(ctx, baseKey); s3Err == nil && existsInS3 {
 				if idx != nil {
 					idx.MarkAddedToTier(baseKey, IndexTierS3)

@@ -29,10 +29,14 @@ func saveAndRestorePhase1Globals(t *testing.T) {
 	oldCacheIdx := GlobalCacheIndex
 	oldS3Idx := GlobalS3Index
 	oldDemoter := getGlobalHybridDemoter()
+	oldHealth := getGlobalStorageHealth()
 	oldPM := GlobalPrehydrationManager
 	oldTopo := GetStorageTopology()
 
 	t.Cleanup(func() {
+		if h := getGlobalStorageHealth(); h != nil && h != oldHealth {
+			h.Stop()
+		}
 		if d := getGlobalHybridDemoter(); d != nil && d != oldDemoter {
 			d.Stop()
 		}
@@ -54,6 +58,7 @@ func saveAndRestorePhase1Globals(t *testing.T) {
 		GlobalCacheIndex = oldCacheIdx
 		GlobalS3Index = oldS3Idx
 		setGlobalHybridDemoter(oldDemoter)
+		setGlobalStorageHealth(oldHealth)
 		GlobalPrehydrationManager = oldPM
 		SetStorageTopology(oldTopo)
 	})
@@ -451,6 +456,9 @@ func TestPhase1TmpAndS3ModesSkipCacheDirAndMetadata(t *testing.T) {
 	if !waitForPhase1Condition(3*time.Second, func() bool { return !FileExists(tmpPart) }) {
 		t.Errorf("Expected %s to be deleted after tmp stream completion/close", tmpPart)
 	}
+	// Drain all Part A HTTP handler goroutines (including deferred CacheReader.Close)
+	// before Part B reassigns GlobalConfig and GlobalStorage.
+	proxySrv.Close()
 
 	// --- Part B: S3 mode does NOT create CACHE_DIR, migrates legacy s3_index.json -> STATE_DIR ---
 	rootS3 := t.TempDir()

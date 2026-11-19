@@ -553,19 +553,29 @@ func (idx *CacheIndex) Reconcile(ctx context.Context, storage StorageBackend) er
 
 	switch b := storage.(type) {
 	case *TieredStorageBackend:
+		if b.Local() != nil && !IsNASHealthy() {
+			return ErrStorageCircuitOpen
+		}
+		if b.S3() != nil && !IsS3Healthy() {
+			return ErrStorageCircuitOpen
+		}
 		var localObjs, s3Objs []StorageObjectInfo
 		var err error
 		if b.Local() != nil {
 			localObjs, err = b.Local().List(ctx)
 			if err != nil {
+				RecordNASFailure(err)
 				return err
 			}
+			RecordNASSuccess()
 		}
 		if b.S3() != nil {
 			s3Objs, err = b.S3().List(ctx)
 			if err != nil {
+				RecordS3Failure(err)
 				return err
 			}
+			RecordS3Success()
 		}
 		for _, obj := range localObjs {
 			var lm *FileMeta
@@ -595,10 +605,15 @@ func (idx *CacheIndex) Reconcile(ctx context.Context, storage StorageBackend) er
 		}
 
 	case *LocalStorageBackend:
+		if !IsNASHealthy() {
+			return ErrStorageCircuitOpen
+		}
 		objs, err := b.List(ctx)
 		if err != nil {
+			RecordNASFailure(err)
 			return err
 		}
+		RecordNASSuccess()
 		for _, obj := range objs {
 			var lm *FileMeta
 			if m, _, ok, serr := b.StatWithTier(ctx, obj.Key); serr == nil && ok {
@@ -613,10 +628,15 @@ func (idx *CacheIndex) Reconcile(ctx context.Context, storage StorageBackend) er
 		}
 
 	default:
+		if !IsS3Healthy() {
+			return ErrStorageCircuitOpen
+		}
 		objs, err := storage.List(ctx)
 		if err != nil {
+			RecordS3Failure(err)
 			return err
 		}
+		RecordS3Success()
 		for _, obj := range objs {
 			live[obj.Key] = &observedEntry{
 				size:    obj.Size,

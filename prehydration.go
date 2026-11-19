@@ -251,11 +251,65 @@ func (pm *PrehydrationManager) pollLoop() {
 	}
 }
 
+// NotifyStorageRecovered wakes the prehydration scheduler when an offline storage tier recovers.
+func (pm *PrehydrationManager) NotifyStorageRecovered() {
+	if pm == nil || pm.notifyCh == nil {
+		return
+	}
+	select {
+	case pm.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
+// PauseForStorageOutage yields any active background prehydrations when no persistent tier is healthy.
+func (pm *PrehydrationManager) PauseForStorageOutage() {
+	pm.PauseForStorageOutageWith(GlobalConfig, GlobalStorage, GlobalRegistry)
+}
+
+// PauseForStorageOutageWith yields active background prehydrations using caller-captured references.
+func (pm *PrehydrationManager) PauseForStorageOutageWith(cfg *Config, storage StorageBackend, reg *CacheRegistry) {
+	if pm == nil || HasHealthyPersistentTier(cfg, storage) {
+		return
+	}
+	pm.mu.RLock()
+	activeKeys := make([]string, 0, len(pm.activePrehydrations))
+	for k := range pm.activePrehydrations {
+		activeKeys = append(activeKeys, k)
+	}
+	pm.mu.RUnlock()
+
+	if len(activeKeys) == 0 || reg == nil {
+		return
+	}
+
+	var states []*FileCacheState
+	reg.Lock.RLock()
+	for _, k := range activeKeys {
+		if fs, ok := reg.Files[k]; ok && fs != nil {
+			states = append(states, fs)
+		}
+	}
+	reg.Lock.RUnlock()
+
+	for _, fs := range states {
+		fs.Lock.Lock()
+		isPre := fs.IsPrehydrating && !fs.IsYielding && len(fs.Clients) == 0
+		fs.Lock.Unlock()
+		if isPre {
+			pm.YieldState(fs, "Storage outage circuit breaker open")
+		}
+	}
+}
+
 // CanStartPrehydration determines if spare capacity exists to launch a new prehydration worker.
 // Requires effective available streams >= PREHYDRATE_CAPACITY_RESERVATION + 1 so that after claiming 1 slot,
 // at least PREHYDRATE_CAPACITY_RESERVATION slots remain free for live viewers.
 func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
-	if GlobalConfig != nil && (!GlobalConfig.GetEnableEpisodePrehydration() || GlobalConfig.EffectiveStorageBackend() == "tmp") {
+	if GlobalConfig != nil && !GlobalConfig.GetEnableEpisodePrehydration() {
+		return false
+	}
+	if !HasHealthyPersistentTier(GlobalConfig, GlobalStorage) {
 		return false
 	}
 
@@ -755,7 +809,7 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 	if pm == nil || state == nil {
 		return
 	}
-	if state.GetTargetTier() == TierTmp || (GlobalConfig != nil && GlobalConfig.EffectiveStorageBackend() == "tmp") {
+	if state.GetTargetTier() == TierTmp || (GlobalConfig != nil && GlobalConfig.EffectiveStorageBackend() == "tmp") || !HasHealthyPersistentTier(GlobalConfig, GlobalStorage) {
 		return
 	}
 
@@ -788,12 +842,19 @@ func (pm *PrehydrationManager) OnDownshift(state *FileCacheState) {
 // isAssetCached checks whether a completed copy already exists in the configured storage backend (local disk or S3).
 func isAssetCached(ctx context.Context, cacheFileName, cacheFilePath string) bool {
 	if GlobalStorage != nil {
+		mode := GlobalStorage.Type()
+		if (mode == "disk" && !IsNASHealthy()) || (mode == "s3" && !IsS3Healthy()) || (mode == "hybrid" && !IsNASHealthy() && !IsS3Healthy()) {
+			return false
+		}
 		_, exists, err := GlobalStorage.Stat(ctx, cacheFileName)
 		if err != nil {
 			log.Printf("[Prehydration] Storage Stat error for %s: %v", cacheFileName, err)
 			return false
 		}
 		return exists
+	}
+	if !IsNASHealthy() {
+		return false
 	}
 	return FileExists(cacheFilePath)
 }

@@ -310,11 +310,16 @@ func (t *NASStagingTarget) ReadCommittedChunk(ctx context.Context, key string, c
 func (t *NASStagingTarget) Cleanup(ctx context.Context, key string) error {
 	t.mu.Lock()
 	t.closed = true
-	if t.stagingFile != nil {
-		_ = t.stagingFile.Close()
-		t.stagingFile = nil
-	}
+	f := t.stagingFile
+	t.stagingFile = nil
 	t.mu.Unlock()
+
+	if !IsNASHealthy() {
+		return ErrStorageCircuitOpen
+	}
+	if f != nil {
+		_ = f.Close()
+	}
 
 	err := os.Remove(t.stagingPath)
 	if err != nil && !os.IsNotExist(err) {

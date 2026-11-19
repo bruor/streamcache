@@ -175,6 +175,9 @@ func (d *HybridDemoter) runEagerBackupKey(ctx context.Context, key string) {
 	if key == "" || d.storage == nil || d.storage.Local() == nil || d.storage.S3() == nil {
 		return
 	}
+	if !IsNASHealthy() || !IsS3Healthy() {
+		return
+	}
 	if d.index != nil {
 		if tier := d.index.GetTier(key); tier == IndexTierBoth || tier == IndexTierS3 {
 			return
@@ -191,9 +194,11 @@ func (d *HybridDemoter) runEagerBackupKey(ctx context.Context, key string) {
 	}
 
 	if err := d.storage.S3().UploadFromFile(ctx, key, localPath, *localMeta); err != nil {
+		RecordS3Failure(err)
 		log.Printf("[HybridDemoter] Eager S3 backup failed for %s (L1 retained): %v", key, err)
 		return
 	}
+	RecordS3Success()
 
 	if d.index != nil {
 		if _, exists := d.index.Get(key); !exists {
@@ -219,6 +224,9 @@ type demoteCandidate struct {
 func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error) {
 	if d == nil || d.storage == nil || d.storage.Local() == nil || d.storage.S3() == nil || d.cfg == nil {
 		return 0, 0, nil
+	}
+	if !IsNASHealthy() || !IsS3Healthy() {
+		return 0, 0, ErrStorageCircuitOpen
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -337,9 +345,11 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 				continue
 			}
 			if uploadErr := d.storage.S3().UploadFromFile(ctx, cand.Key, localPath, *localMeta); uploadErr != nil {
+				RecordS3Failure(uploadErr)
 				log.Printf("[HybridDemoter] S3 upload failed for %s during demotion; preserving local L1 copy: %v", cand.Key, uploadErr)
 				return demoted, freed, uploadErr
 			}
+			RecordS3Success()
 			if d.index != nil {
 				if _, exists := d.index.Get(cand.Key); !exists {
 					d.index.RecordCommitForTier(cand.Key, *localMeta, IndexTierBoth)

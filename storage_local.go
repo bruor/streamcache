@@ -62,6 +62,7 @@ func (b *LocalStorageBackend) StatWithTier(ctx context.Context, key string) (*Fi
 		if os.IsNotExist(err) {
 			return nil, "", false, nil
 		}
+		RecordNASFailure(err)
 		return nil, "", false, err
 	}
 
@@ -127,11 +128,15 @@ func (b *LocalStorageBackend) Open(ctx context.Context, key string) (StorageRead
 
 	f, err := os.Open(filePath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			RecordNASFailure(err)
+		}
 		return nil, err
 	}
 
 	info, err := f.Stat()
 	if err != nil {
+		RecordNASFailure(err)
 		_ = f.Close()
 		return nil, err
 	}
@@ -166,11 +171,15 @@ func (b *LocalStorageBackend) OpenRange(ctx context.Context, key string, offset,
 
 	f, err := os.Open(filePath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			RecordNASFailure(err)
+		}
 		return nil, err
 	}
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			RecordNASFailure(err)
 			_ = f.Close()
 			return nil, err
 		}

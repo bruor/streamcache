@@ -271,6 +271,53 @@ func (rs *RangeSet) Clone() []ByteRange {
 	return out
 }
 
+// Remove deletes any covered bytes intersecting [start, end) and returns the net bytes removed.
+func (rs *RangeSet) Remove(start, end int64) int64 {
+	if rs == nil || start >= end {
+		return 0
+	}
+	if start < 0 {
+		start = 0
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if len(rs.ranges) == 0 {
+		return 0
+	}
+
+	var removed int64
+	updated := make([]ByteRange, 0, len(rs.ranges))
+	for _, r := range rs.ranges {
+		if r.End <= start || r.Start >= end {
+			updated = append(updated, r)
+			continue
+		}
+		if r.Start < start && r.End > end {
+			updated = append(updated, ByteRange{Start: r.Start, End: start})
+			updated = append(updated, ByteRange{Start: end, End: r.End})
+			removed += end - start
+			continue
+		}
+		if r.Start >= start && r.End <= end {
+			removed += r.End - r.Start
+			continue
+		}
+		if r.Start < start && r.End > start {
+			removed += r.End - start
+			updated = append(updated, ByteRange{Start: r.Start, End: start})
+			continue
+		}
+		if r.Start < end && r.End > end {
+			removed += end - r.Start
+			updated = append(updated, ByteRange{Start: end, End: r.End})
+		}
+	}
+	rs.ranges = updated
+	return removed
+}
+
 // Clear removes all ranges
 func (rs *RangeSet) Clear() {
 	rs.mu.Lock()

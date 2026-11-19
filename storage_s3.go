@@ -159,6 +159,41 @@ func (b *S3StorageBackend) Stat(ctx context.Context, key string) (*FileMeta, boo
 	return meta, exists, err
 }
 
+func isS3NotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nfe *types.NoSuchKey
+	var notFound *types.NotFound
+	return errors.As(err, &nfe) || errors.As(err, &notFound) ||
+		strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NotFound")
+}
+
+func recordS3Outcome(err error) error {
+	if err != nil {
+		RecordS3Failure(err)
+		return err
+	}
+	RecordS3Success()
+	return nil
+}
+
+// Ping executes a lightweight ListObjectsV2 check to verify S3 reachability and update circuit state.
+func (b *S3StorageBackend) Ping(ctx context.Context) error {
+	if b == nil || b.client == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(b.bucket),
+		Prefix:  aws.String("vod/"),
+		MaxKeys: aws.Int32(1),
+	})
+	return recordS3Outcome(err)
+}
+
 func (b *S3StorageBackend) StatWithTier(ctx context.Context, key string) (*FileMeta, StorageTier, bool, error) {
 	targetKey := b.monolithicKey(key)
 	resp, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -166,13 +201,14 @@ func (b *S3StorageBackend) StatWithTier(ctx context.Context, key string) (*FileM
 		Key:    aws.String(targetKey),
 	})
 	if err != nil {
-		var nfe *types.NoSuchKey
-		var notFound *types.NotFound
-		if errors.As(err, &nfe) || errors.As(err, &notFound) || strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NotFound") {
+		if isS3NotFoundError(err) {
+			RecordS3Success()
 			return nil, "", false, nil
 		}
+		RecordS3Failure(err)
 		return nil, "", false, err
 	}
+	RecordS3Success()
 
 	meta := b.mapToMeta(resp.Metadata)
 	if meta.TotalSize == 0 && resp.ContentLength != nil {
@@ -306,14 +342,15 @@ func (r *s3ReadSeeker) fetchWindowLocked(off, toRead int64) error {
 		Range:  aws.String(rangeHeader),
 	})
 	if err != nil {
-		return err
+		return recordS3Outcome(err)
 	}
 	defer resp.Body.Close()
 
 	buf, err := io.ReadAll(resp.Body)
 	if err != nil && err != io.EOF {
-		return err
+		return recordS3Outcome(err)
 	}
+	RecordS3Success()
 
 	r.buf = buf
 	r.bufOffset = off
@@ -447,8 +484,9 @@ func (b *S3StorageBackend) OpenRange(ctx context.Context, key string, offset, le
 		Range:  aws.String(rangeHeader),
 	})
 	if err != nil {
-		return nil, err
+		return nil, recordS3Outcome(err)
 	}
+	RecordS3Success()
 	return resp.Body, nil
 }
 
@@ -459,13 +497,14 @@ func (b *S3StorageBackend) HasChunk(ctx context.Context, key string, chunkIndex 
 		Key:    aws.String(chunkKey),
 	})
 	if err != nil {
-		var nfe *types.NoSuchKey
-		var notFound *types.NotFound
-		if errors.As(err, &nfe) || errors.As(err, &notFound) || strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NotFound") {
+		if isS3NotFoundError(err) {
+			RecordS3Success()
 			return false, nil
 		}
+		RecordS3Failure(err)
 		return false, err
 	}
+	RecordS3Success()
 	return true, nil
 }
 
@@ -488,8 +527,9 @@ func (b *S3StorageBackend) OpenChunkRange(ctx context.Context, key string, chunk
 
 	resp, err := b.client.GetObject(ctx, input)
 	if err != nil {
-		return nil, err
+		return nil, recordS3Outcome(err)
 	}
+	RecordS3Success()
 	return resp.Body, nil
 }
 
@@ -538,7 +578,7 @@ func (b *S3StorageBackend) UploadChunk(ctx context.Context, key string, chunkInd
 		Body:          body,
 		ContentLength: aws.Int64(size),
 	})
-	return err
+	return recordS3Outcome(err)
 }
 
 func (b *S3StorageBackend) Recompose(ctx context.Context, key string, totalParts int, meta FileMeta) error {
@@ -549,6 +589,10 @@ func (b *S3StorageBackend) RecomposeWithProgress(ctx context.Context, key string
 	if totalParts <= 0 {
 		return errors.New("cannot recompose with 0 parts")
 	}
+	return recordS3Outcome(b.recomposeWithProgressInner(ctx, key, totalParts, meta, onProgress))
+}
+
+func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key string, totalParts int, meta FileMeta, onProgress CommitProgressFunc) error {
 
 	report := func(stage string, done, total int) {
 		if onProgress != nil {
@@ -748,12 +792,6 @@ func (b *S3StorageBackend) UploadFromFile(ctx context.Context, key string, fileP
 
 // UploadFromFileWithProgress streams filePath directly to vod/<key> while reporting CommitProgress updates.
 func (b *S3StorageBackend) UploadFromFileWithProgress(ctx context.Context, key string, filePath string, meta FileMeta, onProgress CommitProgressFunc) error {
-	report := func(stage string, done, total int) {
-		if onProgress != nil {
-			onProgress(stage, done, total)
-		}
-	}
-
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -765,7 +803,16 @@ func (b *S3StorageBackend) UploadFromFileWithProgress(ctx context.Context, key s
 		return err
 	}
 
-	fileSize := stat.Size()
+	return recordS3Outcome(b.uploadFileWithProgressInner(ctx, key, f, stat.Size(), meta, onProgress))
+}
+
+func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key string, f *os.File, fileSize int64, meta FileMeta, onProgress CommitProgressFunc) error {
+	report := func(stage string, done, total int) {
+		if onProgress != nil {
+			onProgress(stage, done, total)
+		}
+	}
+
 	targetKey := b.monolithicKey(key)
 	meta.Completed = true
 	meta.TotalSize = fileSize
@@ -780,7 +827,7 @@ func (b *S3StorageBackend) UploadFromFileWithProgress(ctx context.Context, key s
 	}
 	if !isMultipart || fileSize == 0 || partSize <= 0 || totalParts <= 1 {
 		report("uploading", 0, 1)
-		_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
+		_, err := b.client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:        aws.String(b.bucket),
 			Key:           aws.String(targetKey),
 			Body:          f,
@@ -993,6 +1040,9 @@ func (b *S3StorageBackend) DeleteChunks(ctx context.Context, key string) error {
 	if key == "" {
 		return nil
 	}
+	if !IsS3Healthy() {
+		return ErrStorageCircuitOpen
+	}
 	prefix := fmt.Sprintf("chunks/%s/", key)
 	paginator := s3.NewListObjectsV2Paginator(b.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(b.bucket),
@@ -1021,6 +1071,9 @@ func (b *S3StorageBackend) DeleteChunks(ctx context.Context, key string) error {
 func (b *S3StorageBackend) SweepStaleChunks(ctx context.Context, maxAge time.Duration) (int, error) {
 	if maxAge <= 0 {
 		maxAge = 24 * time.Hour
+	}
+	if !IsS3Healthy() {
+		return 0, ErrStorageCircuitOpen
 	}
 
 	const prefix = "chunks/"

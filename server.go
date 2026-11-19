@@ -188,21 +188,27 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	var cacheMeta *FileMeta
 	var hitTier StorageTier
 	if GlobalStorage != nil {
-		if tsb, ok := GlobalStorage.(TieredStatBackend); ok {
-			if meta, tier, exists, err := tsb.StatWithTier(r.Context(), cacheFileName); err != nil {
+		storageMode := GlobalStorage.Type()
+		skipStat := (storageMode == "disk" && !IsNASHealthy()) ||
+			(storageMode == "s3" && !IsS3Healthy()) ||
+			(storageMode == "hybrid" && !IsNASHealthy() && !IsS3Healthy())
+		if !skipStat {
+			if tsb, ok := GlobalStorage.(TieredStatBackend); ok {
+				if meta, tier, exists, err := tsb.StatWithTier(r.Context(), cacheFileName); err != nil {
+					log.Printf("[Server] Storage Stat error for %s: %v (falling back to hydration check)", cacheFileName, err)
+				} else if exists {
+					cacheHit = true
+					cacheMeta = meta
+					hitTier = tier
+				}
+			} else if meta, exists, err := GlobalStorage.Stat(r.Context(), cacheFileName); err != nil {
 				log.Printf("[Server] Storage Stat error for %s: %v (falling back to hydration check)", cacheFileName, err)
 			} else if exists {
 				cacheHit = true
 				cacheMeta = meta
-				hitTier = tier
 			}
-		} else if meta, exists, err := GlobalStorage.Stat(r.Context(), cacheFileName); err != nil {
-			log.Printf("[Server] Storage Stat error for %s: %v (falling back to hydration check)", cacheFileName, err)
-		} else if exists {
-			cacheHit = true
-			cacheMeta = meta
 		}
-	} else if cacheFilePath != "" && FileExists(cacheFilePath) {
+	} else if cacheFilePath != "" && IsNASHealthy() && FileExists(cacheFilePath) {
 		cacheHit = true
 		hitTier = TierDisk
 	}

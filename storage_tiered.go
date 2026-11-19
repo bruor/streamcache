@@ -48,15 +48,20 @@ func (b *TieredStorageBackend) Stat(ctx context.Context, key string) (*FileMeta,
 
 func (b *TieredStorageBackend) StatWithTier(ctx context.Context, key string) (*FileMeta, StorageTier, bool, error) {
 	var localErr error
-	if b.local != nil {
+	if b.local != nil && IsNASHealthy() {
 		meta, tier, exists, err := b.local.StatWithTier(ctx, key)
-		if err == nil && exists {
-			return meta, tier, true, nil
+		if err == nil {
+			RecordNASSuccess()
+			if exists {
+				return meta, tier, true, nil
+			}
+		} else {
+			RecordNASFailure(err)
+			localErr = err
 		}
-		localErr = err
 	}
 
-	if b.s3 != nil {
+	if b.s3 != nil && IsS3Healthy() {
 		meta, tier, exists, err := b.s3.StatWithTier(ctx, key)
 		if err == nil && exists {
 			return meta, tier, true, nil
@@ -79,47 +84,72 @@ func (b *TieredStorageBackend) OpenWithMeta(ctx context.Context, key string, met
 		if b.s3 == nil {
 			return nil, os.ErrNotExist
 		}
+		if !IsS3Healthy() {
+			return nil, ErrStorageCircuitOpen
+		}
 		return b.s3.OpenWithMeta(ctx, key, meta, TierS3)
 	case TierDisk:
-		if b.local != nil {
+		if b.local != nil && IsNASHealthy() {
 			r, err := b.local.Open(ctx, key)
 			if err == nil {
+				RecordNASSuccess()
 				return r, nil
 			}
-			if os.IsNotExist(err) && b.s3 != nil {
+			if !os.IsNotExist(err) {
+				RecordNASFailure(err)
+			}
+			if b.s3 != nil && IsS3Healthy() {
 				return b.s3.Open(ctx, key)
 			}
 			return nil, err
 		}
-		if b.s3 != nil {
+		if b.s3 != nil && IsS3Healthy() {
 			return b.s3.Open(ctx, key)
+		}
+		if !IsNASHealthy() {
+			return nil, ErrStorageCircuitOpen
 		}
 		return nil, os.ErrNotExist
 	default:
-		if b.local != nil {
-			if r, err := b.local.Open(ctx, key); err == nil {
+		if b.local != nil && IsNASHealthy() {
+			r, err := b.local.Open(ctx, key)
+			if err == nil {
+				RecordNASSuccess()
 				return r, nil
 			}
+			if !os.IsNotExist(err) {
+				RecordNASFailure(err)
+			}
 		}
-		if b.s3 != nil {
+		if b.s3 != nil && IsS3Healthy() {
 			return b.s3.OpenWithMeta(ctx, key, meta, TierS3)
+		}
+		if (b.local != nil && !IsNASHealthy()) || (b.s3 != nil && !IsS3Healthy()) {
+			return nil, ErrStorageCircuitOpen
 		}
 		return nil, os.ErrNotExist
 	}
 }
 
 func (b *TieredStorageBackend) OpenRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
-	if b.local != nil {
+	if b.local != nil && IsNASHealthy() {
 		rc, err := b.local.OpenRange(ctx, key, offset, length)
 		if err == nil {
+			RecordNASSuccess()
 			return rc, nil
 		}
-		if !os.IsNotExist(err) || b.s3 == nil {
+		if !os.IsNotExist(err) {
+			RecordNASFailure(err)
+		}
+		if b.s3 == nil || !IsS3Healthy() {
 			return nil, err
 		}
 	}
-	if b.s3 != nil {
+	if b.s3 != nil && IsS3Healthy() {
 		return b.s3.OpenRange(ctx, key, offset, length)
+	}
+	if (b.local != nil && !IsNASHealthy()) || (b.s3 != nil && !IsS3Healthy()) {
+		return nil, ErrStorageCircuitOpen
 	}
 	return nil, os.ErrNotExist
 }

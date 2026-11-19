@@ -269,9 +269,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 	state.Lock.Unlock()
 
 	workerIdGen := 0
+	var workersWg sync.WaitGroup
 
 	defer func() {
 		parentCancel()
+		workersWg.Wait()
 		state.Lock.Lock()
 		isCurrentGen := state.coordGen == myGen
 		if isCurrentGen {
@@ -345,20 +347,27 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			if shouldSuspendToYield && pm != nil {
 				pm.YieldState(state, "Coordinator exited before completion; suspended for retry")
 			} else if shouldCleanUpIncomplete {
-				GlobalRegistry.Lock.Lock()
-				existingState, exists := GlobalRegistry.Files[state.Key]
-				if exists && (existingState == state || existingState == nil) {
-					delete(GlobalRegistry.Files, state.Key)
-					GlobalRegistry.Lock.Unlock()
+				shouldDeleteReg := false
+				GlobalRegistry.Lock.RLock()
+				if existingState, exists := GlobalRegistry.Files[state.Key]; exists && (existingState == state || existingState == nil) {
+					shouldDeleteReg = true
+				}
+				GlobalRegistry.Lock.RUnlock()
+
+				if shouldDeleteReg {
 					releaseAccountedCacheBytes(state)
 					_ = os.Remove(state.PartPath)
 					if state.MetaPath != "" {
 						_ = os.Remove(state.MetaPath)
 					}
 					triggerAsyncTargetCleanup(cmToClose, GlobalStorage, state.Key, "[Coord]")
-					log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
-				} else {
+
+					GlobalRegistry.Lock.Lock()
+					if cur, exists := GlobalRegistry.Files[state.Key]; exists && (cur == state || cur == nil) {
+						delete(GlobalRegistry.Files, state.Key)
+					}
 					GlobalRegistry.Lock.Unlock()
+					log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
 				}
 			}
 		}
@@ -440,7 +449,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 		}
 
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
-		go runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
+		workersWg.Add(1)
+		go func() {
+			defer workersWg.Done()
+			runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
+		}()
 	}
 
 	spawnTailPrefetchWorker := func(startOffset int64) {
@@ -480,7 +493,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 		}
 
 		state.ActiveWorkers = append(state.ActiveWorkers, w)
-		go runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
+		workersWg.Add(1)
+		go func() {
+			defer workersWg.Done()
+			runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
+		}()
 	}
 
 	// Initial scan to start worker(s)
@@ -492,16 +509,18 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			break
 		}
 	}
-	if initialTargetOffset == -1 {
-		gapStart, _, found := state.RangeSet.FindNextGap(0, state.TotalSize)
-		if found {
-			initialTargetOffset = gapStart
-		}
-	}
 	state.Lock.Unlock()
 
 	if initialTargetOffset != -1 {
+		if initialTargetOffset < state.GetRingFloorOffset() {
+			state.LowerRingFloorOffset(initialTargetOffset)
+		}
 		spawnWorker(initialTargetOffset)
+	} else {
+		gapStart, _, found := state.RangeSet.FindNextGap(state.GetRingFloorOffset(), state.TotalSize)
+		if found {
+			spawnWorker(gapStart)
+		}
 	}
 
 	consecutiveStallBreakouts := 0
@@ -523,9 +542,19 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			sniffAndSchedulePrefetch(state, file)
 		}
 
-		// Check if fully completed
+		// Check if fully completed (or all ranges from ringFloorOffset to TotalSize completed in ring-buffer mode)
 		if state.RangeSet.IsComplete(state.TotalSize) {
 			break
+		}
+		if state.GetRingFloorOffset() > 0 && state.GetTargetTier() == TierTmp {
+			if _, _, found := state.RangeSet.FindNextGap(state.GetRingFloorOffset(), state.TotalSize); !found {
+				state.WorkersLock.Lock()
+				activeCnt := len(state.ActiveWorkers)
+				state.WorkersLock.Unlock()
+				if activeCnt == 0 {
+					break
+				}
+			}
 		}
 
 		// Keep-alive check: if no workers are running, start one at first gap
@@ -544,8 +573,12 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			}
 			state.Lock.Unlock()
 
-			if keepAliveTarget == -1 {
-				gapStart, _, found := state.RangeSet.FindNextGap(0, state.TotalSize)
+			if keepAliveTarget != -1 {
+				if keepAliveTarget < state.GetRingFloorOffset() {
+					state.LowerRingFloorOffset(keepAliveTarget)
+				}
+			} else {
+				gapStart, _, found := state.RangeSet.FindNextGap(state.GetRingFloorOffset(), state.TotalSize)
 				if found {
 					keepAliveTarget = gapStart
 				}
@@ -788,6 +821,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 				maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
 				if activeCount < maxWorkers {
 					state.WorkersLock.Unlock()
+					if sb < state.GetRingFloorOffset() {
+						state.LowerRingFloorOffset(sb)
+					}
 					log.Printf("[Coord] Spawning new worker starting at starving offset %d (Active: %d/%d)", sb, activeCount+1, maxWorkers)
 					spawnWorker(sb)
 					continue
@@ -863,6 +899,9 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 					}
 					state.Lock.Unlock()
 
+					if sb < state.GetRingFloorOffset() {
+						state.LowerRingFloorOffset(sb)
+					}
 					spawnWorker(sb)
 				} else {
 					state.WorkersLock.Unlock()
@@ -1214,7 +1253,9 @@ func runDownloadWorker(
 				atomic.StoreInt64(&state.LastProgressTimeNano, time.Now().UnixNano())
 			}
 			if cm != nil {
-				cm.AddInFlightBytes(int64(n))
+				if newMediaBytes > 0 {
+					cm.AddInFlightBytes(newMediaBytes)
+				}
 				cm.CheckAndTriggerUploads()
 			}
 
@@ -1229,8 +1270,12 @@ func runDownloadWorker(
 				sniffAndSchedulePrefetch(state, file)
 			}
 
-			// If cumulative downloaded bytes in memory cross 32MB without being materialized yet, materialize to disk
-			if !state.IsDiskMaterialized() && state.RangeSet.TotalBytes() >= 32*1024*1024 {
+			// Materialize to disk once buffered bytes cross threshold (scaled down for small TMP_FILE_MAX_BYTES rings)
+			matThreshold := int64(32 * 1024 * 1024)
+			if cm != nil && cm.maxInFlightBytes > 0 && cm.maxInFlightBytes/2 < matThreshold {
+				matThreshold = cm.maxInFlightBytes / 2
+			}
+			if !state.IsDiskMaterialized() && state.RangeSet.TotalBytes() >= matThreshold {
 				if GlobalRegistry != nil && state.TotalSize > 0 && state.GetTargetTier() == TierDisk {
 					GlobalRegistry.PreEvict(state.TotalSize)
 				}
@@ -1358,8 +1403,12 @@ func (s *FileCacheState) FindNextUnclaimedGap(workerID int, fromOffset int64) (s
 		return false, gStart, gEnd
 	}
 
-	// 2. Search forward from fromOffset to TotalSize
+	// 2. Search forward from max(fromOffset, ringFloorOffset) to TotalSize
+	floor := s.GetRingFloorOffset()
 	curr := fromOffset
+	if curr < floor {
+		curr = floor
+	}
 	for curr < s.TotalSize {
 		gStart, gEnd, ok := s.RangeSet.FindNextGap(curr, s.TotalSize)
 		if !ok {
@@ -1376,9 +1425,9 @@ func (s *FileCacheState) FindNextUnclaimedGap(workerID int, fromOffset int64) (s
 		}
 	}
 
-	// 3. Wrap around from 0 to fromOffset for unfulfilled backfill gaps
-	if fromOffset > 0 {
-		curr = 0
+	// 3. Wrap around from ringFloorOffset to fromOffset for unfulfilled backfill gaps
+	if fromOffset > floor {
+		curr = floor
 		for curr < fromOffset {
 			gStart, gEnd, ok := s.RangeSet.FindNextGap(curr, fromOffset)
 			if !ok {
@@ -1636,7 +1685,7 @@ func triggerAsyncTargetCleanup(cm *ScratchChunkManager, storage StorageBackend, 
 		go func() {
 			delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if err := cm.Cleanup(delCtx); err != nil {
+			if err := cm.Cleanup(delCtx); err != nil && !errors.Is(err, ErrStorageCircuitOpen) {
 				log.Printf("%s Async target cleanup (%s) failed for %s: %v", logPrefix, cm.TargetName(), key, err)
 			}
 		}()
@@ -1720,6 +1769,11 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 		state.IsCommitting = false
 		state.UpstreamStatus = "Completed"
 		hasClients := len(state.Clients) > 0
+		var cmToClose *ScratchChunkManager
+		if !hasClients {
+			cmToClose = state.ChunkManager
+			state.ChunkManager = nil
+		}
 		state.Lock.Unlock()
 
 		if GlobalLogBroker != nil {
@@ -1727,6 +1781,9 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 		}
 
 		if !hasClients {
+			if cmToClose != nil {
+				cmToClose.Close()
+			}
 			_ = os.Remove(state.PartPath)
 			if state.MetaPath != "" {
 				_ = os.Remove(state.MetaPath)

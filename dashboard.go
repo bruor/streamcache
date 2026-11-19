@@ -238,6 +238,12 @@ type dashboardSnapshot struct {
 	ProbeActive       bool                   `json:"probe_active"`
 	ProbeBuffers      []dashboardProbeBuffer `json:"probe_buffers"`
 	ProviderCapacity  interface{}            `json:"provider_capacity,omitempty"`
+	NASHealthy        bool                   `json:"nas_healthy"`
+	S3Healthy         bool                   `json:"s3_healthy"`
+	NASCircuitOpen    bool                   `json:"nas_circuit_open"`
+	S3CircuitOpen     bool                   `json:"s3_circuit_open"`
+	NASLastError      string                 `json:"nas_last_error,omitempty"`
+	S3LastError       string                 `json:"s3_last_error,omitempty"`
 }
 
 func (s dashboardSnapshot) toBaseMap() map[string]interface{} {
@@ -253,6 +259,16 @@ func (s dashboardSnapshot) toBaseMap() map[string]interface{} {
 		"active_vod_probes":      s.ActiveVODProbes,
 		"probe_active":           s.ProbeActive,
 		"probe_buffers":          s.ProbeBuffers,
+		"nas_healthy":            s.NASHealthy,
+		"s3_healthy":             s.S3Healthy,
+		"nas_circuit_open":       s.NASCircuitOpen,
+		"s3_circuit_open":        s.S3CircuitOpen,
+	}
+	if s.NASLastError != "" {
+		data["nas_last_error"] = s.NASLastError
+	}
+	if s.S3LastError != "" {
+		data["s3_last_error"] = s.S3LastError
 	}
 	if s.ProviderCapacity != nil {
 		data["provider_capacity"] = s.ProviderCapacity
@@ -470,6 +486,11 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		probeActive = GlobalRegistry.IsProbeActive()
 	}
 
+	healthSnap := StorageHealthSnapshot{NASHealthy: true, S3Healthy: true}
+	if hm := getGlobalStorageHealth(); hm != nil {
+		healthSnap = hm.Snapshot()
+	}
+
 	snap := dashboardSnapshot{
 		StorageBackend:    GlobalConfig.GetStorageBackend(),
 		TotalCacheSize:    GlobalRegistry.GetTotalSize(),
@@ -484,6 +505,12 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		ActiveVODProbes:   activeVODProbes,
 		ProbeActive:       probeActive,
 		ProbeBuffers:      probeBuffers,
+		NASHealthy:        healthSnap.NASHealthy,
+		S3Healthy:         healthSnap.S3Healthy,
+		NASCircuitOpen:    healthSnap.NASCircuitOpen,
+		S3CircuitOpen:     healthSnap.S3CircuitOpen,
+		NASLastError:      healthSnap.NASLastError,
+		S3LastError:       healthSnap.S3LastError,
 	}
 	if GlobalPrehydrationManager != nil {
 		if capReport := GlobalPrehydrationManager.GetLatestCapacity(); capReport != nil {
