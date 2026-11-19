@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -30,6 +31,20 @@ func NewLocalStorageBackend(cacheDir, tmpDir string) *LocalStorageBackend {
 
 func (b *LocalStorageBackend) Type() string {
 	return "disk"
+}
+
+// FilePath returns the host-local filesystem path for key inside cacheDir.
+func (b *LocalStorageBackend) FilePath(key string) string {
+	if b == nil || key == "" {
+		return ""
+	}
+	b.mu.RLock()
+	dir := b.cacheDir
+	b.mu.RUnlock()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, key)
 }
 
 func (b *LocalStorageBackend) Stat(ctx context.Context, key string) (*FileMeta, bool, error) {
@@ -253,8 +268,12 @@ func (b *LocalStorageBackend) List(ctx context.Context) ([]StorageObjectInfo, er
 		if entry.IsDir() {
 			continue
 		}
-		ext := filepath.Ext(entry.Name())
-		if ext == ".json" || ext == ".part" {
+		name := entry.Name()
+		if strings.HasPrefix(name, "s3_index.json") || strings.HasPrefix(name, "cache_index.json") {
+			continue
+		}
+		ext := filepath.Ext(name)
+		if ext == ".json" || ext == ".part" || ext == ".staging" {
 			continue
 		}
 		info, err := entry.Info()

@@ -30,6 +30,7 @@ type S3StorageBackend struct {
 	uploadConcurrency    int
 	recomposeConcurrency int
 	mu                   sync.RWMutex
+	metaCache            map[string]FileMeta
 }
 
 // NewS3StorageBackend initializes an S3StorageBackend from S3Config
@@ -73,6 +74,7 @@ func NewS3StorageBackend(cfg S3Config) (*S3StorageBackend, error) {
 		chunkSize:            chunkSize,
 		uploadConcurrency:    uploadConc,
 		recomposeConcurrency: recomposeConc,
+		metaCache:            make(map[string]FileMeta),
 	}, nil
 }
 
@@ -177,6 +179,39 @@ func (b *S3StorageBackend) StatWithTier(ctx context.Context, key string) (*FileM
 		meta.TotalSize = *resp.ContentLength
 	}
 	meta.Completed = true
+
+	b.mu.RLock()
+	if b.metaCache != nil {
+		if mc, ok := b.metaCache[key]; ok {
+			b.mu.RUnlock()
+			if mc.TotalSize <= 0 && meta.TotalSize > 0 {
+				mc.TotalSize = meta.TotalSize
+			}
+			mc.Completed = true
+			return &mc, TierS3, true, nil
+		}
+	}
+	b.mu.RUnlock()
+
+	if idx := getGlobalCacheIndex(); idx != nil {
+		if entry, ok := idx.Get(key); ok {
+			if entry.LastValidated > meta.LastValidated {
+				meta.LastValidated = entry.LastValidated
+			}
+			if entry.ETag != "" && meta.ETag == "" {
+				meta.ETag = entry.ETag
+			}
+			if entry.LastModified != "" && meta.LastModified == "" {
+				meta.LastModified = entry.LastModified
+			}
+			if entry.ContentType != "" && meta.ContentType == "" {
+				meta.ContentType = entry.ContentType
+			}
+			if entry.URL != "" && meta.URL == "" {
+				meta.URL = entry.URL
+			}
+		}
+	}
 	return &meta, TierS3, true, nil
 }
 
@@ -676,6 +711,7 @@ func (b *S3StorageBackend) RecomposeWithProgress(ctx context.Context, key string
 	}
 
 	completedSuccessfully = true
+	b.clearCachedMeta(key)
 	finalizeStep := 1
 	report("finalizing", finalizeStep, finalizeTotal)
 
@@ -738,25 +774,11 @@ func (b *S3StorageBackend) UploadFromFileWithProgress(ctx context.Context, key s
 	}
 
 	partSize, isMultipart := CalculateDynamicChunkConfig(fileSize, b.chunkSize)
-	if !isMultipart || fileSize == 0 || partSize <= 0 {
-		report("uploading", 0, 1)
-		_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:        aws.String(b.bucket),
-			Key:           aws.String(targetKey),
-			Body:          f,
-			ContentLength: aws.Int64(fileSize),
-			Metadata:      b.metaToMap(meta),
-		})
-		FadviseDontNeed(f.Fd(), 0, 0)
-		if err != nil {
-			return err
-		}
-		report("finalizing", 1, 1)
-		return nil
+	totalParts := 1
+	if isMultipart && partSize > 0 {
+		totalParts = int((fileSize + partSize - 1) / partSize)
 	}
-
-	totalParts := int((fileSize + partSize - 1) / partSize)
-	if totalParts <= 1 {
+	if !isMultipart || fileSize == 0 || partSize <= 0 || totalParts <= 1 {
 		report("uploading", 0, 1)
 		_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:        aws.String(b.bucket),
@@ -769,6 +791,7 @@ func (b *S3StorageBackend) UploadFromFileWithProgress(ctx context.Context, key s
 		if err != nil {
 			return err
 		}
+		b.clearCachedMeta(key)
 		report("finalizing", 1, 1)
 		return nil
 	}
@@ -919,6 +942,7 @@ func (b *S3StorageBackend) UploadFromFileWithProgress(ctx context.Context, key s
 	}
 
 	completedSuccessfully = true
+	b.clearCachedMeta(key)
 	FadviseDontNeed(f.Fd(), 0, 0)
 	report("finalizing", 1, 1)
 	return nil
@@ -931,7 +955,16 @@ func (b *S3StorageBackend) Delete(ctx context.Context, key string) error {
 		Key:    aws.String(targetKey),
 	})
 	_ = b.DeleteChunks(ctx, key)
+	b.clearCachedMeta(key)
 	return err
+}
+
+func (b *S3StorageBackend) clearCachedMeta(key string) {
+	b.mu.Lock()
+	if b.metaCache != nil {
+		delete(b.metaCache, key)
+	}
+	b.mu.Unlock()
 }
 
 func (b *S3StorageBackend) deleteKeyBatch(ctx context.Context, keys []types.ObjectIdentifier) error {
@@ -1029,17 +1062,20 @@ func (b *S3StorageBackend) SweepStaleChunks(ctx context.Context, maxAge time.Dur
 	return len(toDelete), nil
 }
 
+// UpdateMetadata records updated S3 metadata locally in memory and host-local CacheIndex,
+// avoiding slow/5GB-capped S3 CopyObject self-copies.
 func (b *S3StorageBackend) UpdateMetadata(ctx context.Context, key string, meta FileMeta) error {
-	targetKey := b.monolithicKey(key)
-	copySource := b.bucket + "/" + targetKey
-	_, err := b.client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:            aws.String(b.bucket),
-		Key:               aws.String(targetKey),
-		CopySource:        aws.String(copySource),
-		MetadataDirective: types.MetadataDirectiveReplace,
-		Metadata:          b.metaToMap(meta),
-	})
-	return err
+	b.mu.Lock()
+	if b.metaCache == nil {
+		b.metaCache = make(map[string]FileMeta)
+	}
+	b.metaCache[key] = meta
+	b.mu.Unlock()
+
+	if idx := getGlobalCacheIndex(); idx != nil {
+		idx.RecordValidation(key, meta, IndexTierS3)
+	}
+	return nil
 }
 
 func (b *S3StorageBackend) List(ctx context.Context) ([]StorageObjectInfo, error) {

@@ -12,22 +12,37 @@ import (
 	"time"
 )
 
-// S3IndexEntry stores persistent metadata for a single committed vod/<key> object in S3.
-type S3IndexEntry struct {
-	Key          string `json:"key"`
-	URL          string `json:"url,omitempty"`
-	Size         int64  `json:"size"`
-	CreatedAt    int64  `json:"created_at"`
-	LastAccessed int64  `json:"last_accessed"`
+const (
+	IndexTierDisk = "disk"
+	IndexTierS3   = "s3"
+	IndexTierBoth = "both"
+)
+
+// CacheIndexEntry stores persistent unified metadata and aging timestamps for a cached asset
+// across L1 disk ("disk"), L2 S3 ("s3"), or both ("both").
+type CacheIndexEntry struct {
+	Key           string `json:"key"`
+	URL           string `json:"url,omitempty"`
+	Size          int64  `json:"size"`
+	Tier          string `json:"tier,omitempty"` // "disk", "s3", or "both"
+	ContentType   string `json:"content_type,omitempty"`
+	ETag          string `json:"etag,omitempty"`
+	LastModified  string `json:"last_modified,omitempty"`
+	CreatedAt     int64  `json:"created_at"`
+	LastValidated int64  `json:"last_validated,omitempty"`
+	LastAccessed  int64  `json:"last_accessed"`
 }
 
-// S3AccessIndex tracks local aging metadata for S3-cached assets and evicts idle objects.
-type S3AccessIndex struct {
-	mu        sync.Mutex
-	saveMu    sync.Mutex
-	indexPath string
-	entries   map[string]*S3IndexEntry
-	dirty     bool
+// S3IndexEntry preserves backwards-compatible naming for legacy callers/tests.
+type S3IndexEntry = CacheIndexEntry
+
+// CacheIndex tracks local aging and validation metadata across persistent tiers and sweeps idle objects.
+type CacheIndex struct {
+	mu         sync.Mutex
+	saveMu     sync.Mutex
+	indexPath  string
+	entries    map[string]*CacheIndexEntry
+	dirty      bool
 	nowFn      func() time.Time
 	stopCh     chan struct{}
 	stopOnce   sync.Once
@@ -35,16 +50,47 @@ type S3AccessIndex struct {
 	wg         sync.WaitGroup
 }
 
-// GlobalS3Index tracks cached S3 assets when running with STORAGE_BACKEND=s3.
-var GlobalS3Index *S3AccessIndex
+// S3AccessIndex preserves backwards-compatible naming for legacy callers/tests.
+type S3AccessIndex = CacheIndex
+
+// GlobalCacheIndex and GlobalS3Index track persistent assets on host-local STATE_DIR storage.
+var (
+	GlobalCacheIndex *CacheIndex
+	GlobalS3Index    *S3AccessIndex
+)
+
+func getGlobalCacheIndex() *CacheIndex {
+	if GlobalCacheIndex != nil {
+		return GlobalCacheIndex
+	}
+	return GlobalS3Index
+}
+
+// NewCacheIndex constructs a unified CacheIndex persisted at indexPath.
+func NewCacheIndex(indexPath string) *CacheIndex {
+	return &CacheIndex{
+		indexPath: indexPath,
+		entries:   make(map[string]*CacheIndexEntry),
+		nowFn:     time.Now,
+		stopCh:    make(chan struct{}),
+	}
+}
 
 // NewS3AccessIndex constructs an S3AccessIndex persisted at indexPath.
 func NewS3AccessIndex(indexPath string) *S3AccessIndex {
-	return &S3AccessIndex{
-		indexPath: indexPath,
-		entries:   make(map[string]*S3IndexEntry),
-		nowFn:     time.Now,
-		stopCh:    make(chan struct{}),
+	return NewCacheIndex(indexPath)
+}
+
+func mergeIndexTier(existing, added string) string {
+	switch {
+	case added == "":
+		return existing
+	case existing == "" || existing == added:
+		return added
+	case existing == IndexTierBoth || added == IndexTierBoth:
+		return IndexTierBoth
+	default:
+		return IndexTierBoth
 	}
 }
 
@@ -133,8 +179,13 @@ func (idx *S3AccessIndex) markDirty() {
 	idx.mu.Unlock()
 }
 
-// RecordCommit records or updates an object newly committed to S3 and flushes immediately.
-func (idx *S3AccessIndex) RecordCommit(key, targetURL string, size int64) {
+// RecordCommit records or updates an S3 object commit and flushes immediately.
+func (idx *CacheIndex) RecordCommit(key, targetURL string, size int64) {
+	idx.RecordCommitForTier(key, FileMeta{URL: targetURL, TotalSize: size}, IndexTierS3)
+}
+
+// RecordCommitForTier records a newly committed object on a specific tier and flushes immediately.
+func (idx *CacheIndex) RecordCommitForTier(key string, meta FileMeta, tier string) {
 	if idx == nil || key == "" {
 		return
 	}
@@ -143,30 +194,50 @@ func (idx *S3AccessIndex) RecordCommit(key, targetURL string, size int64) {
 	idx.mu.Lock()
 	e, ok := idx.entries[key]
 	if !ok {
-		e = &S3IndexEntry{
+		e = &CacheIndexEntry{
 			Key:       key,
 			CreatedAt: nowUnix,
 		}
 		idx.entries[key] = e
 	}
-	if targetURL != "" {
-		e.URL = targetURL
+	if meta.URL != "" {
+		e.URL = meta.URL
 	}
-	if size > 0 {
-		e.Size = size
+	if meta.TotalSize > 0 {
+		e.Size = meta.TotalSize
+	}
+	if meta.ContentType != "" {
+		e.ContentType = meta.ContentType
+	}
+	if meta.ETag != "" {
+		e.ETag = meta.ETag
+	}
+	if meta.LastModified != "" {
+		e.LastModified = meta.LastModified
+	}
+	if meta.LastValidated > 0 {
+		e.LastValidated = meta.LastValidated
+	} else if e.LastValidated == 0 {
+		e.LastValidated = nowUnix
 	}
 	if e.CreatedAt == 0 {
 		e.CreatedAt = nowUnix
 	}
 	e.LastAccessed = nowUnix
+	e.Tier = mergeIndexTier(e.Tier, tier)
 	idx.dirty = true
 	idx.mu.Unlock()
 
 	_ = idx.Flush()
 }
 
-// RecordAccess refreshes LastAccessed on real playback (inserting if missing from the index).
-func (idx *S3AccessIndex) RecordAccess(key, targetURL string, size int64) {
+// RecordAccess refreshes LastAccessed on real playback (preserving existing tier or defaulting to S3).
+func (idx *CacheIndex) RecordAccess(key, targetURL string, size int64) {
+	idx.RecordAccessForTier(key, targetURL, size, "")
+}
+
+// RecordAccessForTier refreshes LastAccessed on real playback for key and merges tier membership.
+func (idx *CacheIndex) RecordAccessForTier(key, targetURL string, size int64, tier string) {
 	if idx == nil || key == "" {
 		return
 	}
@@ -175,11 +246,25 @@ func (idx *S3AccessIndex) RecordAccess(key, targetURL string, size int64) {
 	idx.mu.Lock()
 	e, ok := idx.entries[key]
 	if !ok {
-		e = &S3IndexEntry{
+		t := tier
+		if t == "" {
+			t = IndexTierS3
+		}
+		e = &CacheIndexEntry{
 			Key:       key,
+			Tier:      t,
 			CreatedAt: nowUnix,
 		}
 		idx.entries[key] = e
+	} else if tier != "" {
+		merged := mergeIndexTier(e.Tier, tier)
+		if merged != e.Tier {
+			e.Tier = merged
+			idx.dirty = true
+		}
+	} else if e.Tier == "" {
+		e.Tier = IndexTierS3
+		idx.dirty = true
 	}
 	if targetURL != "" && e.URL == "" {
 		e.URL = targetURL
@@ -192,6 +277,169 @@ func (idx *S3AccessIndex) RecordAccess(key, targetURL string, size int64) {
 		idx.dirty = true
 	}
 	idx.mu.Unlock()
+}
+
+// RecordValidation updates metadata & LastValidated without modifying LastAccessed on existing entries.
+func (idx *CacheIndex) RecordValidation(key string, meta FileMeta, tier string) {
+	if idx == nil || key == "" {
+		return
+	}
+	nowUnix := idx.now().Unix()
+
+	idx.mu.Lock()
+	e, ok := idx.entries[key]
+	if !ok {
+		lastAcc := nowUnix
+		created := nowUnix
+		if meta.LastValidated > 0 {
+			lastAcc = meta.LastValidated
+			created = meta.LastValidated
+		}
+		e = &CacheIndexEntry{
+			Key:          key,
+			Tier:         tier,
+			CreatedAt:    created,
+			LastAccessed: lastAcc,
+		}
+		idx.entries[key] = e
+	} else if tier != "" {
+		e.Tier = mergeIndexTier(e.Tier, tier)
+	}
+	if meta.URL != "" {
+		e.URL = meta.URL
+	}
+	if meta.TotalSize > 0 {
+		e.Size = meta.TotalSize
+	}
+	if meta.ContentType != "" {
+		e.ContentType = meta.ContentType
+	}
+	if meta.ETag != "" {
+		e.ETag = meta.ETag
+	}
+	if meta.LastModified != "" {
+		e.LastModified = meta.LastModified
+	}
+	if meta.LastValidated > 0 {
+		e.LastValidated = meta.LastValidated
+	} else if e.LastValidated == 0 {
+		e.LastValidated = nowUnix
+	}
+	if e.LastAccessed == 0 {
+		e.LastAccessed = nowUnix
+	}
+	idx.dirty = true
+	idx.mu.Unlock()
+
+	_ = idx.Flush()
+}
+
+// MarkAddedToTier merges tier membership onto key and flushes.
+func (idx *CacheIndex) MarkAddedToTier(key, tier string) {
+	if idx == nil || key == "" || tier == "" {
+		return
+	}
+	nowUnix := idx.now().Unix()
+
+	idx.mu.Lock()
+	e, ok := idx.entries[key]
+	if !ok {
+		e = &CacheIndexEntry{
+			Key:          key,
+			Tier:         tier,
+			CreatedAt:    nowUnix,
+			LastAccessed: nowUnix,
+		}
+		idx.entries[key] = e
+	} else {
+		e.Tier = mergeIndexTier(e.Tier, tier)
+	}
+	idx.dirty = true
+	idx.mu.Unlock()
+
+	_ = idx.Flush()
+}
+
+// MarkRemovedFromTier updates or removes key's entry when a copy is deleted from tier.
+func (idx *CacheIndex) MarkRemovedFromTier(key, tier string) {
+	if idx == nil || key == "" || tier == "" {
+		return
+	}
+
+	idx.mu.Lock()
+	e, ok := idx.entries[key]
+	changed := false
+	if ok {
+		switch tier {
+		case IndexTierDisk:
+			if e.Tier == IndexTierBoth {
+				e.Tier = IndexTierS3
+				changed = true
+			} else if e.Tier == IndexTierDisk || e.Tier == "" {
+				delete(idx.entries, key)
+				changed = true
+			}
+		case IndexTierS3:
+			if e.Tier == IndexTierBoth {
+				e.Tier = IndexTierDisk
+				changed = true
+			} else if e.Tier == IndexTierS3 || e.Tier == "" {
+				delete(idx.entries, key)
+				changed = true
+			}
+		}
+		if changed {
+			idx.dirty = true
+		}
+	}
+	idx.mu.Unlock()
+
+	if changed {
+		_ = idx.Flush()
+	}
+}
+
+// Get returns a copy of the CacheIndexEntry for key if present.
+func (idx *CacheIndex) Get(key string) (*CacheIndexEntry, bool) {
+	if idx == nil || key == "" {
+		return nil, false
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	e, ok := idx.entries[key]
+	if !ok || e == nil {
+		return nil, false
+	}
+	cp := *e
+	return &cp, true
+}
+
+// GetLastAccessed returns the recorded LastAccessed timestamp for key.
+func (idx *CacheIndex) GetLastAccessed(key string) (time.Time, bool) {
+	if idx == nil || key == "" {
+		return time.Time{}, false
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	e, ok := idx.entries[key]
+	if !ok || e == nil || e.LastAccessed <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(e.LastAccessed, 0), true
+}
+
+// GetTier returns the recorded tier membership for key ("disk", "s3", "both", or "").
+func (idx *CacheIndex) GetTier(key string) string {
+	if idx == nil || key == "" {
+		return ""
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	e, ok := idx.entries[key]
+	if !ok || e == nil {
+		return ""
+	}
+	return e.Tier
 }
 
 // TouchIfPresent refreshes LastAccessed if key is already tracked in the index.
@@ -261,42 +509,187 @@ func (idx *S3AccessIndex) Stats() (int, int64) {
 	return len(idx.entries), totalBytes
 }
 
-// Reconcile synchronizes the local index with actual objects in S3 vod/.
-func (idx *S3AccessIndex) Reconcile(ctx context.Context, storage StorageBackend) error {
+// StatsByTier returns object counts and bytes broken down across disk, s3, and both tiers.
+func (idx *CacheIndex) StatsByTier() (diskCount int, diskBytes int64, s3Count int, s3Bytes int64, bothCount int) {
+	if idx == nil {
+		return 0, 0, 0, 0, 0
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	for _, e := range idx.entries {
+		switch e.Tier {
+		case IndexTierDisk:
+			diskCount++
+			diskBytes += e.Size
+		case IndexTierBoth:
+			diskCount++
+			diskBytes += e.Size
+			s3Count++
+			s3Bytes += e.Size
+			bothCount++
+		default:
+			// "" (legacy s3_index entries) or IndexTierS3
+			s3Count++
+			s3Bytes += e.Size
+		}
+	}
+	return diskCount, diskBytes, s3Count, s3Bytes, bothCount
+}
+
+// Reconcile synchronizes the unified index against local disk, S3, or tiered storage.
+func (idx *CacheIndex) Reconcile(ctx context.Context, storage StorageBackend) error {
 	if idx == nil || storage == nil {
 		return nil
 	}
 
-	objs, err := storage.List(ctx)
-	if err != nil {
-		return err
-	}
-
 	nowUnix := idx.now().Unix()
-	live := make(map[string]StorageObjectInfo, len(objs))
-	for _, obj := range objs {
-		live[obj.Key] = obj
+	type observedEntry struct {
+		size      int64
+		modTime   time.Time
+		tier      string
+		localMeta *FileMeta
+	}
+	live := make(map[string]*observedEntry)
+
+	switch b := storage.(type) {
+	case *TieredStorageBackend:
+		var localObjs, s3Objs []StorageObjectInfo
+		var err error
+		if b.Local() != nil {
+			localObjs, err = b.Local().List(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		if b.S3() != nil {
+			s3Objs, err = b.S3().List(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		for _, obj := range localObjs {
+			var lm *FileMeta
+			if m, _, ok, serr := b.Local().StatWithTier(ctx, obj.Key); serr == nil && ok {
+				lm = m
+			}
+			live[obj.Key] = &observedEntry{
+				size:      obj.Size,
+				modTime:   obj.LastModified,
+				tier:      IndexTierDisk,
+				localMeta: lm,
+			}
+		}
+		for _, obj := range s3Objs {
+			if existing, ok := live[obj.Key]; ok {
+				existing.tier = IndexTierBoth
+				if existing.size <= 0 {
+					existing.size = obj.Size
+				}
+			} else {
+				live[obj.Key] = &observedEntry{
+					size:    obj.Size,
+					modTime: obj.LastModified,
+					tier:    IndexTierS3,
+				}
+			}
+		}
+
+	case *LocalStorageBackend:
+		objs, err := b.List(ctx)
+		if err != nil {
+			return err
+		}
+		for _, obj := range objs {
+			var lm *FileMeta
+			if m, _, ok, serr := b.StatWithTier(ctx, obj.Key); serr == nil && ok {
+				lm = m
+			}
+			live[obj.Key] = &observedEntry{
+				size:      obj.Size,
+				modTime:   obj.LastModified,
+				tier:      IndexTierDisk,
+				localMeta: lm,
+			}
+		}
+
+	default:
+		objs, err := storage.List(ctx)
+		if err != nil {
+			return err
+		}
+		for _, obj := range objs {
+			live[obj.Key] = &observedEntry{
+				size:    obj.Size,
+				modTime: obj.LastModified,
+				tier:    IndexTierS3,
+			}
+		}
 	}
 
 	idx.mu.Lock()
 	added, removed, updated := 0, 0, 0
-	for key, obj := range live {
+	for key, obs := range live {
 		modUnix := nowUnix
-		if !obj.LastModified.IsZero() {
-			modUnix = obj.LastModified.Unix()
+		if !obs.modTime.IsZero() {
+			modUnix = obs.modTime.Unix()
 		}
 		e, ok := idx.entries[key]
 		if !ok {
-			idx.entries[key] = &S3IndexEntry{
-				Key:          key,
-				Size:         obj.Size,
-				CreatedAt:    modUnix,
-				LastAccessed: modUnix,
+			entry := &CacheIndexEntry{
+				Key:           key,
+				Size:          obs.size,
+				Tier:          obs.tier,
+				CreatedAt:     modUnix,
+				LastValidated: modUnix,
+				LastAccessed:  modUnix,
 			}
+			if obs.localMeta != nil {
+				if obs.localMeta.URL != "" {
+					entry.URL = obs.localMeta.URL
+				}
+				if obs.localMeta.ContentType != "" {
+					entry.ContentType = obs.localMeta.ContentType
+				}
+				if obs.localMeta.ETag != "" {
+					entry.ETag = obs.localMeta.ETag
+				}
+				if obs.localMeta.LastModified != "" {
+					entry.LastModified = obs.localMeta.LastModified
+				}
+				if obs.localMeta.LastValidated > 0 {
+					entry.LastValidated = obs.localMeta.LastValidated
+					entry.LastAccessed = obs.localMeta.LastValidated
+				}
+			}
+			idx.entries[key] = entry
 			added++
-		} else if obj.Size > 0 && e.Size != obj.Size {
-			e.Size = obj.Size
-			updated++
+		} else {
+			if obs.size > 0 && e.Size != obs.size {
+				e.Size = obs.size
+				updated++
+			}
+			if obs.tier != "" && e.Tier != obs.tier {
+				e.Tier = obs.tier
+				updated++
+			}
+			if obs.localMeta != nil {
+				if e.URL == "" && obs.localMeta.URL != "" {
+					e.URL = obs.localMeta.URL
+					updated++
+				}
+				if e.ContentType == "" && obs.localMeta.ContentType != "" {
+					e.ContentType = obs.localMeta.ContentType
+					updated++
+				}
+				if e.ETag == "" && obs.localMeta.ETag != "" {
+					e.ETag = obs.localMeta.ETag
+					updated++
+				}
+				if e.LastModified == "" && obs.localMeta.LastModified != "" {
+					e.LastModified = obs.localMeta.LastModified
+					updated++
+				}
+			}
 		}
 	}
 
@@ -315,26 +708,28 @@ func (idx *S3AccessIndex) Reconcile(ctx context.Context, storage StorageBackend)
 
 	if added > 0 || removed > 0 || updated > 0 {
 		_ = idx.Flush()
-		log.Printf("[S3Index] Reconciled with S3: tracked=%d (added=%d, pruned=%d, updated=%d)", totalCount, added, removed, updated)
+		log.Printf("[CacheIndex] Reconciled (%s): tracked=%d (added=%d, pruned=%d, updated=%d)",
+			storage.Type(), totalCount, added, removed, updated)
 	}
 	return nil
 }
 
-// SweepExpired evicts S3 objects whose LastAccessed exceeds maxIdleAge and are not actively in use.
-func (idx *S3AccessIndex) SweepExpired(ctx context.Context, storage StorageBackend, registry *CacheRegistry, maxIdleAge time.Duration) (int, int64) {
+// SweepExpired evicts objects whose LastAccessed exceeds maxIdleAge across whichever tier(s) hold them,
+// skipping actively used keys.
+func (idx *CacheIndex) SweepExpired(ctx context.Context, storage StorageBackend, registry *CacheRegistry, maxIdleAge time.Duration) (int, int64) {
 	if idx == nil || storage == nil || maxIdleAge <= 0 {
 		return 0, 0
 	}
 
 	if err := idx.Reconcile(ctx, storage); err != nil {
-		log.Printf("[S3Evictor] Skipping sweep: S3 reconcile failed: %v", err)
+		log.Printf("[IdleEvictor] Skipping sweep: reconcile failed: %v", err)
 		return 0, 0
 	}
 
 	now := idx.now()
 
 	idx.mu.Lock()
-	var candidates []S3IndexEntry
+	var candidates []CacheIndexEntry
 	for _, e := range idx.entries {
 		idle := now.Sub(time.Unix(e.LastAccessed, 0))
 		if idle >= maxIdleAge {
@@ -370,14 +765,22 @@ func (idx *S3AccessIndex) SweepExpired(ctx context.Context, storage StorageBacke
 		idx.mu.Lock()
 		cur, stillTracked := idx.entries[cand.Key]
 		stillExpired := stillTracked && idx.now().Sub(time.Unix(cur.LastAccessed, 0)) >= maxIdleAge
+		curTier := ""
+		if cur != nil {
+			curTier = cur.Tier
+		}
 		idx.mu.Unlock()
 		if !stillExpired {
 			continue
 		}
 
 		if err := storage.Delete(ctx, cand.Key); err != nil {
-			log.Printf("[S3Evictor] Failed to delete %s from S3: %v", cand.Key, err)
+			log.Printf("[IdleEvictor] Failed to delete %s (%s): %v", cand.Key, curTier, err)
 			continue
+		}
+
+		if registry != nil && cand.Size > 0 && (curTier == IndexTierDisk || curTier == IndexTierBoth || storage.Type() == "disk") {
+			registry.UpdateSize(-cand.Size)
 		}
 
 		idx.mu.Lock()
@@ -388,13 +791,13 @@ func (idx *S3AccessIndex) SweepExpired(ctx context.Context, storage StorageBacke
 		idle := idx.now().Sub(time.Unix(cand.LastAccessed, 0)).Round(time.Second)
 		evicted++
 		freedBytes += cand.Size
-		log.Printf("[S3Evictor] Evicted idle S3 object: %s (Size: %.2f MB, Idle: %s)",
-			cand.Key, float64(cand.Size)/(1024*1024), idle)
+		log.Printf("[IdleEvictor] Evicted idle object: %s (Tier: %s, Size: %.2f MB, Idle: %s)",
+			cand.Key, curTier, float64(cand.Size)/(1024*1024), idle)
 	}
 
 	if evicted > 0 {
 		_ = idx.Flush()
-		log.Printf("[S3Evictor] Sweep complete. Evicted %d objects, freed %.2f MB",
+		log.Printf("[IdleEvictor] Sweep complete. Evicted %d objects, freed %.2f MB",
 			evicted, float64(freedBytes)/(1024*1024))
 	}
 

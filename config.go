@@ -38,6 +38,10 @@ type Config struct {
 	WritebackBufferSize           int64
 	StorageBackend                string
 	NASSequentialStage            string
+	HybridDemoteHighWatermark     int
+	HybridDemoteLowWatermark      int
+	hybridLowWatermarkSet         bool
+	HybridEagerS3Backup           bool
 	S3Config                      S3Config
 	CacheMaxIdleAge               time.Duration
 	CacheEvictInterval            time.Duration
@@ -192,6 +196,88 @@ func (c *Config) SetNASSequentialStage(val string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.NASSequentialStage = val
+}
+
+func normalizeHighWatermark(val int) int {
+	if val <= 0 {
+		return 80
+	}
+	if val > 100 {
+		return 100
+	}
+	return val
+}
+
+func (c *Config) GetHybridDemoteHighWatermark() int {
+	if c == nil {
+		return 80
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return normalizeHighWatermark(c.HybridDemoteHighWatermark)
+}
+
+func (c *Config) SetHybridDemoteHighWatermark(val int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.HybridDemoteHighWatermark = normalizeHighWatermark(val)
+}
+
+func (c *Config) GetHybridDemoteLowWatermark() int {
+	if c == nil {
+		return 70
+	}
+	c.mu.RLock()
+	high := normalizeHighWatermark(c.HybridDemoteHighWatermark)
+	low := c.HybridDemoteLowWatermark
+	lowSet := c.hybridLowWatermarkSet
+	c.mu.RUnlock()
+
+	if !lowSet && low <= 0 {
+		low = 70
+	} else if low < 0 {
+		low = 70
+	}
+	if low > high {
+		low = high
+	}
+	return low
+}
+
+func (c *Config) SetHybridDemoteLowWatermark(val int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if val < 0 {
+		val = 70
+	} else if val > 100 {
+		val = 100
+	}
+	c.HybridDemoteLowWatermark = val
+	c.hybridLowWatermarkSet = true
+}
+
+func (c *Config) GetHybridEagerS3Backup() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.HybridEagerS3Backup
+}
+
+func (c *Config) SetHybridEagerS3Backup(val bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.HybridEagerS3Backup = val
 }
 
 func (c *Config) GetMaxUpstreamWorkers() int {
@@ -730,8 +816,12 @@ func parseConfigFromEnv() *Config {
 		StallTeardownCooldown:   getEnvDuration("STALL_TEARDOWN_COOLDOWN", 5*time.Second),
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
-		StorageBackend:          getEnv("STORAGE_BACKEND", "disk"),
-		NASSequentialStage:      getEnv("NAS_SEQUENTIAL_STAGE", "auto"),
+		StorageBackend:            getEnv("STORAGE_BACKEND", "disk"),
+		NASSequentialStage:        getEnv("NAS_SEQUENTIAL_STAGE", "auto"),
+		HybridDemoteHighWatermark: getEnvPercentClamped("HYBRID_DEMOTE_HIGH_WATERMARK", 80, 1, 100),
+		HybridDemoteLowWatermark:  getEnvPercentClamped("HYBRID_DEMOTE_LOW_WATERMARK", 70, 0, 100),
+		hybridLowWatermarkSet:     true,
+		HybridEagerS3Backup:       getEnvBool("HYBRID_EAGER_S3_BACKUP", false),
 		S3Config: S3Config{
 			Endpoint:             getEnv("S3_ENDPOINT", ""),
 			Bucket:               getEnv("S3_BUCKET", ""),
@@ -836,7 +926,7 @@ func LoadConfig() {
 	cfg := parseConfigFromEnv()
 	GlobalConfig = cfg
 	s3Cfg := cfg.GetS3Config()
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, TmpDir=%s, StateDir=%s, StorageBackend=%s (Effective=%s), NASSequentialStage=%s, DispatcharrURL=%s, MaxCache=%dGB, CacheMaxItemPct=%d%%, CacheMinDiskFree=%dGB, TmpFileMax=%dMB, TmpMinDiskFree=%dMB, CacheMaxIdleAge=%s, CacheEvictInterval=%s, S3UploadConcurrency=%d, S3RecomposeConcurrency=%d, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, TmpDir=%s, StateDir=%s, StorageBackend=%s (Effective=%s), NASSequentialStage=%s, HybridDemoteHigh=%d%%, HybridDemoteLow=%d%%, HybridEagerS3Backup=%v, DispatcharrURL=%s, MaxCache=%dGB, CacheMaxItemPct=%d%%, CacheMinDiskFree=%dGB, TmpFileMax=%dMB, TmpMinDiskFree=%dMB, CacheMaxIdleAge=%s, CacheEvictInterval=%s, S3UploadConcurrency=%d, S3RecomposeConcurrency=%d, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.TmpDir,
@@ -844,6 +934,9 @@ func LoadConfig() {
 		cfg.GetStorageBackend(),
 		cfg.EffectiveStorageBackend(),
 		cfg.GetNASSequentialStage(),
+		cfg.GetHybridDemoteHighWatermark(),
+		cfg.GetHybridDemoteLowWatermark(),
+		cfg.GetHybridEagerS3Backup(),
 		cfg.GetDispatcharrURL(),
 		cfg.CacheMaxBytes/(1024*1024*1024),
 		cfg.GetCacheMaxItemPct(),
@@ -868,21 +961,31 @@ func LoadConfig() {
 	)
 }
 
-func getEnvPercent(key string, fallback int) int {
+func getEnvPercentClamped(key string, fallback, minVal, maxVal int) int {
 	valStr, ok := os.LookupEnv(key)
 	if !ok {
-		return normalizeCacheMaxItemPct(fallback)
+		return fallback
 	}
 	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(valStr), "%"))
 	if trimmed == "" {
-		return normalizeCacheMaxItemPct(fallback)
+		return fallback
 	}
 	val, err := strconv.Atoi(trimmed)
 	if err != nil {
 		log.Printf("[Config] Warning: Invalid percentage value for %s: %s. Using default %d%%", key, valStr, fallback)
-		return normalizeCacheMaxItemPct(fallback)
+		return fallback
 	}
-	return normalizeCacheMaxItemPct(val)
+	if val < minVal {
+		return fallback
+	}
+	if val > maxVal {
+		return maxVal
+	}
+	return val
+}
+
+func getEnvPercent(key string, fallback int) int {
+	return normalizeCacheMaxItemPct(getEnvPercentClamped(key, fallback, 0, 100))
 }
 
 func getEnv(key, fallback string) string {

@@ -719,8 +719,8 @@ func (pm *PrehydrationManager) OnCacheHit(currentURL string, nextURLs []string) 
 	}
 	pm.OnPlayerPlayback(currentURL, nextURLs)
 	pm.AutoDiscoverDispatcharrURL(currentURL)
-	if GlobalS3Index != nil {
-		GlobalS3Index.TouchChain(nextURLs)
+	if idx := getGlobalCacheIndex(); idx != nil {
+		idx.TouchChain(nextURLs)
 	}
 	pm.Enqueue(nextURLs[0], nextURLs[1:])
 }
@@ -817,13 +817,17 @@ func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	// If already completed in storage (local disk or S3), chain immediately to the next one!
 	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
 		log.Printf("[Prehydration] Episode %s is already cached (Cache HIT). Chaining to next in sequence.", targetURL)
-		if GlobalS3Index != nil && !GlobalS3Index.TouchIfPresent(cacheFileName) && GlobalStorage != nil {
+		if idx := getGlobalCacheIndex(); idx != nil && !idx.TouchIfPresent(cacheFileName) && GlobalStorage != nil {
 			if tsb, ok := GlobalStorage.(TieredStatBackend); ok {
-				if sm, tier, exists, err := tsb.StatWithTier(context.Background(), cacheFileName); err == nil && exists && sm != nil && tier == TierS3 {
-					GlobalS3Index.RecordAccess(cacheFileName, targetURL, sm.TotalSize)
+				if sm, tier, exists, err := tsb.StatWithTier(context.Background(), cacheFileName); err == nil && exists && sm != nil {
+					idx.RecordAccessForTier(cacheFileName, targetURL, sm.TotalSize, string(tier))
 				}
 			} else if sm, exists, err := GlobalStorage.Stat(context.Background(), cacheFileName); err == nil && exists && sm != nil {
-				GlobalS3Index.RecordAccess(cacheFileName, targetURL, sm.TotalSize)
+				backendTier := IndexTierDisk
+				if GlobalStorage.Type() == "s3" {
+					backendTier = IndexTierS3
+				}
+				idx.RecordAccessForTier(cacheFileName, targetURL, sm.TotalSize, backendTier)
 			}
 		}
 		if len(nextURLs) > 0 {

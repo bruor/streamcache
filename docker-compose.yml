@@ -47,6 +47,9 @@ services:
       # - S3_CHUNK_SIZE=64MB
       # - S3_UPLOAD_CONCURRENCY=4
       # - S3_RECOMPOSE_CONCURRENCY=6
+      # - HYBRID_DEMOTE_HIGH_WATERMARK=80
+      # - HYBRID_DEMOTE_LOW_WATERMARK=70
+      # - HYBRID_EAGER_S3_BACKUP=false
 
       # Debounced Scheduler & Probe Guards
       - SCHEDULER_MIN_TIME=2s

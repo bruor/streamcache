@@ -1778,8 +1778,8 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 		} else {
 			state.SetUpstreamStatus("Completed")
 			log.Printf("%s Cached file finalized and committed to S3: %s", logPrefix, state.Key)
-			if GlobalS3Index != nil {
-				GlobalS3Index.RecordCommit(state.Key, state.URL, state.TotalSize)
+			if idx := getGlobalCacheIndex(); idx != nil {
+				idx.RecordCommitForTier(state.Key, meta, IndexTierS3)
 			}
 		}
 
@@ -1837,6 +1837,10 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 			GlobalRegistry.Lock.Unlock()
 		}
 
+		if commitErr == nil {
+			recordLocalCommitToIndexAndDemoter(state.Key, meta)
+		}
+
 		runtime.GC()
 		debug.FreeOSMemory()
 		return
@@ -1869,6 +1873,8 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 				GlobalRegistry.Lock.Unlock()
 			}
 
+			recordLocalCommitToIndexAndDemoter(state.Key, meta)
+
 			if GlobalLogBroker != nil {
 				go GlobalLogBroker.BroadcastStateUpdate()
 			}
@@ -1899,6 +1905,7 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 			}
 			GlobalRegistry.Lock.Unlock()
 		}
+		recordLocalCommitToIndexAndDemoter(state.Key, meta)
 		if GlobalLogBroker != nil {
 			go GlobalLogBroker.BroadcastStateUpdate()
 		}
@@ -1910,5 +1917,15 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 
 	runtime.GC()
 	debug.FreeOSMemory()
+}
+
+func recordLocalCommitToIndexAndDemoter(key string, meta FileMeta) {
+	if idx := getGlobalCacheIndex(); idx != nil {
+		idx.RecordCommitForTier(key, meta, IndexTierDisk)
+	}
+	if demoter := getGlobalHybridDemoter(); demoter != nil {
+		demoter.EnqueueEagerBackup(key)
+		demoter.TriggerWatermarkDemotion()
+	}
 }
 

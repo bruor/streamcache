@@ -292,12 +292,10 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 							newRead := atomic.AddInt64(&hitTotalRead, int64(n))
 							if newRead >= minThreshold || (fileSize > 0 && newRead >= fileSize) {
 								hitPrehydrateOnce.Do(func() {
-									if GlobalS3Index != nil {
-										if cacheSource == string(TierS3) {
-											GlobalS3Index.RecordAccess(cacheFileName, targetURL, fileSize)
-										}
+									if idx := getGlobalCacheIndex(); idx != nil {
+										idx.RecordAccessForTier(cacheFileName, targetURL, fileSize, cacheSource)
 										if len(nextURLs) > 0 {
-											GlobalS3Index.TouchChain(nextURLs)
+											idx.TouchChain(nextURLs)
 										}
 									}
 									if GlobalPrehydrationManager != nil && len(nextURLs) > 0 {
@@ -475,10 +473,12 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 func handleDebugState(w http.ResponseWriter, r *http.Request) {
 	data := collectDashboardSnapshot().toBaseMap()
 
-	if GlobalS3Index != nil {
-		s3Count, s3Bytes := GlobalS3Index.Stats()
+	if idx := getGlobalCacheIndex(); idx != nil {
+		diskCount, diskBytes, s3Count, s3Bytes, _ := idx.StatsByTier()
 		data["s3_cached_objects"] = s3Count
 		data["s3_cached_bytes"] = s3Bytes
+		data["disk_cached_objects"] = diskCount
+		data["disk_cached_bytes"] = diskBytes
 		data["cache_max_idle_age_seconds"] = int64(GlobalConfig.GetCacheMaxIdleAge().Seconds())
 	}
 

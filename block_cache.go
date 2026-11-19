@@ -607,6 +607,18 @@ func InitRegistry() {
 		GlobalRegistry.Stop()
 	}
 
+	if d := getGlobalHybridDemoter(); d != nil {
+		d.Stop()
+		setGlobalHybridDemoter(nil)
+	}
+
+	if GlobalCacheIndex != nil {
+		GlobalCacheIndex.Stop()
+		if GlobalS3Index == GlobalCacheIndex {
+			GlobalS3Index = nil
+		}
+		GlobalCacheIndex = nil
+	}
 	if GlobalS3Index != nil {
 		GlobalS3Index.Stop()
 		GlobalS3Index = nil
@@ -637,14 +649,7 @@ func InitRegistry() {
 	go GlobalRegistry.startDiskFreeMonitor(cfg)
 	go GlobalRegistry.startSpeedMonitor()
 
-	var s3IndexBackend StorageBackend
-	if tb, ok := GlobalStorage.(*TieredStorageBackend); ok && tb.S3() != nil {
-		s3IndexBackend = tb.S3()
-	} else if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-		s3IndexBackend = GlobalStorage
-	}
-
-	if s3IndexBackend != nil {
+	if GlobalStorage != nil && GlobalStorage.Type() != "tmp" {
 		stateDir := ""
 		legacyCacheDir := ""
 		if cfg != nil {
@@ -657,27 +662,41 @@ func InitRegistry() {
 		if stateDir != "" {
 			_ = os.MkdirAll(stateDir, 0755)
 		}
-		indexPath := filepath.Join(stateDir, "s3_index.json")
+		indexPath := filepath.Join(stateDir, "cache_index.json")
 
-		// Seamless upgrade migration: move legacy CACHE_DIR/s3_index.json if present and new STATE_DIR file does not exist.
-		normLegacy := strings.ToLower(strings.TrimSpace(legacyCacheDir))
-		if normLegacy != "" && normLegacy != "none" && normLegacy != "off" && normLegacy != "disabled" {
-			legacyPath := filepath.Join(legacyCacheDir, "s3_index.json")
-			if legacyPath != indexPath && !FileExists(indexPath) && FileExists(legacyPath) {
-				if err := moveFileCrossFS(legacyPath, indexPath); err != nil {
-					log.Printf("[S3Index] Warning: Failed to migrate legacy %s to %s: %v", legacyPath, indexPath, err)
-				} else {
-					log.Printf("[S3Index] Migrated legacy index %s -> %s", legacyPath, indexPath)
+		// Seamless upgrade migration: prefer STATE_DIR/s3_index.json (Phase 1/2), then legacy CACHE_DIR/s3_index.json.
+		if !FileExists(indexPath) {
+			var candidateSrcs []string
+			if stateDir != "" {
+				candidateSrcs = append(candidateSrcs, filepath.Join(stateDir, "s3_index.json"))
+			}
+			normLegacy := strings.ToLower(strings.TrimSpace(legacyCacheDir))
+			if normLegacy != "" && normLegacy != "none" && normLegacy != "off" && normLegacy != "disabled" {
+				candidateSrcs = append(candidateSrcs, filepath.Join(legacyCacheDir, "s3_index.json"))
+			}
+			for _, srcPath := range candidateSrcs {
+				if srcPath != indexPath && FileExists(srcPath) {
+					if err := moveFileCrossFS(srcPath, indexPath); err != nil {
+						log.Printf("[CacheIndex] Warning: Failed to migrate legacy %s to %s: %v", srcPath, indexPath, err)
+					} else {
+						log.Printf("[CacheIndex] Migrated legacy index %s -> %s", srcPath, indexPath)
+					}
+					break
 				}
 			}
 		}
 
-		idx := NewS3AccessIndex(indexPath)
+		idx := NewCacheIndex(indexPath)
 		if err := idx.Load(); err != nil {
-			log.Printf("[S3Index] Warning: Failed to load %s: %v", indexPath, err)
+			log.Printf("[CacheIndex] Warning: Failed to load %s: %v", indexPath, err)
 		}
+		GlobalCacheIndex = idx
 		GlobalS3Index = idx
-		idx.StartBackgroundLoops(s3IndexBackend, GlobalRegistry)
+		idx.StartBackgroundLoops(GlobalStorage, GlobalRegistry)
+
+		if tb, ok := GlobalStorage.(*TieredStorageBackend); ok {
+			setGlobalHybridDemoter(NewHybridDemoter(tb, idx, GlobalRegistry, cfg))
+		}
 	}
 }
 
@@ -860,6 +879,18 @@ func (r *CacheRegistry) startDiskFreeMonitor(cfg *Config) {
 					minFree := EffectiveCacheMinDiskFreeBytes(cfg, GetStorageTopology())
 					if minFree > 0 && space < uint64(minFree) {
 						r.PreEvict(0)
+					}
+				}
+			}
+			if cfg.EffectiveStorageBackend() == "hybrid" {
+				if demoter := getGlobalHybridDemoter(); demoter != nil && demoter.registry == r {
+					if maxBytes := cfg.GetCacheMaxBytes(); maxBytes > 0 {
+						if highPct := cfg.GetHybridDemoteHighWatermark(); highPct > 0 {
+							highBytes := int64(float64(maxBytes) * float64(highPct) / 100.0)
+							if r.GetTotalCacheSize() >= highBytes {
+								demoter.TriggerWatermarkDemotion()
+							}
+						}
 					}
 				}
 			}
@@ -1402,10 +1433,10 @@ func (r *CacheRegistry) LoadExistingCache() {
 			}
 			if !d.IsDir() {
 				base := filepath.Base(path)
-				if base == "s3_index.json" {
+				if base == "s3_index.json" || base == "cache_index.json" {
 					return nil
 				}
-				if strings.HasPrefix(base, "s3_index.json.tmp.") {
+				if strings.HasPrefix(base, "s3_index.json.tmp.") || strings.HasPrefix(base, "cache_index.json.tmp.") {
 					_ = os.Remove(path)
 					return nil
 				}
@@ -1518,7 +1549,7 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 				continue
 			}
 			name := entry.Name()
-			if strings.HasPrefix(name, "s3_index.json") || filepath.Ext(name) == ".json" || filepath.Ext(name) == ".part" {
+			if isAuxiliaryCacheFile(name) {
 				continue
 			}
 			info, err := entry.Info()
@@ -1609,8 +1640,25 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 	return true, ""
 }
 
+func isAuxiliaryCacheFile(name string) bool {
+	if strings.HasPrefix(name, "s3_index.json") || strings.HasPrefix(name, "cache_index.json") {
+		return true
+	}
+	ext := filepath.Ext(name)
+	return ext == ".json" || ext == ".part" || ext == ".staging"
+}
+
 func (r *CacheRegistry) UpdateSize(delta int64) {
-	atomic.AddInt64(&r.TotalCacheSize, delta)
+	for {
+		cur := atomic.LoadInt64(&r.TotalCacheSize)
+		next := cur + delta
+		if next < 0 {
+			next = 0
+		}
+		if atomic.CompareAndSwapInt64(&r.TotalCacheSize, cur, next) {
+			return
+		}
+	}
 }
 
 func (r *CacheRegistry) GetTotalCacheSize() int64 {
@@ -1712,7 +1760,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 
 	var availableFreeable int64
 	for _, entry := range entries {
-		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" || filepath.Ext(entry.Name()) == ".staging" {
+		if entry.IsDir() || isAuxiliaryCacheFile(entry.Name()) {
 			continue
 		}
 		if !activeKeys[entry.Name()] {
@@ -1749,7 +1797,13 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 }
 
 func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
+	if GlobalConfig == nil {
+		return
+	}
 	cacheDir := GlobalConfig.GetCacheDir()
+	if cacheDir == "" {
+		return
+	}
 
 	// Collect completed files in cache directory
 	entries, err := os.ReadDir(cacheDir)
@@ -1758,17 +1812,20 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 		return
 	}
 
+	idx := getGlobalCacheIndex()
+
 	type fileInfo struct {
-		Name       string
-		Path       string
-		Size       int64
-		AccessTime time.Time
+		Name        string
+		Path        string
+		Size        int64
+		AccessTime  time.Time
+		AlreadyOnS3 bool
 	}
 
 	var files []fileInfo
 
 	for _, entry := range entries {
-		if entry.IsDir() || strings.HasPrefix(entry.Name(), "s3_index.json") || filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".part" || filepath.Ext(entry.Name()) == ".staging" {
+		if entry.IsDir() || isAuxiliaryCacheFile(entry.Name()) {
 			continue
 		}
 		path := filepath.Join(cacheDir, entry.Name())
@@ -1777,33 +1834,53 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 			continue
 		}
 
-		// Try to read metadata JSON for last-accessed timestamp
-		metaPath := path + ".json"
 		var lastAccess time.Time
-		metaBytes, err := os.ReadFile(metaPath)
-		if err == nil {
-			var meta FileMeta
-			if json.Unmarshal(metaBytes, &meta) == nil && meta.LastValidated > 0 {
-				lastAccess = time.Unix(meta.LastValidated, 0)
+		var alreadyOnS3 bool
+		if idx != nil {
+			if indexEntry, ok := idx.Get(entry.Name()); ok {
+				alreadyOnS3 = indexEntry.Tier == IndexTierBoth || indexEntry.Tier == IndexTierS3
+				if indexEntry.LastAccessed > 0 {
+					lastAccess = time.Unix(indexEntry.LastAccessed, 0)
+				}
 			}
 		}
 
+		// Fall back to sidecar metadata JSON LastValidated, then filesystem ModTime.
+		if lastAccess.IsZero() {
+			metaPath := path + ".json"
+			if metaBytes, merr := os.ReadFile(metaPath); merr == nil {
+				var meta FileMeta
+				if json.Unmarshal(metaBytes, &meta) == nil && meta.LastValidated > 0 {
+					lastAccess = time.Unix(meta.LastValidated, 0)
+				}
+			}
+		}
 		if lastAccess.IsZero() {
 			lastAccess = info.ModTime()
 		}
 
 		files = append(files, fileInfo{
-			Name:       entry.Name(),
-			Path:       path,
-			Size:       info.Size(),
-			AccessTime: lastAccess,
+			Name:        entry.Name(),
+			Path:        path,
+			Size:        info.Size(),
+			AccessTime:  lastAccess,
+			AlreadyOnS3: alreadyOnS3,
 		})
 	}
 
-	// Sort files by access time ascending (oldest first)
+	// Sort already-backed (Tier=="both") files first, then oldest LastAccessed first.
 	sort.Slice(files, func(i, j int) bool {
-		return files[i].AccessTime.Before(files[j].AccessTime)
+		if files[i].AlreadyOnS3 != files[j].AlreadyOnS3 {
+			return files[i].AlreadyOnS3
+		}
+		if !files[i].AccessTime.Equal(files[j].AccessTime) {
+			return files[i].AccessTime.Before(files[j].AccessTime)
+		}
+		return files[i].Name < files[j].Name
 	})
+
+	ctx := context.Background()
+	tieredStorage, _ := GlobalStorage.(*TieredStorageBackend)
 
 	var freedBytes int64
 	evictedCount := 0
@@ -1819,11 +1896,58 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 			continue // skip active files
 		}
 
+		// In hybrid mode, attempt to preserve un-backed L1 assets by uploading to S3 before deleting locally.
+		// If S3 is unreachable during emergency PreEvict, log and STILL remove local file to prevent disk deadlock.
+		if !file.AlreadyOnS3 && tieredStorage != nil && tieredStorage.S3() != nil {
+			if _, existsInS3, s3Err := tieredStorage.S3().Stat(ctx, baseKey); s3Err == nil && existsInS3 {
+				if idx != nil {
+					idx.MarkAddedToTier(baseKey, IndexTierS3)
+				}
+			} else {
+				var uploadMeta FileMeta
+				metaLoaded := false
+				if tieredStorage.Local() != nil {
+					if m, exists, serr := tieredStorage.Local().Stat(ctx, baseKey); serr == nil && exists && m != nil {
+						uploadMeta = *m
+						metaLoaded = true
+					}
+				}
+				if !metaLoaded {
+					if metaBytes, merr := os.ReadFile(file.Path + ".json"); merr == nil {
+						if json.Unmarshal(metaBytes, &uploadMeta) == nil {
+							metaLoaded = true
+						}
+					}
+				}
+				if !metaLoaded {
+					uploadMeta = FileMeta{TotalSize: file.Size, Completed: true}
+				}
+
+				if uploadErr := tieredStorage.S3().UploadFromFile(ctx, baseKey, file.Path, uploadMeta); uploadErr != nil {
+					log.Printf("[Evictor] Warning: S3 demotion failed for %s during emergency PreEvict (%v); evicting local copy anyway to reclaim disk space", baseKey, uploadErr)
+				} else if idx != nil {
+					if _, exists := idx.Get(baseKey); !exists {
+						idx.RecordCommitForTier(baseKey, uploadMeta, IndexTierBoth)
+					} else {
+						idx.MarkAddedToTier(baseKey, IndexTierS3)
+					}
+				}
+			}
+
+			// Re-check active usage in case a client opened the file while S3 upload was running.
+			if r.IsKeyInUse(baseKey) {
+				continue
+			}
+		}
+
 		// Delete video and metadata JSON
 		_ = os.Remove(file.Path)
 		_ = os.Remove(file.Path + ".json")
 
-		atomic.AddInt64(&r.TotalCacheSize, -file.Size)
+		r.UpdateSize(-file.Size)
+		if idx != nil {
+			idx.MarkRemovedFromTier(baseKey, IndexTierDisk)
+		}
 
 		freedBytes += file.Size
 		evictedCount++

@@ -26,12 +26,20 @@ func saveAndRestorePhase1Globals(t *testing.T) {
 	oldCfg := GlobalConfig
 	oldReg := GlobalRegistry
 	oldStorage := GlobalStorage
+	oldCacheIdx := GlobalCacheIndex
 	oldS3Idx := GlobalS3Index
+	oldDemoter := getGlobalHybridDemoter()
 	oldPM := GlobalPrehydrationManager
 	oldTopo := GetStorageTopology()
 
 	t.Cleanup(func() {
-		if GlobalS3Index != nil && GlobalS3Index != oldS3Idx {
+		if d := getGlobalHybridDemoter(); d != nil && d != oldDemoter {
+			d.Stop()
+		}
+		if GlobalCacheIndex != nil && GlobalCacheIndex != oldCacheIdx {
+			GlobalCacheIndex.Stop()
+		}
+		if GlobalS3Index != nil && GlobalS3Index != oldS3Idx && GlobalS3Index != GlobalCacheIndex {
 			GlobalS3Index.Stop()
 		}
 		if GlobalRegistry != nil && GlobalRegistry != oldReg {
@@ -43,7 +51,9 @@ func saveAndRestorePhase1Globals(t *testing.T) {
 		GlobalConfig = oldCfg
 		GlobalRegistry = oldReg
 		GlobalStorage = oldStorage
+		GlobalCacheIndex = oldCacheIdx
 		GlobalS3Index = oldS3Idx
+		setGlobalHybridDemoter(oldDemoter)
 		GlobalPrehydrationManager = oldPM
 		SetStorageTopology(oldTopo)
 	})
@@ -490,13 +500,13 @@ func TestPhase1TmpAndS3ModesSkipCacheDirAndMetadata(t *testing.T) {
 	InitStorage()
 	InitRegistry()
 
-	newIdxPath := filepath.Join(s3StateDir, "s3_index.json")
+	newIdxPath := filepath.Join(s3StateDir, "cache_index.json")
 	if !FileExists(newIdxPath) {
 		t.Fatalf("Expected s3_index.json to be migrated into STATE_DIR %s", newIdxPath)
 	}
-	count, _ := GlobalS3Index.Stats()
-	if GlobalS3Index == nil || count != 1 {
-		t.Errorf("Expected migrated GlobalS3Index to retain 1 entry, got count=%d (%+v)", count, GlobalS3Index)
+	count, _ := GlobalCacheIndex.Stats()
+	if GlobalCacheIndex == nil || count != 1 {
+		t.Errorf("Expected migrated GlobalCacheIndex to retain 1 entry, got count=%d (%+v)", count, GlobalCacheIndex)
 	}
 
 	// Verify S3 MaterializeDiskFile and Revalidate never create .json in CACHE_DIR

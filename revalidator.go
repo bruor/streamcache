@@ -11,9 +11,66 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
+
+type revalidateFlight struct {
+	done  chan struct{}
+	valid bool
+	meta  *FileMeta
+	err   error
+}
+
+var (
+	revalidateFlightMu sync.Mutex
+	revalidateFlights  = make(map[string]*revalidateFlight)
+)
+
+func cloneFileMetaPtr(m *FileMeta) *FileMeta {
+	if m == nil {
+		return nil
+	}
+	cp := *m
+	return &cp
+}
+
+func overlayMetaFromIndex(meta *FileMeta, entry *CacheIndexEntry, tier StorageTier) {
+	if meta == nil || entry == nil {
+		return
+	}
+	if tier == TierS3 {
+		if entry.LastValidated > meta.LastValidated {
+			meta.LastValidated = entry.LastValidated
+		}
+		if entry.ETag != "" {
+			meta.ETag = entry.ETag
+		}
+		if entry.LastModified != "" {
+			meta.LastModified = entry.LastModified
+		}
+	} else if meta.LastValidated == 0 && entry.LastValidated > 0 {
+		// Local disk .json sidecar is authoritative for mutable local validations/tests;
+		// only backfill LastValidated from CacheIndex when missing on disk.
+		meta.LastValidated = entry.LastValidated
+	}
+	if meta.URL == "" && entry.URL != "" {
+		meta.URL = entry.URL
+	}
+	if meta.TotalSize <= 0 && entry.Size > 0 {
+		meta.TotalSize = entry.Size
+	}
+	if meta.ContentType == "" && entry.ContentType != "" {
+		meta.ContentType = entry.ContentType
+	}
+	if meta.ETag == "" && entry.ETag != "" {
+		meta.ETag = entry.ETag
+	}
+	if meta.LastModified == "" && entry.LastModified != "" {
+		meta.LastModified = entry.LastModified
+	}
+}
 
 var contentRangeRegex = regexp.MustCompile(`/(\d+)\s*$`)
 
@@ -97,18 +154,78 @@ func RevalidateWithMeta(key string, url string, playerHeader http.Header, prefet
 		}
 	}
 
+	if tier == "" && GlobalStorage != nil {
+		switch GlobalStorage.Type() {
+		case "s3":
+			tier = TierS3
+		case "disk":
+			tier = TierDisk
+		}
+	}
+
+	if idx := getGlobalCacheIndex(); idx != nil {
+		if entry, ok := idx.Get(key); ok {
+			overlayMetaFromIndex(&meta, entry, tier)
+		}
+	}
+
 	// Check if the validation time has expired
-	age := time.Since(time.Unix(meta.LastValidated, 0))
-	if age < GlobalConfig.GetCacheRevalidateInterval() {
+	revalidateInterval := GlobalConfig.GetCacheRevalidateInterval()
+	if time.Since(time.Unix(meta.LastValidated, 0)) < revalidateInterval {
 		// Fresh validation, skip network probe
 		return true, &meta, nil
 	}
 
+	// Per-key singleflight coalescing prevents concurrent range requests from stampeding origin probes.
+	revalidateFlightMu.Lock()
+	if existing := revalidateFlights[key]; existing != nil {
+		revalidateFlightMu.Unlock()
+		<-existing.done
+		return existing.valid, cloneFileMetaPtr(existing.meta), existing.err
+	}
+	flight := &revalidateFlight{done: make(chan struct{})}
+	revalidateFlights[key] = flight
+	revalidateFlightMu.Unlock()
+
+	defer func() {
+		revalidateFlightMu.Lock()
+		delete(revalidateFlights, key)
+		revalidateFlightMu.Unlock()
+		close(flight.done)
+	}()
+
+	// Re-check persisted metadata in case an overlapping flight just refreshed LastValidated.
+	if tier == TierS3 {
+		if idx := getGlobalCacheIndex(); idx != nil {
+			if entry, ok := idx.Get(key); ok {
+				overlayMetaFromIndex(&meta, entry, tier)
+				if time.Since(time.Unix(meta.LastValidated, 0)) < revalidateInterval {
+					flight.valid = true
+					flight.meta = cloneFileMetaPtr(&meta)
+					return true, &meta, nil
+				}
+			}
+		}
+	} else if metaPath != "" {
+		if metaBytes, rerr := os.ReadFile(metaPath); rerr == nil {
+			var refreshed FileMeta
+			if json.Unmarshal(metaBytes, &refreshed) == nil && refreshed.LastValidated > 0 &&
+				time.Since(time.Unix(refreshed.LastValidated, 0)) < revalidateInterval {
+				flight.valid = true
+				flight.meta = cloneFileMetaPtr(&refreshed)
+				return true, &refreshed, nil
+			}
+		}
+	}
+
+	age := time.Since(time.Unix(meta.LastValidated, 0))
 	log.Printf("[Revalidate] Cache validation expired for %s (Age: %s). Probing CDN upstream...", key, age.Truncate(time.Second))
 
 	upstreamSize, _, upstreamETag, upstreamLastModified, notModified, err := probeUpstream(context.Background(), url, playerHeader, &meta)
 	if err != nil {
 		log.Printf("[Revalidate] Network probe failed for %s: %v. Soft-failing and serving cache.", key, err)
+		flight.valid = true
+		flight.meta = cloneFileMetaPtr(&meta)
 		return true, &meta, nil
 	}
 
@@ -135,6 +252,7 @@ func RevalidateWithMeta(key string, url string, playerHeader http.Header, prefet
 		if modified {
 			log.Printf("[Revalidate] ALERT: Media content changed on CDN upstream: %s. Evicting cache for %s.", reason, key)
 			evictCachedFile(filePath, metaPath)
+			flight.valid = false
 			return false, nil, nil
 		}
 	}
@@ -154,6 +272,9 @@ func RevalidateWithMeta(key string, url string, playerHeader http.Header, prefet
 	} else if GlobalStorage != nil {
 		_ = GlobalStorage.UpdateMetadata(context.Background(), key, meta)
 	}
+	if idx := getGlobalCacheIndex(); idx != nil && tier != TierS3 {
+		idx.RecordValidation(key, meta, string(tier))
+	}
 	if tier != TierS3 && (GlobalConfig == nil || GlobalConfig.UsesCacheDir()) {
 		newMetaBytes, err := json.Marshal(meta)
 		if err == nil {
@@ -162,6 +283,8 @@ func RevalidateWithMeta(key string, url string, playerHeader http.Header, prefet
 	}
 
 	log.Printf("[Revalidate] Cache validated successfully. Serving HIT for: %s", key)
+	flight.valid = true
+	flight.meta = cloneFileMetaPtr(&meta)
 	return true, &meta, nil
 }
 
@@ -179,26 +302,28 @@ func writeMetaFileAtomic(metaPath string, data []byte) error {
 
 func evictCachedFile(path, metaPath string) {
 	key := filepath.Base(path)
-	if GlobalStorage != nil {
-		_ = GlobalStorage.Delete(context.Background(), key)
-	}
-	if GlobalS3Index != nil {
-		GlobalS3Index.Delete(key)
-	}
 
-	info, err := os.Stat(path)
 	var size int64
-	if err == nil {
+	if info, err := os.Stat(path); err == nil {
 		size = info.Size()
 	}
 
-	if size > 0 {
+	if GlobalStorage != nil {
+		_ = GlobalStorage.Delete(context.Background(), key)
+	}
+	if idx := getGlobalCacheIndex(); idx != nil {
+		idx.Delete(key)
+	}
+
+	if size > 0 && GlobalRegistry != nil {
 		GlobalRegistry.UpdateSize(-size)
 	}
 
 	go func() {
 		_ = os.Remove(path)
-		_ = os.Remove(metaPath)
+		if metaPath != "" {
+			_ = os.Remove(metaPath)
+		}
 	}()
 }
 
