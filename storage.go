@@ -22,6 +22,37 @@ type StorageReadSeeker interface {
 	Size() int64
 }
 
+// TieredReadSeeker is optionally implemented by StorageReadSeeker instances
+// so callers know whether a HIT is served from local "disk" or remote "s3".
+type TieredReadSeeker interface {
+	StorageReadSeeker
+	Tier() StorageTier
+}
+
+// TieredStatBackend is optionally implemented by backends that report which
+// tier holds an object alongside its FileMeta in a single Stat call.
+type TieredStatBackend interface {
+	StatWithTier(ctx context.Context, key string) (*FileMeta, StorageTier, bool, error)
+}
+
+// OpenWithMetaBackend is optionally implemented by backends that can open a
+// reader using already-fetched FileMeta/tier info without issuing another Stat/HeadObject.
+type OpenWithMetaBackend interface {
+	OpenWithMeta(ctx context.Context, key string, meta *FileMeta, tier StorageTier) (StorageReadSeeker, error)
+}
+
+func resolveReaderTier(r StorageReadSeeker, fallback StorageTier) StorageTier {
+	if tr, ok := r.(TieredReadSeeker); ok {
+		if t := tr.Tier(); t != "" {
+			return t
+		}
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return TierDisk
+}
+
 // StorageTier identifies which tier a media file is currently served from or routed to.
 type StorageTier string
 
@@ -124,6 +155,14 @@ func InitStorage() error {
 		return nil
 	case "tmp":
 		GlobalStorage = NewTmpStorageBackend(GlobalConfig.GetTmpDir())
+		return nil
+	case "hybrid":
+		s3Backend, err := NewS3StorageBackend(GlobalConfig.GetS3Config())
+		if err != nil {
+			return err
+		}
+		local := NewLocalStorageBackend(GlobalConfig.GetCacheDir(), GlobalConfig.GetTmpDir())
+		GlobalStorage = NewTieredStorageBackend(local, s3Backend)
 		return nil
 	default:
 		GlobalStorage = NewLocalStorageBackend(GlobalConfig.GetCacheDir(), GlobalConfig.GetTmpDir())

@@ -15,7 +15,7 @@ services:
       - ./tmp:/var/cache/streamcache/tmp
     environment:
       - PORT=8080
-      - STORAGE_BACKEND=disk # Valid options: tmp, disk, s3
+      - STORAGE_BACKEND=disk # Valid options: tmp, disk, s3, hybrid
       - CACHE_DIR=/var/cache/streamcache/files
       - TMP_DIR=/var/cache/streamcache/tmp
       # - STATE_DIR=/var/cache/streamcache/tmp/state

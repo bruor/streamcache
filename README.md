@@ -46,8 +46,8 @@ streamcache is configured using environment variables. Default fallback values a
 | Environment Variable | Default | Description |
 |---|---|---|
 | `PORT` | `:8080` | Port the proxy server listens on. |
-| `STORAGE_BACKEND` | `disk` | Storage backend (`tmp`, `disk`, or `s3`). Setting `disk` with `CACHE_DIR` empty/`none`/`off`/`disabled` routes automatically to `tmp` mode. |
-| `CACHE_DIR` | `./cache/files` | Location where completed cached media files and JSON metadata are stored (only created/used when `STORAGE_BACKEND=disk`). |
+| `STORAGE_BACKEND` | `disk` | Storage backend (`tmp`, `disk`, `s3`, or `hybrid`). Setting `disk` with `CACHE_DIR` disabled routes to `tmp`; setting `hybrid` with `CACHE_DIR` disabled routes to `s3`. |
+| `CACHE_DIR` | `./cache/files` | Location where completed cached media files and JSON metadata are stored (only created/used when `STORAGE_BACKEND=disk` or `hybrid`). |
 | `TMP_DIR` | `./cache/tmp` | Location where active `.part` scratch downloads are assembled (keep bind-mounted on a native hole-punching host SSD/NVMe filesystem). |
 | `STATE_DIR` | `TMP_DIR/state` | Durable internal state directory (e.g. `s3_index.json`), kept independent of `CACHE_DIR`. |
 | `TMP_FILE_MAX_BYTES` | `512MB` | Per-file in-flight scratch budget in `TMP_DIR` before hole-punched upload/staging catches up (floored to at least `2 × chunk size`). |

@@ -26,6 +26,10 @@ func (b *TmpStorageBackend) Stat(ctx context.Context, key string) (*FileMeta, bo
 	return nil, false, nil
 }
 
+func (b *TmpStorageBackend) StatWithTier(ctx context.Context, key string) (*FileMeta, StorageTier, bool, error) {
+	return nil, TierTmp, false, nil
+}
+
 func (b *TmpStorageBackend) Open(ctx context.Context, key string) (StorageReadSeeker, error) {
 	return nil, os.ErrNotExist
 }

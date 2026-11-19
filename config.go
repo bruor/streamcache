@@ -457,17 +457,24 @@ func (c *Config) SetStorageBackend(b string) {
 	}
 }
 
-// EffectiveStorageBackend resolves the active mode ("tmp", "disk", or "s3"),
-// routing disk configs with empty/"none"/"off"/"disabled" CACHE_DIR to ephemeral "tmp" mode.
+// EffectiveStorageBackend resolves the active mode ("tmp", "disk", "s3", or "hybrid"),
+// routing disk/hybrid configs with empty/"none"/"off"/"disabled" CACHE_DIR to "tmp"/"s3" respectively.
 func (c *Config) EffectiveStorageBackend() string {
+	cacheDir := strings.ToLower(strings.TrimSpace(c.GetCacheDir()))
+	cacheDisabled := cacheDir == "" || cacheDir == "none" || cacheDir == "off" || cacheDir == "disabled"
+
 	switch c.GetStorageBackend() {
 	case "s3":
 		return "s3"
 	case "tmp":
 		return "tmp"
+	case "hybrid":
+		if cacheDisabled {
+			return "s3"
+		}
+		return "hybrid"
 	default:
-		cacheDir := strings.ToLower(strings.TrimSpace(c.GetCacheDir()))
-		if cacheDir == "" || cacheDir == "none" || cacheDir == "off" || cacheDir == "disabled" {
+		if cacheDisabled {
 			return "tmp"
 		}
 		return "disk"
@@ -476,7 +483,8 @@ func (c *Config) EffectiveStorageBackend() string {
 
 // UsesCacheDir reports whether this runtime actually reads or writes persistent CACHE_DIR files.
 func (c *Config) UsesCacheDir() bool {
-	return c.EffectiveStorageBackend() == "disk"
+	eff := c.EffectiveStorageBackend()
+	return eff == "disk" || eff == "hybrid"
 }
 
 // clampConcurrency normalizes concurrency values to [1, 16], falling back when val <= 0.
@@ -793,8 +801,8 @@ func detectLegacyConfigWarnings() []string {
 		norm := strings.ToLower(strings.TrimSpace(val))
 		if norm == "local" {
 			warnings = append(warnings, `STORAGE_BACKEND="local" is removed; set STORAGE_BACKEND="disk" instead`)
-		} else if norm != "tmp" && norm != "disk" && norm != "s3" {
-			warnings = append(warnings, "STORAGE_BACKEND="+val+` is invalid; valid values are "tmp", "disk", or "s3"`)
+		} else if norm != "tmp" && norm != "disk" && norm != "s3" && norm != "hybrid" {
+			warnings = append(warnings, "STORAGE_BACKEND="+val+` is invalid; valid values are "tmp", "disk", "s3", or "hybrid"`)
 		}
 	}
 

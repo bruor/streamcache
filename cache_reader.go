@@ -178,7 +178,13 @@ func (r *CacheReader) getS3Reader() (StorageReadSeeker, error) {
 	if GlobalStorage == nil {
 		return nil, errors.New("storage backend not initialized")
 	}
-	s3r, err := GlobalStorage.Open(r.ctx, r.state.Key)
+	var s3r StorageReadSeeker
+	var err error
+	if omb, ok := GlobalStorage.(OpenWithMetaBackend); ok && r.state != nil && r.state.TotalSize > 0 {
+		s3r, err = omb.OpenWithMeta(r.ctx, r.state.Key, &FileMeta{TotalSize: r.state.TotalSize}, TierS3)
+	} else {
+		s3r, err = GlobalStorage.Open(r.ctx, r.state.Key)
+	}
 	if err != nil {
 		return nil, err
 	}

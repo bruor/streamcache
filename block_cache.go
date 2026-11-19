@@ -159,8 +159,8 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 	useScratch := false
 
 	mode := "disk"
-	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-		mode = "s3"
+	if GlobalStorage != nil && (GlobalStorage.Type() == "s3" || GlobalStorage.Type() == "hybrid") {
+		mode = GlobalStorage.Type()
 	} else if GlobalConfig != nil {
 		mode = GlobalConfig.EffectiveStorageBackend()
 	} else if GlobalStorage != nil && GlobalStorage.Type() == "tmp" {
@@ -171,16 +171,34 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 	case "s3":
 		targetTier = TierS3
 		useScratch = true
-		chunkSize := int64(64 * 1024 * 1024)
-		if s3b, ok := GlobalStorage.(*S3StorageBackend); ok && s3b.ChunkSize() > 0 {
-			chunkSize = s3b.ChunkSize()
-		} else if GlobalConfig != nil {
-			chunkSize = GlobalConfig.GetS3Config().ChunkSize
-		}
-		s.ChunkManager = NewScratchChunkManager(s, GlobalStorage, chunkSize)
+		s3Target, chunkSize := resolveS3TargetBackend()
+		s.ChunkManager = NewScratchChunkManager(s, s3Target, chunkSize)
 	case "tmp":
 		targetTier = TierTmp
 		useScratch = false
+	case "hybrid":
+		admit := true
+		reason := ""
+		if GlobalRegistry != nil {
+			admit, reason = GlobalRegistry.CanAdmitToHybridL1(totalSize)
+		}
+		if admit {
+			targetTier = TierDisk
+			s.TargetTier = targetTier
+			s.configureNASStagingTarget()
+			useScratch = s.UseScratchManager
+		} else {
+			s3Target, chunkSize := resolveS3TargetBackend()
+			if s3Target == nil {
+				targetTier = TierTmp
+				useScratch = false
+			} else {
+				targetTier = TierS3
+				useScratch = true
+				s.ChunkManager = NewScratchChunkManager(s, s3Target, chunkSize)
+			}
+			log.Printf("[Admission] Bypassing hybrid L1 for %s (%d bytes -> %s): %s", key, totalSize, targetTier, reason)
+		}
 	default:
 		admit := true
 		reason := ""
@@ -193,29 +211,9 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 			log.Printf("[Admission] Bypassing L1 disk cache for %s (%d bytes -> TierTmp): %s", key, totalSize, reason)
 		} else {
 			targetTier = TierDisk
-			topo := GetStorageTopology()
-			cacheDir := ""
-			if GlobalConfig != nil {
-				cacheDir = GlobalConfig.GetCacheDir()
-			}
-			if topo != nil && topo.CrossFSStaging && cacheDir != "" {
-				useScratch = true
-				chunkSize := int64(16 * 1024 * 1024)
-				if GlobalConfig != nil {
-					if s3cs := GlobalConfig.GetS3Config().ChunkSize; s3cs > 0 && s3cs < chunkSize {
-						chunkSize = s3cs
-					}
-					if maxTmp := GlobalConfig.GetTmpFileMaxBytes(); maxTmp > 0 && chunkSize > maxTmp/2 {
-						if half := maxTmp / 2; half > 0 {
-							chunkSize = half
-						}
-					}
-				}
-				nasTarget := NewNASStagingTarget(cacheDir, key, topo.SequentialNASStage)
-				s.ChunkManager = NewScratchChunkManagerWithTarget(s, nasTarget, chunkSize)
-				log.Printf("[Admission] Admitted %s (%d bytes) to TierDisk with cross-FS NAS staging (sequential=%v, punchHole=%v)",
-					key, totalSize, topo.SequentialNASStage, topo.TmpPunchHoleSupported)
-			}
+			s.TargetTier = targetTier
+			s.configureNASStagingTarget()
+			useScratch = s.UseScratchManager
 		}
 	}
 
@@ -223,6 +221,47 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 	s.UseScratchManager = useScratch
 	s.Cond = sync.NewCond(&s.Lock)
 	return s
+}
+
+func resolveS3TargetBackend() (StorageBackend, int64) {
+	s3Target := GlobalStorage
+	if tb, ok := GlobalStorage.(*TieredStorageBackend); ok && tb.S3() != nil {
+		s3Target = tb.S3()
+	}
+	chunkSize := int64(64 * 1024 * 1024)
+	if s3b, ok := s3Target.(*S3StorageBackend); ok && s3b.ChunkSize() > 0 {
+		chunkSize = s3b.ChunkSize()
+	} else if GlobalConfig != nil {
+		chunkSize = GlobalConfig.GetS3Config().ChunkSize
+	}
+	return s3Target, chunkSize
+}
+
+func (s *FileCacheState) configureNASStagingTarget() {
+	topo := GetStorageTopology()
+	cacheDir := ""
+	if GlobalConfig != nil {
+		cacheDir = GlobalConfig.GetCacheDir()
+	}
+	if topo == nil || !topo.CrossFSStaging || cacheDir == "" {
+		return
+	}
+	s.UseScratchManager = true
+	chunkSize := int64(16 * 1024 * 1024)
+	if GlobalConfig != nil {
+		if s3cs := GlobalConfig.GetS3Config().ChunkSize; s3cs > 0 && s3cs < chunkSize {
+			chunkSize = s3cs
+		}
+		if maxTmp := GlobalConfig.GetTmpFileMaxBytes(); maxTmp > 0 && chunkSize > maxTmp/2 {
+			if half := maxTmp / 2; half > 0 {
+				chunkSize = half
+			}
+		}
+	}
+	nasTarget := NewNASStagingTarget(cacheDir, s.Key, topo.SequentialNASStage)
+	s.ChunkManager = NewScratchChunkManagerWithTarget(s, nasTarget, chunkSize)
+	log.Printf("[Admission] Admitted %s (%d bytes) to TierDisk with cross-FS NAS staging (sequential=%v, punchHole=%v)",
+		s.Key, s.TotalSize, topo.SequentialNASStage, topo.TmpPunchHoleSupported)
 }
 
 func (s *FileCacheState) targetTierLocked() StorageTier {
@@ -598,7 +637,14 @@ func InitRegistry() {
 	go GlobalRegistry.startDiskFreeMonitor(cfg)
 	go GlobalRegistry.startSpeedMonitor()
 
-	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+	var s3IndexBackend StorageBackend
+	if tb, ok := GlobalStorage.(*TieredStorageBackend); ok && tb.S3() != nil {
+		s3IndexBackend = tb.S3()
+	} else if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		s3IndexBackend = GlobalStorage
+	}
+
+	if s3IndexBackend != nil {
 		stateDir := ""
 		legacyCacheDir := ""
 		if cfg != nil {
@@ -631,7 +677,7 @@ func InitRegistry() {
 			log.Printf("[S3Index] Warning: Failed to load %s: %v", indexPath, err)
 		}
 		GlobalS3Index = idx
-		idx.StartBackgroundLoops(GlobalStorage, GlobalRegistry)
+		idx.StartBackgroundLoops(s3IndexBackend, GlobalRegistry)
 	}
 }
 
@@ -1149,7 +1195,7 @@ func (r *CacheRegistry) SetConnectionInCache(connID string, inCache bool) {
 	if inCache {
 		if fs != nil {
 			resolvedSource = string(fs.GetTargetTier())
-		} else if GlobalStorage != nil && GlobalStorage.Type() != "" {
+		} else if GlobalStorage != nil && GlobalStorage.Type() != "" && GlobalStorage.Type() != "hybrid" {
 			resolvedSource = GlobalStorage.Type()
 		} else {
 			resolvedSource = string(TierDisk)
@@ -1404,9 +1450,20 @@ func (r *CacheRegistry) LoadExistingCache() {
 }
 
 // CanAdmitToDiskL1 decides whether an incoming item of totalSize bytes can be admitted to the persistent
-// CACHE_DIR (TierDisk) without violating CACHE_MAX_ITEM_PCT, evicting active/pinned files, or breaching
-// CACHE_MAX_BYTES / EffectiveCacheMinDiskFreeBytes. Otherwise callers route the file to TierTmp.
+// CACHE_DIR (TierDisk) in disk mode without violating CACHE_MAX_ITEM_PCT, evicting active/pinned files,
+// or breaching CACHE_MAX_BYTES / EffectiveCacheMinDiskFreeBytes. Otherwise callers route to TierTmp.
 func (r *CacheRegistry) CanAdmitToDiskL1(totalSize int64) (bool, string) {
+	return r.canAdmitToL1(totalSize, true)
+}
+
+// CanAdmitToHybridL1 decides whether an incoming item can be admitted to CACHE_DIR in hybrid mode
+// using only unallocated L1 headroom (without forcing eviction of warm L1 items or active viewers).
+// Items not admitted bypass cleanly to TierS3.
+func (r *CacheRegistry) CanAdmitToHybridL1(totalSize int64) (bool, string) {
+	return r.canAdmitToL1(totalSize, false)
+}
+
+func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool, string) {
 	if GlobalConfig == nil {
 		return true, ""
 	}
@@ -1414,6 +1471,9 @@ func (r *CacheRegistry) CanAdmitToDiskL1(totalSize int64) (bool, string) {
 		return false, "cache_dir_disabled"
 	}
 	if totalSize <= 0 {
+		if !allowEviction {
+			return false, "unknown_size_bypass"
+		}
 		return true, ""
 	}
 
@@ -1509,9 +1569,15 @@ func (r *CacheRegistry) CanAdmitToDiskL1(totalSize int64) (bool, string) {
 		}
 	}
 
-	if maxBytes > 0 && (pinnedL1Bytes+totalSize) > maxBytes {
-		return false, fmt.Sprintf("pinned L1 bytes (%d) + item (%d) exceeds CACHE_MAX_BYTES (%d) even after evicting all inactive files (%d)",
-			pinnedL1Bytes, totalSize, maxBytes, inactiveEvictableBytes)
+	if maxBytes > 0 {
+		committedL1 := pinnedL1Bytes
+		if !allowEviction {
+			committedL1 += inactiveEvictableBytes
+		}
+		if committedL1+totalSize > maxBytes {
+			return false, fmt.Sprintf("L1 occupancy (%d) + item (%d) exceeds CACHE_MAX_BYTES (%d) (allowEviction=%v, inactive=%d)",
+				committedL1, totalSize, maxBytes, allowEviction, inactiveEvictableBytes)
+		}
 	}
 
 	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
@@ -1527,7 +1593,7 @@ func (r *CacheRegistry) CanAdmitToDiskL1(totalSize int64) (bool, string) {
 			required += uint64(minDiskFree)
 		}
 		maxAvailable := freeSpace
-		if inactiveEvictableBytes > 0 {
+		if allowEviction && inactiveEvictableBytes > 0 {
 			if freeSpace > math.MaxUint64-uint64(inactiveEvictableBytes) {
 				maxAvailable = math.MaxUint64
 			} else {
@@ -1535,8 +1601,8 @@ func (r *CacheRegistry) CanAdmitToDiskL1(totalSize int64) (bool, string) {
 			}
 		}
 		if maxAvailable < required {
-			return false, fmt.Sprintf("insufficient L1 disk space (free %d + evictable %d < required %d)",
-				freeSpace, inactiveEvictableBytes, required)
+			return false, fmt.Sprintf("insufficient L1 disk space (available %d < required %d, allowEviction=%v)",
+				maxAvailable, required, allowEviction)
 		}
 	}
 

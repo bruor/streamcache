@@ -33,6 +33,11 @@ func (b *LocalStorageBackend) Type() string {
 }
 
 func (b *LocalStorageBackend) Stat(ctx context.Context, key string) (*FileMeta, bool, error) {
+	meta, _, exists, err := b.StatWithTier(ctx, key)
+	return meta, exists, err
+}
+
+func (b *LocalStorageBackend) StatWithTier(ctx context.Context, key string) (*FileMeta, StorageTier, bool, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
@@ -40,9 +45,9 @@ func (b *LocalStorageBackend) Stat(ctx context.Context, key string) (*FileMeta, 
 	info, err := os.Stat(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, false, nil
+			return nil, "", false, nil
 		}
-		return nil, false, err
+		return nil, "", false, err
 	}
 
 	metaPath := filePath + ".json"
@@ -50,7 +55,7 @@ func (b *LocalStorageBackend) Stat(ctx context.Context, key string) (*FileMeta, 
 	if err == nil {
 		var meta FileMeta
 		if err := json.Unmarshal(metaBytes, &meta); err == nil {
-			return &meta, true, nil
+			return &meta, TierDisk, true, nil
 		}
 	}
 
@@ -60,7 +65,7 @@ func (b *LocalStorageBackend) Stat(ctx context.Context, key string) (*FileMeta, 
 		LastValidated: info.ModTime().Unix(),
 		Completed:     true,
 	}
-	return &meta, true, nil
+	return &meta, TierDisk, true, nil
 }
 
 type localFileReadSeeker struct {
@@ -90,6 +95,14 @@ func (r *localFileReadSeeker) Close() error {
 
 func (r *localFileReadSeeker) Size() int64 {
 	return r.size
+}
+
+func (r *localFileReadSeeker) Tier() StorageTier {
+	return TierDisk
+}
+
+func (b *LocalStorageBackend) OpenWithMeta(ctx context.Context, key string, _ *FileMeta, _ StorageTier) (StorageReadSeeker, error) {
+	return b.Open(ctx, key)
 }
 
 func (b *LocalStorageBackend) Open(ctx context.Context, key string) (StorageReadSeeker, error) {

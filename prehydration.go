@@ -818,7 +818,11 @@ func (pm *PrehydrationManager) Enqueue(targetURL string, nextURLs []string) {
 	if isAssetCached(context.Background(), cacheFileName, cacheFilePath) {
 		log.Printf("[Prehydration] Episode %s is already cached (Cache HIT). Chaining to next in sequence.", targetURL)
 		if GlobalS3Index != nil && !GlobalS3Index.TouchIfPresent(cacheFileName) && GlobalStorage != nil {
-			if sm, exists, err := GlobalStorage.Stat(context.Background(), cacheFileName); err == nil && exists && sm != nil {
+			if tsb, ok := GlobalStorage.(TieredStatBackend); ok {
+				if sm, tier, exists, err := tsb.StatWithTier(context.Background(), cacheFileName); err == nil && exists && sm != nil && tier == TierS3 {
+					GlobalS3Index.RecordAccess(cacheFileName, targetURL, sm.TotalSize)
+				}
+			} else if sm, exists, err := GlobalStorage.Stat(context.Background(), cacheFileName); err == nil && exists && sm != nil {
 				GlobalS3Index.RecordAccess(cacheFileName, targetURL, sm.TotalSize)
 			}
 		}

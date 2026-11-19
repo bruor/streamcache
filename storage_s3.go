@@ -153,6 +153,11 @@ func (b *S3StorageBackend) mapToMeta(m map[string]string) FileMeta {
 }
 
 func (b *S3StorageBackend) Stat(ctx context.Context, key string) (*FileMeta, bool, error) {
+	meta, _, exists, err := b.StatWithTier(ctx, key)
+	return meta, exists, err
+}
+
+func (b *S3StorageBackend) StatWithTier(ctx context.Context, key string) (*FileMeta, StorageTier, bool, error) {
 	targetKey := b.monolithicKey(key)
 	resp, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
@@ -162,9 +167,9 @@ func (b *S3StorageBackend) Stat(ctx context.Context, key string) (*FileMeta, boo
 		var nfe *types.NoSuchKey
 		var notFound *types.NotFound
 		if errors.As(err, &nfe) || errors.As(err, &notFound) || strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NotFound") {
-			return nil, false, nil
+			return nil, "", false, nil
 		}
-		return nil, false, err
+		return nil, "", false, err
 	}
 
 	meta := b.mapToMeta(resp.Metadata)
@@ -172,7 +177,7 @@ func (b *S3StorageBackend) Stat(ctx context.Context, key string) (*FileMeta, boo
 		meta.TotalSize = *resp.ContentLength
 	}
 	meta.Completed = true
-	return &meta, true, nil
+	return &meta, TierS3, true, nil
 }
 
 const s3ReadRequestTimeout = 30 * time.Second
@@ -193,6 +198,10 @@ type s3ReadSeeker struct {
 
 func (r *s3ReadSeeker) Size() int64 {
 	return r.totalSize
+}
+
+func (r *s3ReadSeeker) Tier() StorageTier {
+	return TierS3
 }
 
 func (r *s3ReadSeeker) Close() error {
@@ -360,7 +369,18 @@ func (b *S3StorageBackend) Open(ctx context.Context, key string) (StorageReadSee
 	if !exists {
 		return nil, os.ErrNotExist
 	}
+	return b.openKnownSize(ctx, key, meta.TotalSize), nil
+}
 
+// OpenWithMeta opens an s3ReadSeeker without issuing a HeadObject call when meta.TotalSize is already known.
+func (b *S3StorageBackend) OpenWithMeta(ctx context.Context, key string, meta *FileMeta, _ StorageTier) (StorageReadSeeker, error) {
+	if meta != nil && meta.TotalSize > 0 {
+		return b.openKnownSize(ctx, key, meta.TotalSize), nil
+	}
+	return b.Open(ctx, key)
+}
+
+func (b *S3StorageBackend) openKnownSize(ctx context.Context, key string, totalSize int64) StorageReadSeeker {
 	baseCtx := ctx
 	if baseCtx == nil {
 		baseCtx = context.Background()
@@ -371,10 +391,10 @@ func (b *S3StorageBackend) Open(ctx context.Context, key string) (StorageReadSee
 		client:    b.client,
 		bucket:    b.bucket,
 		key:       b.monolithicKey(key),
-		totalSize: meta.TotalSize,
+		totalSize: totalSize,
 		ctx:       readerCtx,
 		cancel:    cancel,
-	}, nil
+	}
 }
 
 func (b *S3StorageBackend) OpenRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
@@ -679,8 +699,26 @@ func (b *S3StorageBackend) RecomposeWithProgress(ctx context.Context, key string
 	return nil
 }
 
+// CommitLocalFile streams localPartPath into vod/<key> (using concurrent multipart UploadPart for > chunkSize files).
 func (b *S3StorageBackend) CommitLocalFile(ctx context.Context, key string, localPartPath string, meta FileMeta) error {
-	f, err := os.Open(localPartPath)
+	return b.UploadFromFile(ctx, key, localPartPath, meta)
+}
+
+// UploadFromFile uploads an intact local file directly to S3 vod/<key> in a single pass
+// using concurrent multipart UploadPart when larger than S3_CHUNK_SIZE (safe for > 5 GB objects).
+func (b *S3StorageBackend) UploadFromFile(ctx context.Context, key string, filePath string, meta FileMeta) error {
+	return b.UploadFromFileWithProgress(ctx, key, filePath, meta, commitProgressFromContext(ctx))
+}
+
+// UploadFromFileWithProgress streams filePath directly to vod/<key> while reporting CommitProgress updates.
+func (b *S3StorageBackend) UploadFromFileWithProgress(ctx context.Context, key string, filePath string, meta FileMeta, onProgress CommitProgressFunc) error {
+	report := func(stage string, done, total int) {
+		if onProgress != nil {
+			onProgress(stage, done, total)
+		}
+	}
+
+	f, err := os.Open(filePath)
 	if err != nil {
 		return err
 	}
@@ -691,19 +729,199 @@ func (b *S3StorageBackend) CommitLocalFile(ctx context.Context, key string, loca
 		return err
 	}
 
+	fileSize := stat.Size()
 	targetKey := b.monolithicKey(key)
 	meta.Completed = true
-	meta.TotalSize = stat.Size()
-	meta.LastValidated = time.Now().Unix()
+	meta.TotalSize = fileSize
+	if meta.LastValidated == 0 {
+		meta.LastValidated = time.Now().Unix()
+	}
 
-	_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:        aws.String(b.bucket),
-		Key:           aws.String(targetKey),
-		Body:          f,
-		ContentLength: aws.Int64(stat.Size()),
-		Metadata:      b.metaToMap(meta),
+	partSize, isMultipart := CalculateDynamicChunkConfig(fileSize, b.chunkSize)
+	if !isMultipart || fileSize == 0 || partSize <= 0 {
+		report("uploading", 0, 1)
+		_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:        aws.String(b.bucket),
+			Key:           aws.String(targetKey),
+			Body:          f,
+			ContentLength: aws.Int64(fileSize),
+			Metadata:      b.metaToMap(meta),
+		})
+		FadviseDontNeed(f.Fd(), 0, 0)
+		if err != nil {
+			return err
+		}
+		report("finalizing", 1, 1)
+		return nil
+	}
+
+	totalParts := int((fileSize + partSize - 1) / partSize)
+	if totalParts <= 1 {
+		report("uploading", 0, 1)
+		_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:        aws.String(b.bucket),
+			Key:           aws.String(targetKey),
+			Body:          f,
+			ContentLength: aws.Int64(fileSize),
+			Metadata:      b.metaToMap(meta),
+		})
+		FadviseDontNeed(f.Fd(), 0, 0)
+		if err != nil {
+			return err
+		}
+		report("finalizing", 1, 1)
+		return nil
+	}
+
+	createResp, err := b.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket:   aws.String(b.bucket),
+		Key:      aws.String(targetKey),
+		Metadata: b.metaToMap(meta),
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	uploadID := createResp.UploadId
+	var completedSuccessfully bool
+	defer func() {
+		if !completedSuccessfully && uploadID != nil && *uploadID != "" {
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer abortCancel()
+			_, _ = b.client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(b.bucket),
+				Key:      aws.String(targetKey),
+				UploadId: uploadID,
+			})
+		}
+	}()
+
+	report("uploading", 0, totalParts)
+
+	completedParts := make([]types.CompletedPart, totalParts)
+	workers := clampConcurrency(b.uploadConcurrency, 4)
+	if workers > totalParts {
+		workers = totalParts
+	}
+
+	uploadCtx, cancelUpload := context.WithCancel(ctx)
+	defer cancelUpload()
+
+	jobs := make(chan int, totalParts)
+	for i := 0; i < totalParts; i++ {
+		jobs <- i
+	}
+	close(jobs)
+
+	var progressMu sync.Mutex
+	completedCount := 0
+	var errOnce sync.Once
+	var firstErr error
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := range jobs {
+				if uploadCtx.Err() != nil {
+					return
+				}
+
+				partOffset := int64(i) * partSize
+				partLen := partSize
+				if partOffset+partLen > fileSize {
+					partLen = fileSize - partOffset
+				}
+				partNumber := int32(i + 1)
+
+				var upResp *s3.UploadPartOutput
+				var partErr error
+				for attempt := 1; attempt <= 3; attempt++ {
+					if uploadCtx.Err() != nil {
+						partErr = uploadCtx.Err()
+						break
+					}
+
+					sr := io.NewSectionReader(f, partOffset, partLen)
+					upResp, partErr = b.client.UploadPart(uploadCtx, &s3.UploadPartInput{
+						Bucket:        aws.String(b.bucket),
+						Key:           aws.String(targetKey),
+						UploadId:      uploadID,
+						PartNumber:    aws.Int32(partNumber),
+						Body:          sr,
+						ContentLength: aws.Int64(partLen),
+					})
+					if partErr == nil {
+						if upResp == nil || upResp.ETag == nil {
+							partErr = fmt.Errorf("UploadPart returned empty ETag for part %d", partNumber)
+						} else {
+							break
+						}
+					}
+
+					if attempt < 3 {
+						jitter := time.Duration((time.Now().UnixNano()+int64(i*37+workerID*13))%50) * time.Millisecond
+						backoff := time.Duration(75*attempt)*time.Millisecond + jitter
+						timer := time.NewTimer(backoff)
+						select {
+						case <-uploadCtx.Done():
+							timer.Stop()
+							partErr = uploadCtx.Err()
+							attempt = 3
+						case <-timer.C:
+						}
+					}
+				}
+
+				if partErr != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("UploadPart failed for part %d: %w", partNumber, partErr)
+						cancelUpload()
+					})
+					return
+				}
+
+				completedParts[i] = types.CompletedPart{
+					PartNumber: aws.Int32(partNumber),
+					ETag:       upResp.ETag,
+				}
+				FadviseDontNeed(f.Fd(), partOffset, partLen)
+
+				progressMu.Lock()
+				completedCount++
+				done := completedCount
+				report("uploading", done, totalParts)
+				progressMu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	report("finalizing", 0, 1)
+	_, err = b.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(b.bucket),
+		Key:      aws.String(targetKey),
+		UploadId: uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("CompleteMultipartUpload failed: %w", err)
+	}
+
+	completedSuccessfully = true
+	FadviseDontNeed(f.Fd(), 0, 0)
+	report("finalizing", 1, 1)
+	return nil
 }
 
 func (b *S3StorageBackend) Delete(ctx context.Context, key string) error {

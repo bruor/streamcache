@@ -26,24 +26,45 @@ var GlobalInFlightProbes atomic.Int32
 //   - bool: true if cache is valid (serve it), false if cache is invalid/evicted (must re-download)
 //   - error: error if critical validation pipeline fails
 func Revalidate(key string, url string, playerHeader http.Header) (bool, error) {
+	valid, _, err := RevalidateWithMeta(key, url, playerHeader, nil, "")
+	return valid, err
+}
+
+// RevalidateWithMeta validates a cached item while reusing already-fetched metadata
+// and resolved tier info (avoiding redundant storage Stat/HeadObject round-trips).
+func RevalidateWithMeta(key string, url string, playerHeader http.Header, prefetchedMeta *FileMeta, tier StorageTier) (bool, *FileMeta, error) {
 	filePath := filepath.Join(GlobalConfig.GetCacheDir(), key)
 	metaPath := filePath + ".json"
 
 	var meta FileMeta
 	var found bool
 
-	if GlobalStorage != nil {
-		sm, exists, err := GlobalStorage.Stat(context.Background(), key)
-		if err == nil && exists && sm != nil {
-			meta = *sm
-			found = true
+	if prefetchedMeta != nil {
+		meta = *prefetchedMeta
+		found = true
+	} else if GlobalStorage != nil {
+		if tsb, ok := GlobalStorage.(TieredStatBackend); ok {
+			sm, stier, exists, err := tsb.StatWithTier(context.Background(), key)
+			if err == nil && exists && sm != nil {
+				meta = *sm
+				if tier == "" {
+					tier = stier
+				}
+				found = true
+			}
+		} else {
+			sm, exists, err := GlobalStorage.Stat(context.Background(), key)
+			if err == nil && exists && sm != nil {
+				meta = *sm
+				found = true
+			}
 		}
 	}
 
 	if !found {
 		// If cached file doesn't exist, we consider it valid (we'll start a fresh download)
-		if !FileExists(filePath) {
-			return true, nil
+		if (GlobalConfig != nil && !GlobalConfig.UsesCacheDir()) || !FileExists(filePath) {
+			return true, nil, nil
 		}
 
 		// Read metadata
@@ -55,13 +76,13 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 			if err != nil {
 				log.Printf("[Revalidate] Failed to recreate metadata for %s: %v. Evicting.", key, err)
 				evictCachedFile(filePath, metaPath)
-				return false, nil
+				return false, nil, nil
 			}
 			// Read it back to continue validation
 			metaBytes, err = os.ReadFile(metaPath)
 			if err != nil {
 				evictCachedFile(filePath, metaPath)
-				return false, nil
+				return false, nil, nil
 			}
 		}
 
@@ -69,7 +90,10 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 		if err != nil {
 			log.Printf("[Revalidate] Metadata corrupted for cached file %s. Evicting.", key)
 			evictCachedFile(filePath, metaPath)
-			return false, nil
+			return false, nil, nil
+		}
+		if tier == "" {
+			tier = TierDisk
 		}
 	}
 
@@ -77,7 +101,7 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	age := time.Since(time.Unix(meta.LastValidated, 0))
 	if age < GlobalConfig.GetCacheRevalidateInterval() {
 		// Fresh validation, skip network probe
-		return true, nil
+		return true, &meta, nil
 	}
 
 	log.Printf("[Revalidate] Cache validation expired for %s (Age: %s). Probing CDN upstream...", key, age.Truncate(time.Second))
@@ -85,7 +109,7 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	upstreamSize, _, upstreamETag, upstreamLastModified, notModified, err := probeUpstream(context.Background(), url, playerHeader, &meta)
 	if err != nil {
 		log.Printf("[Revalidate] Network probe failed for %s: %v. Soft-failing and serving cache.", key, err)
-		return true, nil
+		return true, &meta, nil
 	}
 
 	if notModified {
@@ -111,7 +135,7 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 		if modified {
 			log.Printf("[Revalidate] ALERT: Media content changed on CDN upstream: %s. Evicting cache for %s.", reason, key)
 			evictCachedFile(filePath, metaPath)
-			return false, nil
+			return false, nil, nil
 		}
 	}
 
@@ -125,10 +149,12 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 			meta.LastModified = upstreamLastModified
 		}
 	}
-	if GlobalStorage != nil {
+	if tb, ok := GlobalStorage.(*TieredStorageBackend); ok {
+		_ = tb.UpdateMetadataForTier(context.Background(), key, meta, tier)
+	} else if GlobalStorage != nil {
 		_ = GlobalStorage.UpdateMetadata(context.Background(), key, meta)
 	}
-	if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
+	if tier != TierS3 && (GlobalConfig == nil || GlobalConfig.UsesCacheDir()) {
 		newMetaBytes, err := json.Marshal(meta)
 		if err == nil {
 			_ = writeMetaFileAtomic(metaPath, newMetaBytes)
@@ -136,7 +162,7 @@ func Revalidate(key string, url string, playerHeader http.Header) (bool, error) 
 	}
 
 	log.Printf("[Revalidate] Cache validated successfully. Serving HIT for: %s", key)
-	return true, nil
+	return true, &meta, nil
 }
 
 func writeMetaFileAtomic(metaPath string, data []byte) error {

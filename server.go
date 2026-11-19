@@ -186,8 +186,17 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// 3. Cache HIT Path with Revalidation
 	var cacheHit bool
 	var cacheMeta *FileMeta
+	var hitTier StorageTier
 	if GlobalStorage != nil {
-		if meta, exists, err := GlobalStorage.Stat(r.Context(), cacheFileName); err != nil {
+		if tsb, ok := GlobalStorage.(TieredStatBackend); ok {
+			if meta, tier, exists, err := tsb.StatWithTier(r.Context(), cacheFileName); err != nil {
+				log.Printf("[Server] Storage Stat error for %s: %v (falling back to hydration check)", cacheFileName, err)
+			} else if exists {
+				cacheHit = true
+				cacheMeta = meta
+				hitTier = tier
+			}
+		} else if meta, exists, err := GlobalStorage.Stat(r.Context(), cacheFileName); err != nil {
 			log.Printf("[Server] Storage Stat error for %s: %v (falling back to hydration check)", cacheFileName, err)
 		} else if exists {
 			cacheHit = true
@@ -195,16 +204,24 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if cacheFilePath != "" && FileExists(cacheFilePath) {
 		cacheHit = true
+		hitTier = TierDisk
 	}
 
 	if cacheHit {
-		valid, err := Revalidate(cacheFileName, targetURL, r.Header)
+		valid, updatedMeta, err := RevalidateWithMeta(cacheFileName, targetURL, r.Header, cacheMeta, hitTier)
+		if updatedMeta != nil {
+			cacheMeta = updatedMeta
+		}
 		if err != nil {
 			log.Printf("[Server] Revalidate error for %s: %v", cacheFileName, err)
 		} else if valid {
 			var reader StorageReadSeeker
 			if GlobalStorage != nil {
-				reader, err = GlobalStorage.Open(r.Context(), cacheFileName)
+				if omb, ok := GlobalStorage.(OpenWithMetaBackend); ok {
+					reader, err = omb.OpenWithMeta(r.Context(), cacheFileName, cacheMeta, hitTier)
+				} else {
+					reader, err = GlobalStorage.Open(r.Context(), cacheFileName)
+				}
 			} else {
 				f, ferr := os.Open(cacheFilePath)
 				if ferr == nil {
@@ -234,10 +251,11 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					startOffset = parseRangeStart(r.Header.Get("Range"))
 				}
 
-				cacheSource := string(TierDisk)
-				if GlobalStorage != nil && GlobalStorage.Type() != "" {
-					cacheSource = GlobalStorage.Type()
+				fallbackTier := hitTier
+				if fallbackTier == "" && GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+					fallbackTier = TierS3
 				}
+				cacheSource := string(resolveReaderTier(reader, fallbackTier))
 				conn := &ClientConnection{
 					ID:             connID,
 					Key:            cacheFileName,
@@ -275,7 +293,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 							if newRead >= minThreshold || (fileSize > 0 && newRead >= fileSize) {
 								hitPrehydrateOnce.Do(func() {
 									if GlobalS3Index != nil {
-										GlobalS3Index.RecordAccess(cacheFileName, targetURL, fileSize)
+										if cacheSource == string(TierS3) {
+											GlobalS3Index.RecordAccess(cacheFileName, targetURL, fileSize)
+										}
 										if len(nextURLs) > 0 {
 											GlobalS3Index.TouchChain(nextURLs)
 										}
@@ -294,7 +314,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 				if cacheMeta != nil && cacheMeta.ContentType != "" {
 					w.Header().Set("Content-Type", cacheMeta.ContentType)
-				} else if GlobalConfig == nil || GlobalConfig.UsesCacheDir() {
+				} else if hitTier != TierS3 && cacheSource != string(TierS3) && cacheFilePath != "" && (GlobalConfig == nil || GlobalConfig.UsesCacheDir()) {
 					metaPath := cacheFilePath + ".json"
 					if metaBytes, err := os.ReadFile(metaPath); err == nil {
 						var meta FileMeta
