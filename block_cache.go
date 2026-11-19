@@ -105,7 +105,10 @@ type FileCacheState struct {
 	Sniffed              bool
 	LiveBuffer           *LiveBuffer
 	Pipeline             StorageSink
-	ChunkManager         *S3ChunkManager
+	ChunkManager         *ScratchChunkManager
+	TargetTier           StorageTier // Explicit storage tier routing ("disk", "s3", "probe")
+	UseScratchManager    bool        // True when staged chunks use ScratchChunkManager hole-punching
+	AccountedCacheBytes  int64       // Bytes contributed to GlobalRegistry.TotalCacheSize (TierDisk only)
 	IsPrehydrating       bool
 	IsYielding           bool
 	IsProbe              bool
@@ -149,17 +152,53 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		LastProgressTimeNano:      time.Now().UnixNano(),
 		StalledGaps:               make(map[int64]int64),
 	}
+	targetTier := TierDisk
+	useScratch := false
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+		targetTier = TierS3
+		useScratch = true
 		chunkSize := int64(64 * 1024 * 1024)
 		if s3b, ok := GlobalStorage.(*S3StorageBackend); ok && s3b.ChunkSize() > 0 {
 			chunkSize = s3b.ChunkSize()
 		} else if GlobalConfig != nil {
 			chunkSize = GlobalConfig.GetS3Config().ChunkSize
 		}
-		s.ChunkManager = NewS3ChunkManager(s, GlobalStorage, chunkSize)
+		s.ChunkManager = NewScratchChunkManager(s, GlobalStorage, chunkSize)
 	}
+	s.TargetTier = targetTier
+	s.UseScratchManager = useScratch
 	s.Cond = sync.NewCond(&s.Lock)
 	return s
+}
+
+func (s *FileCacheState) targetTierLocked() StorageTier {
+	if s.TargetTier != "" {
+		return s.TargetTier
+	}
+	if s.ChunkManager != nil || (GlobalStorage != nil && GlobalStorage.Type() == "s3") {
+		return TierS3
+	}
+	return TierDisk
+}
+
+// GetTargetTier safely returns the explicit target storage tier for this state.
+func (s *FileCacheState) GetTargetTier() StorageTier {
+	if s == nil {
+		return TierDisk
+	}
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	return s.targetTierLocked()
+}
+
+// UsesScratchManager safely reports whether this state uses ScratchChunkManager staging.
+func (s *FileCacheState) UsesScratchManager() bool {
+	if s == nil {
+		return false
+	}
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	return s.UseScratchManager || s.ChunkManager != nil
 }
 
 // MaxDeadZoneSkip is the absolute maximum byte span the reader is allowed to zero-fill (16MB).
@@ -201,7 +240,7 @@ type ConnectionInfo struct {
 }
 
 // GetChunkManager safely reads s.ChunkManager under s.Lock.
-func (s *FileCacheState) GetChunkManager() *S3ChunkManager {
+func (s *FileCacheState) GetChunkManager() *ScratchChunkManager {
 	if s == nil {
 		return nil
 	}
@@ -378,6 +417,22 @@ type CacheRegistry struct {
 	Evicting         bool
 	pendingEvict     bool
 	lastProbeTime    int64
+	stopCh           chan struct{}
+	stopOnce         sync.Once
+	wg               sync.WaitGroup
+}
+
+// Stop terminates background monitor goroutines owned by this CacheRegistry instance.
+func (r *CacheRegistry) Stop() {
+	if r == nil {
+		return
+	}
+	r.stopOnce.Do(func() {
+		if r.stopCh != nil {
+			close(r.stopCh)
+		}
+	})
+	r.wg.Wait()
 }
 
 var GlobalRegistry *CacheRegistry
@@ -429,6 +484,10 @@ func InitRegistry() {
 		_ = InitStorage()
 	}
 
+	if GlobalRegistry != nil {
+		GlobalRegistry.Stop()
+	}
+
 	if GlobalS3Index != nil {
 		GlobalS3Index.Stop()
 		GlobalS3Index = nil
@@ -440,15 +499,21 @@ func InitRegistry() {
 		Sessions:     make(map[string]*ClientSession),
 		FailedProbes: make(map[string]time.Time),
 		probeLRU:     make([]string, 0, 128),
+		stopCh:       make(chan struct{}),
 	}
 
 	GlobalRegistry.LoadExistingCache()
 
+	// Capture config reference on caller goroutine so background monitor never races on GlobalConfig replacement in tests.
+	cfg := GlobalConfig
 	// Initial population of disk free space
-	space, _ := GetDiskFreeSpace(GlobalConfig.GetCacheDir())
-	atomic.StoreUint64(&GlobalDiskFreeBytes, space)
-	go startDiskFreeMonitor()
+	if cfg != nil {
+		space, _ := GetDiskFreeSpace(cfg.GetCacheDir())
+		atomic.StoreUint64(&GlobalDiskFreeBytes, space)
+	}
 
+	GlobalRegistry.wg.Add(2)
+	go GlobalRegistry.startDiskFreeMonitor(cfg)
 	go GlobalRegistry.startSpeedMonitor()
 
 	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
@@ -615,26 +680,50 @@ func (r *CacheRegistry) SweepExpiredProbes() {
 	}
 }
 
-func startDiskFreeMonitor() {
+func (r *CacheRegistry) startDiskFreeMonitor(cfg *Config) {
+	defer r.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		space, err := GetDiskFreeSpace(GlobalConfig.GetCacheDir())
-		if err == nil {
-			atomic.StoreUint64(&GlobalDiskFreeBytes, space)
-			minFree := GlobalConfig.GetMinDiskFreeBytes()
-			if minFree > 0 && space < uint64(minFree) && GlobalRegistry != nil {
-				GlobalRegistry.PreEvict(0)
+	defer ticker.Stop()
+
+	stopCh := r.stopCh
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			if cfg == nil {
+				continue
 			}
-		}
-		if GlobalRegistry != nil {
-			GlobalRegistry.SweepExpiredProbes()
+			space, err := GetDiskFreeSpace(cfg.GetCacheDir())
+			if err == nil {
+				atomic.StoreUint64(&GlobalDiskFreeBytes, space)
+				minFree := cfg.GetCacheMinDiskFreeBytes()
+				if minFree > 0 && space < uint64(minFree) {
+					r.PreEvict(0)
+				}
+			}
+			r.SweepExpiredProbes()
 		}
 	}
 }
 
 func (r *CacheRegistry) startSpeedMonitor() {
+	defer r.wg.Done()
 	ticker := time.NewTicker(1 * time.Second)
-	for range ticker.C {
+	defer ticker.Stop()
+
+	stopCh := r.stopCh
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			r.tickSpeedMonitor()
+		}
+	}
+}
+
+func (r *CacheRegistry) tickSpeedMonitor() {
 		now := time.Now().Unix()
 		shouldBroadcast := false
 		r.Lock.RLock()
@@ -711,9 +800,8 @@ func (r *CacheRegistry) startSpeedMonitor() {
 			r.Lock.Unlock()
 		}
 
-		if shouldBroadcast && GlobalLogBroker != nil {
-			go GlobalLogBroker.BroadcastStateUpdate()
-		}
+	if shouldBroadcast && GlobalLogBroker != nil {
+		go GlobalLogBroker.BroadcastStateUpdate()
 	}
 }
 
@@ -930,14 +1018,28 @@ func (r *CacheRegistry) UpdateConnectionOffset(connID string, offset int64) {
 }
 
 func (r *CacheRegistry) SetConnectionInCache(connID string, inCache bool) {
+	var fs *FileCacheState
 	r.Lock.RLock()
 	if r.Connections != nil {
 		if conn, ok := r.Connections[connID]; ok && conn.InCache == inCache {
 			r.Lock.RUnlock()
 			return
+		} else if ok && inCache && conn.CacheSource == "" {
+			fs = r.Files[conn.Key]
 		}
 	}
 	r.Lock.RUnlock()
+
+	resolvedSource := ""
+	if inCache {
+		if fs != nil {
+			resolvedSource = string(fs.GetTargetTier())
+		} else if GlobalStorage != nil && GlobalStorage.Type() != "" {
+			resolvedSource = GlobalStorage.Type()
+		} else {
+			resolvedSource = string(TierDisk)
+		}
+	}
 
 	r.Lock.Lock()
 	defer r.Lock.Unlock()
@@ -945,11 +1047,7 @@ func (r *CacheRegistry) SetConnectionInCache(connID string, inCache bool) {
 		if conn, ok := r.Connections[connID]; ok {
 			conn.InCache = inCache
 			if inCache && conn.CacheSource == "" {
-				if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-					conn.CacheSource = "s3"
-				} else {
-					conn.CacheSource = "disk"
-				}
+				conn.CacheSource = resolvedSource
 			}
 			if r.Sessions != nil {
 				for _, session := range r.Sessions {
@@ -1185,11 +1283,16 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 	r.Evicting = true
 	r.pendingEvict = false
 	files := make([]*FileCacheState, 0, len(r.Files))
-	activeKeys := make(map[string]bool, len(r.Files))
+	activeKeys := make(map[string]bool, len(r.Files)+len(r.Connections))
 	for k, f := range r.Files {
 		activeKeys[k] = true
 		if f != nil {
 			files = append(files, f)
+		}
+	}
+	for _, conn := range r.Connections {
+		if conn != nil && conn.Key != "" {
+			activeKeys[conn.Key] = true
 		}
 	}
 	r.Lock.Unlock()
@@ -1200,8 +1303,9 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 		isMat := f.DiskMaterialized
 		isYield := f.IsYielding
 		totalSz := f.TotalSize
+		tier := f.targetTierLocked()
 		f.Lock.Unlock()
-		if isMat && !isYield && totalSz > 0 {
+		if isMat && !isYield && tier == TierDisk && totalSz > 0 {
 			downloaded := atomic.LoadInt64(&f.TotalBytesDownloaded)
 			if rem := totalSz - downloaded; rem > 0 {
 				unwrittenActiveBytes += rem
@@ -1216,7 +1320,7 @@ func (r *CacheRegistry) PreEvict(incomingSizeBytes int64) {
 	// Calculate how much space we need to free based on cache limit if incoming + unwritten active bytes are added
 	var cacheBytesToFree int64
 	maxBytes := GlobalConfig.GetCacheMaxBytes()
-	minDiskFree := GlobalConfig.GetMinDiskFreeBytes()
+	minDiskFree := GlobalConfig.GetCacheMinDiskFreeBytes()
 	if maxBytes > 0 && (currentSize+totalPending) > maxBytes {
 		cacheBytesToFree = (currentSize + totalPending) - maxBytes
 	}
@@ -1361,13 +1465,9 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 			break
 		}
 
-		// Prevent evicting files that are actively being downloaded or streamed
+		// Prevent evicting files that are actively being downloaded or streamed (including disk cache HITs)
 		baseKey := strings.TrimSuffix(file.Name, ".part")
-		r.Lock.RLock()
-		_, active := r.Files[baseKey]
-		r.Lock.RUnlock()
-
-		if active {
+		if r.IsKeyInUse(baseKey) {
 			continue // skip active files
 		}
 

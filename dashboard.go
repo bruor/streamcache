@@ -176,64 +176,105 @@ func sendStateUpdate(w http.ResponseWriter, flusher http.Flusher) error {
 	return nil
 }
 
-func buildStatePayload() ([]byte, error) {
+type dashboardClientPos struct {
+	ID         string `json:"id"`
+	Offset     int64  `json:"offset"`
+	RemoteAddr string `json:"remote_addr"`
+	UserAgent  string `json:"user_agent"`
+	Username   string `json:"username,omitempty"`
+	IsStarving bool   `json:"is_starving"`
+}
+
+type dashboardFile struct {
+	Key                 string               `json:"key"`
+	URL                 string               `json:"url"`
+	TotalSize           int64                `json:"total_size"`
+	Ranges              [][]int64            `json:"ranges"`
+	DownloadedBytes     int64                `json:"downloaded_bytes"`
+	ActiveWriter        bool                 `json:"active_writer"`
+	ActiveClients       int                  `json:"active_clients"`
+	ActiveWorkers       int                  `json:"active_workers"`
+	MaxWorkers          int                  `json:"max_workers"`
+	StarvingQueue       []int64              `json:"starving_queue"`
+	StarvingList        map[string]int64     `json:"starving_clients"`
+	DownloadSpeed       int64                `json:"download_speed"`
+	AvgDownloadSpeed    int64                `json:"avg_download_speed"`
+	UpstreamStatus      string               `json:"upstream_status"`
+	IsStalled           bool                 `json:"is_stalled"`
+	StalledSeconds      int                  `json:"stalled_seconds"`
+	ClientPositions     []dashboardClientPos `json:"client_positions"`
+	ConnectionsLast30s  int                  `json:"connections_last_30s"`
+	ObservedCooldown    float64              `json:"observed_cooldown"`
+	UpstreamUserAgent   string               `json:"upstream_user_agent"`
+	IsPrehydrating      bool                 `json:"is_prehydrating"`
+	IsYielding          bool                 `json:"is_yielding"`
+	QueuedPrehydrations int                  `json:"queued_prehydrations"`
+	NextURLs            []string             `json:"next_urls,omitempty"`
+	CommitProgress      *CommitProgress      `json:"commit_progress,omitempty"`
+}
+
+type dashboardProbeBuffer struct {
+	Key            string   `json:"key"`
+	URL            string   `json:"url"`
+	TotalSize      int64    `json:"total_size"`
+	RAMBytes       int64    `json:"ram_bytes"`
+	UpstreamStatus string   `json:"upstream_status"`
+	IdleSeconds    int      `json:"idle_seconds"`
+	NextURLs       []string `json:"next_urls,omitempty"`
+}
+
+type dashboardSnapshot struct {
+	StorageBackend    string                 `json:"storage_backend"`
+	TotalCacheSize    int64                  `json:"total_cache_size_bytes"`
+	MaxCacheSize      int64                  `json:"max_cache_size_bytes"`
+	MaxObservedSpeed  int64                  `json:"max_observed_speed"`
+	DiskFreeBytes     uint64                 `json:"disk_free_bytes"`
+	MinDiskFreeBytes  int64                  `json:"min_disk_free_bytes"`
+	ActiveFiles       []dashboardFile        `json:"active_downloads"`
+	ActiveSessions    []ClientSession        `json:"active_connections"`
+	ActiveVODClients  int                    `json:"active_vod_clients"`
+	ActiveVODUpstream int                    `json:"active_vod_upstream"`
+	ActiveVODProbes   int                    `json:"active_vod_probes"`
+	ProbeActive       bool                   `json:"probe_active"`
+	ProbeBuffers      []dashboardProbeBuffer `json:"probe_buffers"`
+	ProviderCapacity  interface{}            `json:"provider_capacity,omitempty"`
+}
+
+func (s dashboardSnapshot) toBaseMap() map[string]interface{} {
+	data := map[string]interface{}{
+		"storage_backend":        s.StorageBackend,
+		"total_cache_size_bytes": s.TotalCacheSize,
+		"max_cache_size_bytes":   s.MaxCacheSize,
+		"disk_free_bytes":        s.DiskFreeBytes,
+		"active_downloads":       s.ActiveFiles,
+		"active_connections":     s.ActiveSessions,
+		"active_vod_clients":     s.ActiveVODClients,
+		"active_vod_upstream":    s.ActiveVODUpstream,
+		"active_vod_probes":      s.ActiveVODProbes,
+		"probe_active":           s.ProbeActive,
+		"probe_buffers":          s.ProbeBuffers,
+	}
+	if s.ProviderCapacity != nil {
+		data["provider_capacity"] = s.ProviderCapacity
+	}
+	return data
+}
+
+func collectDashboardSnapshot() dashboardSnapshot {
 	activeSessions := GlobalRegistry.GetActiveSessions()
 
-	GlobalRegistry.Lock.RLock()
-	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
-	for _, fileState := range GlobalRegistry.Files {
-		files = append(files, fileState)
-	}
-	GlobalRegistry.Lock.RUnlock()
-
-	type sseClientPos struct {
-		ID         string `json:"id"`
-		Offset     int64  `json:"offset"`
-		RemoteAddr string `json:"remote_addr"`
-		UserAgent  string `json:"user_agent"`
-		Username   string `json:"username,omitempty"`
-		IsStarving bool   `json:"is_starving"`
+	var files []*FileCacheState
+	if GlobalRegistry != nil {
+		GlobalRegistry.Lock.RLock()
+		files = make([]*FileCacheState, 0, len(GlobalRegistry.Files))
+		for _, fileState := range GlobalRegistry.Files {
+			files = append(files, fileState)
+		}
+		GlobalRegistry.Lock.RUnlock()
 	}
 
-	type sseFile struct {
-		Key                string         `json:"key"`
-		URL                string         `json:"url"`
-		TotalSize          int64          `json:"total_size"`
-		Ranges             [][]int64      `json:"ranges"`
-		DownloadedBytes    int64          `json:"downloaded_bytes"`
-		ActiveWriter       bool           `json:"active_writer"`
-		ActiveClients      int            `json:"active_clients"`
-		ActiveWorkers      int            `json:"active_workers"`
-		MaxWorkers         int            `json:"max_workers"`
-		StarvingQueue      []int64        `json:"starving_queue"`
-		DownloadSpeed      int64          `json:"download_speed"`
-		AvgDownloadSpeed   int64          `json:"avg_download_speed"`
-		UpstreamStatus     string         `json:"upstream_status"`
-		IsStalled          bool           `json:"is_stalled"`
-		StalledSeconds     int            `json:"stalled_seconds"`
-		ClientPositions    []sseClientPos `json:"client_positions"`
-		ConnectionsLast30s int            `json:"connections_last_30s"`
-		ObservedCooldown   float64        `json:"observed_cooldown"`
-		UpstreamUserAgent  string         `json:"upstream_user_agent"`
-		IsPrehydrating      bool            `json:"is_prehydrating"`
-		IsYielding          bool            `json:"is_yielding"`
-		QueuedPrehydrations int             `json:"queued_prehydrations"`
-		NextURLs            []string        `json:"next_urls,omitempty"`
-		CommitProgress      *CommitProgress `json:"commit_progress,omitempty"`
-	}
-
-	type sseProbeBuffer struct {
-		Key            string   `json:"key"`
-		URL            string   `json:"url"`
-		TotalSize      int64    `json:"total_size"`
-		RAMBytes       int64    `json:"ram_bytes"`
-		UpstreamStatus string   `json:"upstream_status"`
-		IdleSeconds    int      `json:"idle_seconds"`
-		NextURLs       []string `json:"next_urls,omitempty"`
-	}
-
-	var activeFiles []sseFile
-	var probeBuffers []sseProbeBuffer
+	var activeFiles []dashboardFile
+	var probeBuffers []dashboardProbeBuffer
 	activeVODUpstream := 0
 	activeVODProbes := 0
 	for _, fileState := range files {
@@ -248,7 +289,7 @@ func buildStatePayload() ([]byte, error) {
 			if lastProg > 0 {
 				idleSec = int(time.Since(time.Unix(0, lastProg)).Seconds())
 			}
-			probeBuffers = append(probeBuffers, sseProbeBuffer{
+			probeBuffers = append(probeBuffers, dashboardProbeBuffer{
 				Key:            fileState.Key,
 				URL:            fileState.URL,
 				TotalSize:      fileState.TotalSize,
@@ -304,10 +345,12 @@ func buildStatePayload() ([]byte, error) {
 
 		ranges := fileState.RangeSet.ToSlices()
 
-		// Collect unique starvation offsets
+		// Collect unique starvation offsets and per-client starving map
 		starveSet := make(map[int64]bool)
 		var starveQueue []int64
-		for _, offset := range fileState.Starving {
+		starvingCopy := make(map[string]int64, len(fileState.Starving))
+		for clientID, offset := range fileState.Starving {
+			starvingCopy[clientID] = offset
 			if !starveSet[offset] {
 				starveSet[offset] = true
 				starveQueue = append(starveQueue, offset)
@@ -315,10 +358,10 @@ func buildStatePayload() ([]byte, error) {
 		}
 
 		// Collect client playback positions for this file
-		var clientPositions []sseClientPos
+		var clientPositions []dashboardClientPos
 		for _, sess := range activeSessions {
 			if sess.Key == k {
-				clientPositions = append(clientPositions, sseClientPos{
+				clientPositions = append(clientPositions, dashboardClientPos{
 					ID:         sess.ID,
 					Offset:     sess.Offset,
 					RemoteAddr: sess.RemoteAddr,
@@ -360,7 +403,7 @@ func buildStatePayload() ([]byte, error) {
 			commitProgress = fileState.ChunkManager.GetCommitProgress()
 		}
 
-		activeFiles = append(activeFiles, sseFile{
+		activeFiles = append(activeFiles, dashboardFile{
 			Key:                 k,
 			URL:                 fileState.URL,
 			TotalSize:           fileState.TotalSize,
@@ -371,6 +414,7 @@ func buildStatePayload() ([]byte, error) {
 			ActiveWorkers:       activeCount,
 			MaxWorkers:          GlobalConfig.GetMaxUpstreamWorkers(),
 			StarvingQueue:       starveQueue,
+			StarvingList:        starvingCopy,
 			DownloadSpeed:       fileState.DownloadSpeed,
 			AvgDownloadSpeed:    fileState.AvgDownloadSpeed,
 			UpstreamStatus:      status,
@@ -426,30 +470,34 @@ func buildStatePayload() ([]byte, error) {
 		probeActive = GlobalRegistry.IsProbeActive()
 	}
 
-	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
-
-	data := map[string]interface{}{
-		"server_instance_id":     ServerInstanceID,
-		"storage_backend":        GlobalConfig.GetStorageBackend(),
-		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
-		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
-		"max_observed_speed":     GlobalRegistry.GetMaxObservedSpeed(),
-		"disk_free_bytes":        freeSpace,
-		"min_disk_free_bytes":    GlobalConfig.GetMinDiskFreeBytes(),
-		"active_downloads":       activeFiles,
-		"active_connections":     activeSessions,
-		"active_vod_clients":     activeVODClients,
-		"active_vod_upstream":    activeVODUpstream,
-		"active_vod_probes":      activeVODProbes,
-		"probe_active":           probeActive,
-		"probe_buffers":          probeBuffers,
+	snap := dashboardSnapshot{
+		StorageBackend:    GlobalConfig.GetStorageBackend(),
+		TotalCacheSize:    GlobalRegistry.GetTotalSize(),
+		MaxCacheSize:      GlobalConfig.GetCacheMaxBytes(),
+		MaxObservedSpeed:  GlobalRegistry.GetMaxObservedSpeed(),
+		DiskFreeBytes:     atomic.LoadUint64(&GlobalDiskFreeBytes),
+		MinDiskFreeBytes:  GlobalConfig.GetCacheMinDiskFreeBytes(),
+		ActiveFiles:       activeFiles,
+		ActiveSessions:    activeSessions,
+		ActiveVODClients:  activeVODClients,
+		ActiveVODUpstream: activeVODUpstream,
+		ActiveVODProbes:   activeVODProbes,
+		ProbeActive:       probeActive,
+		ProbeBuffers:      probeBuffers,
 	}
-
 	if GlobalPrehydrationManager != nil {
 		if capReport := GlobalPrehydrationManager.GetLatestCapacity(); capReport != nil {
-			data["provider_capacity"] = capReport
+			snap.ProviderCapacity = capReport
 		}
 	}
+	return snap
+}
 
+func buildStatePayload() ([]byte, error) {
+	snap := collectDashboardSnapshot()
+	data := snap.toBaseMap()
+	data["server_instance_id"] = ServerInstanceID
+	data["max_observed_speed"] = snap.MaxObservedSpeed
+	data["min_disk_free_bytes"] = snap.MinDiskFreeBytes
 	return json.Marshal(data)
 }

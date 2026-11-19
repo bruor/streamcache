@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -182,20 +181,6 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	cacheDir := GlobalConfig.GetCacheDir()
 	cacheFilePath := filepath.Join(cacheDir, cacheFileName)
 
-	// Check for legacy extension-less file if the new file is missing
-	if !FileExists(cacheFilePath) {
-		legacyFilePath := filepath.Join(cacheDir, key)
-		if FileExists(legacyFilePath) {
-			log.Printf("[Server] Legacy cache file detected for %s. Migrating...", key)
-			err := migrateLegacyFile(legacyFilePath, cacheFilePath, targetURL)
-			if err != nil {
-				log.Printf("[Server] Error migrating legacy file %s: %v", key, err)
-			} else {
-				log.Printf("[Server] Successfully migrated legacy cache: %s -> %s", key, cacheFileName)
-			}
-		}
-	}
-
 	// 3. Cache HIT Path with Revalidation
 	var cacheHit bool
 	var cacheMeta *FileMeta
@@ -247,9 +232,9 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 					startOffset = parseRangeStart(r.Header.Get("Range"))
 				}
 
-				cacheSource := "disk"
-				if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-					cacheSource = "s3"
+				cacheSource := string(TierDisk)
+				if GlobalStorage != nil && GlobalStorage.Type() != "" {
+					cacheSource = GlobalStorage.Type()
 				}
 				conn := &ClientConnection{
 					ID:             connID,
@@ -455,192 +440,13 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDebugState(w http.ResponseWriter, r *http.Request) {
-	activeSessions := GlobalRegistry.GetActiveSessions()
-
-	GlobalRegistry.Lock.RLock()
-	files := make([]*FileCacheState, 0, len(GlobalRegistry.Files))
-	for _, fileState := range GlobalRegistry.Files {
-		files = append(files, fileState)
-	}
-	GlobalRegistry.Lock.RUnlock()
-
-	type debugFile struct {
-		Key             string           `json:"key"`
-		URL             string           `json:"url"`
-		TotalSize       int64            `json:"total_size"`
-		Ranges          [][]int64        `json:"ranges"`
-		DownloadedBytes int64            `json:"downloaded_bytes"`
-		ActiveWriter    bool             `json:"active_writer"`
-		ActiveClients   int              `json:"active_clients"`
-		StarvingList    map[string]int64 `json:"starving_clients"`
-		CommitProgress  *CommitProgress  `json:"commit_progress,omitempty"`
-	}
-
-	type debugProbeBuffer struct {
-		Key            string   `json:"key"`
-		URL            string   `json:"url"`
-		TotalSize      int64    `json:"total_size"`
-		RAMBytes       int64    `json:"ram_bytes"`
-		UpstreamStatus string   `json:"upstream_status"`
-		IdleSeconds    int      `json:"idle_seconds"`
-		NextURLs       []string `json:"next_urls,omitempty"`
-	}
-
-	var activeFiles []debugFile
-	var probeBuffers []debugProbeBuffer
-	activeVODUpstream := 0
-	activeVODProbes := 0
-	for _, fileState := range files {
-		fileState.Lock.Lock()
-		if fileState.IsProbe {
-			ramBytes := int64(0)
-			if fileState.LiveBuffer != nil {
-				ramBytes = fileState.LiveBuffer.GetCurBytes()
-			}
-			lastProg := atomic.LoadInt64(&fileState.LastProgressTimeNano)
-			idleSec := 0
-			if lastProg > 0 {
-				idleSec = int(time.Since(time.Unix(0, lastProg)).Seconds())
-			}
-			probeBuffers = append(probeBuffers, debugProbeBuffer{
-				Key:            fileState.Key,
-				URL:            fileState.URL,
-				TotalSize:      fileState.TotalSize,
-				RAMBytes:       ramBytes,
-				UpstreamStatus: fileState.UpstreamStatus,
-				IdleSeconds:    idleSec,
-				NextURLs:       append([]string(nil), fileState.NextURLs...),
-			})
-			fileActiveConns := 0
-			for _, conn := range fileState.RecentConnections {
-				if conn.Closed.IsZero() {
-					fileActiveConns++
-				}
-			}
-			activeVODUpstream += fileActiveConns
-			activeVODProbes += fileActiveConns
-			fileState.Lock.Unlock()
-			continue
-		}
-
-		isDiskMat := fileState.DiskMaterialized
-		isProbeFile := !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing"
-		fileActiveConns := 0
-		for _, conn := range fileState.RecentConnections {
-			if conn.Closed.IsZero() {
-				fileActiveConns++
-			}
-		}
-		activeVODUpstream += fileActiveConns
-		if isProbeFile {
-			if fileActiveConns > 0 {
-				activeVODProbes += fileActiveConns
-			} else {
-				activeVODProbes++
-			}
-		}
-		k := fileState.Key
-		downloaded := fileState.RangeSet.TotalBytes()
-		isCompleted := fileState.RangeSet.IsComplete(fileState.TotalSize)
-
-		if isCompleted && fileState.UpstreamStatus != "Committing" {
-			fileState.Lock.Unlock()
-			continue
-		}
-
-		if isProbeFile {
-			fileState.Lock.Unlock()
-			continue
-		}
-
-		starvingCopy := make(map[string]int64, len(fileState.Starving))
-		for clientID, offset := range fileState.Starving {
-			starvingCopy[clientID] = offset
-		}
-
-		var commitProgress *CommitProgress
-		if fileState.UpstreamStatus == "Committing" && fileState.ChunkManager != nil {
-			commitProgress = fileState.ChunkManager.GetCommitProgress()
-		}
-
-		activeFiles = append(activeFiles, debugFile{
-			Key:             k,
-			URL:             fileState.URL,
-			TotalSize:       fileState.TotalSize,
-			Ranges:          fileState.RangeSet.ToSlices(),
-			DownloadedBytes: downloaded,
-			ActiveWriter:    fileState.WriterActive,
-			ActiveClients:   len(fileState.Clients),
-			StarvingList:    starvingCopy,
-			CommitProgress:  commitProgress,
-		})
-		fileState.Lock.Unlock()
-	}
-
-	// Sort active files from most complete to least complete (descending)
-	sort.Slice(activeFiles, func(i, j int) bool {
-		compI := 0.0
-		if activeFiles[i].TotalSize > 0 {
-			compI = float64(activeFiles[i].DownloadedBytes) / float64(activeFiles[i].TotalSize)
-		}
-		compJ := 0.0
-		if activeFiles[j].TotalSize > 0 {
-			compJ = float64(activeFiles[j].DownloadedBytes) / float64(activeFiles[j].TotalSize)
-		}
-		if compI == compJ {
-			return activeFiles[i].Key < activeFiles[j].Key
-		}
-		return compI > compJ
-	})
-
-	// Sort active sessions by start time (oldest first)
-	sort.Slice(activeSessions, func(i, j int) bool {
-		return activeSessions[i].StartTime < activeSessions[j].StartTime
-	})
-
-	activeVODClients := 0
-	for _, sess := range activeSessions {
-		if sess.ActiveConns > 0 {
-			activeVODClients++
-		}
-	}
-
-	inFlightHeaderProbes := int(GlobalInFlightProbes.Load())
-	activeVODProbes += inFlightHeaderProbes
-	activeVODUpstream += inFlightHeaderProbes
-
-	probeActive := activeVODProbes > 0
-	if !probeActive && GlobalRegistry != nil {
-		probeActive = GlobalRegistry.IsProbeActive()
-	}
-
-	freeSpace := atomic.LoadUint64(&GlobalDiskFreeBytes)
-
-	data := map[string]interface{}{
-		"storage_backend":        GlobalConfig.GetStorageBackend(),
-		"total_cache_size_bytes": GlobalRegistry.GetTotalSize(),
-		"max_cache_size_bytes":   GlobalConfig.GetCacheMaxBytes(),
-		"disk_free_bytes":        freeSpace,
-		"active_downloads":       activeFiles,
-		"active_connections":     activeSessions,
-		"active_vod_clients":     activeVODClients,
-		"active_vod_upstream":    activeVODUpstream,
-		"active_vod_probes":      activeVODProbes,
-		"probe_active":           probeActive,
-		"probe_buffers":          probeBuffers,
-	}
-
-	if GlobalPrehydrationManager != nil {
-		if capReport := GlobalPrehydrationManager.GetLatestCapacity(); capReport != nil {
-			data["provider_capacity"] = capReport
-		}
-	}
+	data := collectDashboardSnapshot().toBaseMap()
 
 	if GlobalS3Index != nil {
 		s3Count, s3Bytes := GlobalS3Index.Stats()
 		data["s3_cached_objects"] = s3Count
 		data["s3_cached_bytes"] = s3Bytes
-		data["s3_max_idle_age_seconds"] = int64(GlobalConfig.GetS3MaxIdleAge().Seconds())
+		data["cache_max_idle_age_seconds"] = int64(GlobalConfig.GetCacheMaxIdleAge().Seconds())
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -776,18 +582,6 @@ func getCacheKeyAndExt(targetURL string) (string, string) {
 		ext = ".mkv"
 	}
 	return key, ext
-}
-
-func migrateLegacyFile(legacyPath, newPath, targetURL string) error {
-	// 1. Rename the legacy file to the new path (with extension)
-	err := os.Rename(legacyPath, newPath)
-	if err != nil {
-		return err
-	}
-
-	// 2. Create the companion metadata JSON using the shared helper
-	metaPath := newPath + ".json"
-	return recreateMetadata(newPath, metaPath, targetURL)
 }
 
 func handleCancelHydration(w http.ResponseWriter, r *http.Request) {

@@ -7,27 +7,48 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Mounts the local ./cache folder into the container to persist media files
-      - ./cache:/var/cache/streamcache
+      # Persistent cache storage (`CACHE_DIR`): mount your local disk or NAS share here for `disk` mode.
+      # TIP: When backing CACHE_DIR with an NFS or SMB/CIFS NAS share, mount with `soft` (e.g. `soft,timeo=30` for NFS) so unreachable mounts recover instead of hanging processes in D-state.
+      - ./cache:/var/cache/streamcache/files
+      # Active scratch storage (`TMP_DIR`): DO NOT disable or remove this mount!
+      # Keeping TMP_DIR on a native host SSD/NVMe filesystem ensures fast random writes and `fallocate(FALLOC_FL_PUNCH_HOLE)` support, preventing scratch I/O from bloating Docker container layers (`/var/lib/docker`/`docker.img`).
+      - ./tmp:/var/cache/streamcache/tmp
     environment:
       - PORT=8080
+      - STORAGE_BACKEND=disk # Valid options: disk, s3
       - CACHE_DIR=/var/cache/streamcache/files
       - TMP_DIR=/var/cache/streamcache/tmp
-      
-      # Block & Buffer Configs
-      - BLOCK_SIZE=4MB
+
+      # Scratch Budget Guards (`TMP_DIR` mount)
+      - TMP_FILE_MAX_BYTES=512MB
+      - TMP_MIN_DISK_FREE_BYTES=1GB
+
+      # Persistent Cache Bounds & Eviction (`CACHE_DIR` / S3)
+      # CACHE_MAX_BYTES supports size units (e.g. 50GB, 1TB) or 0/none/off/disabled to rely solely on disk free space
+      - CACHE_MAX_BYTES=50GB
+      - CACHE_MIN_DISK_FREE_BYTES=10GB
+      - CACHE_MAX_IDLE_AGE=720h
+      - CACHE_EVICT_INTERVAL=6h
+
       # Asynchronous writeback & LiveBuffer sliding window size (defaults to 64MB; min 16MB, max 256MB)
       # - WRITEBACK_BUFFER_SIZE=64MB
-      
-      # Cache eviction bounds (e.g. 50GB, 1TB, or 0/none/off/disabled to rely solely on disk free space)
-      - CACHE_MAX_BYTES=50GB
-      
-      # Physical disk safety guard (minimum disk free space, e.g. 10GB)
-      - MIN_DISK_FREE_BYTES=10GB
-      
-      # Debounced Scheduler bounds
-      - SCHEDULER_MIN_BYTES=16MB
+
+      # Optional S3 Storage Backend (`STORAGE_BACKEND=s3`)
+      # - S3_ENDPOINT=https://s3.us-east-1.amazonaws.com
+      # - S3_BUCKET=streamcache
+      # - S3_REGION=us-east-1
+      # - S3_ACCESS_KEY=your-access-key
+      # - S3_SECRET_KEY=your-secret-key
+      # - S3_USE_PATH_STYLE=true
+      # - S3_DISABLE_SSL=false
+      # - S3_CHUNK_SIZE=64MB
+      # - S3_UPLOAD_CONCURRENCY=4
+      # - S3_RECOMPOSE_CONCURRENCY=6
+
+      # Debounced Scheduler & Probe Guards
       - SCHEDULER_MIN_TIME=2s
+      - MIN_READ_THRESHOLD_BYTES=5MB
+      - MAX_PROBE_BUFFERS=128
       
       # Cache change validation period
       - CACHE_REVALIDATE_INTERVAL=1h

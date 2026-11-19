@@ -413,14 +413,26 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 	maxIdle := 720 * time.Hour
 	interval := 6 * time.Hour
 	if cfg != nil {
-		maxIdle = cfg.GetS3MaxIdleAge()
-		interval = cfg.GetS3EvictInterval()
+		maxIdle = cfg.GetCacheMaxIdleAge()
+		interval = cfg.GetCacheEvictInterval()
 	}
 
 	loopCtx, loopCancel := context.WithCancel(context.Background())
 	idx.mu.Lock()
 	idx.loopCancel = loopCancel
 	idx.mu.Unlock()
+
+	sweepStale := func(ctx context.Context) {
+		if cleaner, ok := storage.(ChunkCleanupBackend); ok {
+			if deleted, err := cleaner.SweepStaleChunks(ctx, 24*time.Hour); err != nil {
+				if loopCtx.Err() == nil {
+					log.Printf("[S3Index] Stale chunk sweep failed: %v", err)
+				}
+			} else if deleted > 0 {
+				log.Printf("[S3Index] Swept %d stale staging chunks (>24h old)", deleted)
+			}
+		}
+	}
 
 	// Initial startup reconcile + sweep
 	idx.wg.Add(1)
@@ -434,6 +446,7 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 		} else if err := idx.Reconcile(ctx, storage); err != nil && loopCtx.Err() == nil {
 			log.Printf("[S3Index] Initial reconcile failed: %v", err)
 		}
+		sweepStale(ctx)
 	}()
 
 	// Periodic metadata flush for playback touches
@@ -466,13 +479,14 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 			case <-evictTicker.C:
 				curMaxIdle := 720 * time.Hour
 				if cfg != nil {
-					curMaxIdle = cfg.GetS3MaxIdleAge()
+					curMaxIdle = cfg.GetCacheMaxIdleAge()
 				}
+				ctx, cancel := context.WithTimeout(loopCtx, 5*time.Minute)
 				if curMaxIdle > 0 {
-					ctx, cancel := context.WithTimeout(loopCtx, 5*time.Minute)
 					idx.SweepExpired(ctx, storage, registry, curMaxIdle)
-					cancel()
 				}
+				sweepStale(ctx)
+				cancel()
 			}
 		}
 	}()

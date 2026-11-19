@@ -29,7 +29,7 @@ func NewLocalStorageBackend(cacheDir, tmpDir string) *LocalStorageBackend {
 }
 
 func (b *LocalStorageBackend) Type() string {
-	return "local"
+	return "disk"
 }
 
 func (b *LocalStorageBackend) Stat(ctx context.Context, key string) (*FileMeta, bool, error) {

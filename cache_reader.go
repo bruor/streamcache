@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -77,10 +76,10 @@ func NewCacheReader(ctx context.Context, state *FileCacheState, req *http.Reques
 
 	cacheSource := ""
 	if isCompleted {
-		if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-			cacheSource = "s3"
+		if state.GetTargetTier() == TierS3 {
+			cacheSource = string(TierS3)
 		} else {
-			cacheSource = "disk"
+			cacheSource = string(TierDisk)
 		}
 	}
 
@@ -270,7 +269,7 @@ func (r *CacheReader) Close() error {
 	isDiskMat := r.state.DiskMaterialized || FileExists(r.state.PartPath)
 	isProbe := !isCompleted && !isDiskMat && totalRead < minThreshold && maxOffset < minThreshold
 
-	alreadyCommittedS3 := GlobalStorage != nil && GlobalStorage.Type() == "s3" && r.state.ChunkManager != nil && r.state.ChunkManager.IsRecomposed()
+	alreadyCommittedS3 := r.state.targetTierLocked() == TierS3 && r.state.ChunkManager != nil && r.state.ChunkManager.IsRecomposed()
 	shouldFinalize := remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommittedS3 && !FileExists(r.state.Path)
 	shouldCleanUpIncomplete := remainingClients == 0 && !isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !isPrehydrating && (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts())
 
@@ -344,10 +343,8 @@ func (r *CacheReader) Close() error {
 		if shouldCleanUpIncomplete {
 			_ = os.Remove(r.state.PartPath)
 			_ = os.Remove(r.state.MetaPath)
-			accounted := atomic.SwapInt64(&r.state.TotalBytesDownloaded, 0)
-			if accounted > 0 && GlobalRegistry != nil {
-				GlobalRegistry.UpdateSize(-accounted)
-			}
+			releaseAccountedCacheBytes(r.state)
+			triggerAsyncChunkCleanup(GlobalStorage, r.state.Key, "[Reader]")
 			GlobalRegistry.Lock.Lock()
 			if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
 				delete(GlobalRegistry.Files, r.state.Key)
@@ -370,127 +367,7 @@ func (r *CacheReader) Close() error {
 }
 
 func (r *CacheReader) finalizeCache() {
-	defer func() {
-		r.state.Lock.Lock()
-		r.state.IsCommitting = false
-		r.state.Lock.Unlock()
-	}()
-
-	// Close write handle if open
-	r.state.Lock.Lock()
-	fileToClose := r.state.File
-	r.state.File = nil
-	pipeline := r.state.Pipeline
-	r.state.Pipeline = nil
-	if r.state.LiveBuffer != nil {
-		r.state.LiveBuffer.Clear()
-		r.state.LiveBuffer = nil
-	}
-	r.state.Lock.Unlock()
-
-	if pipeline != nil {
-		_ = pipeline.FlushAndClose()
-	}
-	if fileToClose != nil {
-		FadviseDontNeed(fileToClose.Fd(), 0, 0)
-		_ = fileToClose.Close()
-	}
-
-	meta := FileMeta{
-		URL:           r.state.URL,
-		TotalSize:     r.state.TotalSize,
-		ContentType:   r.state.ContentType,
-		ETag:          r.state.ETag,
-		LastModified:  r.state.LastModified,
-		LastValidated: time.Now().Unix(),
-		Completed:     true,
-	}
-
-	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-		var commitErr error
-		if cm := r.state.GetChunkManager(); cm != nil {
-			commitErr = cm.WaitAndRecompose(context.Background())
-		} else {
-			commitErr = GlobalStorage.CommitLocalFile(context.Background(), r.state.Key, r.state.PartPath, meta)
-		}
-		_ = os.Remove(r.state.PartPath)
-		_ = os.Remove(r.state.MetaPath)
-
-		accounted := atomic.SwapInt64(&r.state.TotalBytesDownloaded, 0)
-		if accounted > 0 && GlobalRegistry != nil {
-			GlobalRegistry.UpdateSize(-accounted)
-		}
-
-		GlobalRegistry.MarkConnectionsAsInCache(r.state.Key)
-		if commitErr != nil {
-			log.Printf("[Reader] S3 commit/recomposition failed on client exit for %s: %v", r.state.Key, commitErr)
-			r.state.SetUpstreamStatus("Error")
-		} else {
-			r.state.SetUpstreamStatus("Completed")
-			log.Printf("[Reader] Cache file finalized and committed to S3 on last client exit: %s", r.state.Key)
-		}
-
-		GlobalRegistry.Lock.Lock()
-		delete(GlobalRegistry.Files, r.state.Key)
-		GlobalRegistry.Lock.Unlock()
-
-		if GlobalLogBroker != nil {
-			go GlobalLogBroker.BroadcastStateUpdate()
-		}
-		if commitErr == nil && GlobalPrehydrationManager != nil {
-			GlobalPrehydrationManager.OnHydrationCompleted(r.state)
-		}
-
-		debug.FreeOSMemory()
-		return
-	}
-
-	// Rename temporary file to final cache path
-	err := os.Rename(r.state.PartPath, r.state.Path)
-	if err != nil {
-		log.Printf("[Reader] Error renaming cache file on final client exit: %v", err)
-		return
-	}
-
-	if cf, ferr := os.Open(r.state.Path); ferr == nil {
-		FadviseDontNeed(cf.Fd(), 0, 0)
-		_ = cf.Close()
-	}
-
-	// Save final metadata JSON confirming completion
-	metaPath := r.state.Path + ".json"
-	meta = FileMeta{
-		URL:           r.state.URL,
-		TotalSize:     r.state.TotalSize,
-		ContentType:   r.state.ContentType,
-		ETag:          r.state.ETag,
-		LastModified:  r.state.LastModified,
-		LastValidated: time.Now().Unix(),
-		Completed:     true,
-	}
-	newBytes, err := json.Marshal(meta)
-	if err == nil {
-		_ = writeMetaFileAtomic(metaPath, newBytes)
-	}
-
-	GlobalRegistry.MarkConnectionsAsInCache(r.state.Key)
-	r.state.SetUpstreamStatus("Completed")
-
-	// Remove from active registry
-	GlobalRegistry.Lock.Lock()
-	delete(GlobalRegistry.Files, r.state.Key)
-	GlobalRegistry.Lock.Unlock()
-
-	if GlobalLogBroker != nil {
-		go GlobalLogBroker.BroadcastStateUpdate()
-	}
-	if GlobalPrehydrationManager != nil {
-		GlobalPrehydrationManager.OnHydrationCompleted(r.state)
-	}
-
-	debug.FreeOSMemory()
-
-	log.Printf("[Reader] Cache file finalized on last client exit: %s", r.state.Key)
+	commitCompletedFile(r.state, nil, nil, false, "[Reader]")
 }
 
 func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
@@ -646,7 +523,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	// 1. LiveBuffer Fast-Path: check in-memory buffer first for zero-copy playback
 	if lb != nil {
 		if memN, ok := lb.ReadAt(p[:toRead], off); ok && memN > 0 {
-			isS3Chunked := GlobalStorage != nil && GlobalStorage.Type() == "s3" && cm != nil
+			isS3Chunked := r.state.UsesScratchManager() && cm != nil
 			if memN < int(toRead) && !isS3Chunked && (r.state.IsDiskMaterialized() || FileExists(r.state.PartPath) || FileExists(r.state.Path)) {
 				if f, ferr := r.getFile(); ferr == nil {
 					diskN, _ := f.ReadAt(p[memN:toRead], off+int64(memN))
@@ -663,7 +540,7 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 
 	// 2. S3 Storage Tier
-	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
+	if r.state.GetTargetTier() == TierS3 {
 		// A. Recomposed Monolithic Object: If all parts have been stitched and sealed, read via s3ReadSeeker
 		isRecomposed := false
 		if cm != nil && cm.IsRecomposed() {

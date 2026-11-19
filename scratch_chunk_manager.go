@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// S3ChunkManager manages progressive chunk uploads to S3, enforces scratch disk backpressure, and coordinates recomposition
-type S3ChunkManager struct {
+// ScratchChunkManager manages progressive chunk uploads to remote storage, enforces TMP_DIR scratch backpressure, and coordinates recomposition.
+type ScratchChunkManager struct {
 	key         string
 	state       *FileCacheState
 	storage     StorageBackend
@@ -27,6 +27,7 @@ type S3ChunkManager struct {
 	recomposing     bool
 	recomposed      bool
 	recomposeErr    error
+	permanentErr    error
 	commitStage     string
 	commitCompleted int
 	commitTotal     int
@@ -38,6 +39,7 @@ type S3ChunkManager struct {
 	budgetMu         sync.Mutex
 	budgetChan       chan struct{}
 
+	uploadSem        chan struct{}
 	trackDiskFlushes atomic.Bool
 	activeUploads    int32
 	ctx              context.Context
@@ -86,8 +88,8 @@ func CalculateDynamicChunkConfig(totalSize int64, configuredChunkSize int64) (ch
 	return chunkSize, true
 }
 
-// NewS3ChunkManager creates a new chunk manager for an active hydration state
-func NewS3ChunkManager(state *FileCacheState, storage StorageBackend, chunkSize int64) *S3ChunkManager {
+// NewScratchChunkManager creates a new chunk manager for an active hydration state.
+func NewScratchChunkManager(state *FileCacheState, storage StorageBackend, chunkSize int64) *ScratchChunkManager {
 	totalSize := state.TotalSize
 	dynChunkSize, isMultipart := CalculateDynamicChunkConfig(totalSize, chunkSize)
 
@@ -99,28 +101,28 @@ func NewS3ChunkManager(state *FileCacheState, storage StorageBackend, chunkSize 
 		totalParts = 1
 	}
 
-	maxInFlight := int64(2 * 1024 * 1024 * 1024) // 2GB default
-	minFreeDisk := int64(1 * 1024 * 1024 * 1024) // 1GB default
-	if s3b, ok := storage.(*S3StorageBackend); ok {
-		if s3b.ScratchMaxBytes() > 0 {
-			maxInFlight = s3b.ScratchMaxBytes()
+	maxInFlight := int64(512 * 1024 * 1024)   // 512MB default (TMP_FILE_MAX_BYTES)
+	minFreeDisk := int64(1 * 1024 * 1024 * 1024) // 1GB default (TMP_MIN_DISK_FREE_BYTES)
+	uploadConc := 4
+
+	if GlobalConfig != nil {
+		maxInFlight = GlobalConfig.GetTmpFileMaxBytes()
+		minFreeDisk = GlobalConfig.GetTmpMinDiskFreeBytes()
+		if sc := GlobalConfig.GetS3Config().UploadConcurrency; sc > 0 {
+			uploadConc = sc
 		}
-		if s3b.ScratchMinFreeBytes() > 0 {
-			minFreeDisk = s3b.ScratchMinFreeBytes()
-		}
-	} else if GlobalConfig != nil {
-		s3Cfg := GlobalConfig.GetS3Config()
-		if s3Cfg.ScratchMaxBytes > 0 {
-			maxInFlight = s3Cfg.ScratchMaxBytes
-		}
-		if s3Cfg.ScratchMinFreeBytes > 0 {
-			minFreeDisk = s3Cfg.ScratchMinFreeBytes
-		}
+	}
+	if s3b, ok := storage.(*S3StorageBackend); ok && s3b.UploadConcurrency() > 0 {
+		uploadConc = s3b.UploadConcurrency()
+	}
+	uploadConc = clampConcurrency(uploadConc, 4)
+	if dynChunkSize > 0 && maxInFlight < 2*dynChunkSize {
+		maxInFlight = 2 * dynChunkSize
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &S3ChunkManager{
+	return &ScratchChunkManager{
 		key:              state.Key,
 		state:            state,
 		storage:          storage,
@@ -131,6 +133,7 @@ func NewS3ChunkManager(state *FileCacheState, storage StorageBackend, chunkSize 
 		maxInFlightBytes: maxInFlight,
 		minFreeDiskBytes: minFreeDisk,
 		budgetChan:       make(chan struct{}, 1),
+		uploadSem:        make(chan struct{}, uploadConc),
 		uploaded:         make(map[int]bool),
 		uploading:        make(map[int]bool),
 		ctx:              ctx,
@@ -138,16 +141,16 @@ func NewS3ChunkManager(state *FileCacheState, storage StorageBackend, chunkSize 
 	}
 }
 
-// IsMultipart returns whether this hydration uses S3 multipart upload
-func (m *S3ChunkManager) IsMultipart() bool {
+// IsMultipart returns whether this hydration uses multipart chunked upload.
+func (m *ScratchChunkManager) IsMultipart() bool {
 	if m == nil {
 		return false
 	}
 	return m.isMultipart
 }
 
-// WaitScratchBudget pauses the caller if in-flight un-uploaded bytes exceed budget or disk free space is low
-func (m *S3ChunkManager) WaitScratchBudget(ctx context.Context) error {
+// WaitScratchBudget pauses the caller if in-flight un-uploaded bytes exceed budget or disk free space is low.
+func (m *ScratchChunkManager) WaitScratchBudget(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
@@ -184,8 +187,8 @@ func (m *S3ChunkManager) WaitScratchBudget(ctx context.Context) error {
 	}
 }
 
-// AddInFlightBytes increments the recorded un-uploaded scratch bytes
-func (m *S3ChunkManager) AddInFlightBytes(n int64) {
+// AddInFlightBytes increments the recorded un-uploaded scratch bytes.
+func (m *ScratchChunkManager) AddInFlightBytes(n int64) {
 	if m == nil || n <= 0 {
 		return
 	}
@@ -194,8 +197,8 @@ func (m *S3ChunkManager) AddInFlightBytes(n int64) {
 	m.budgetMu.Unlock()
 }
 
-// SubInFlightBytes decrements the un-uploaded scratch bytes and signals waiting workers
-func (m *S3ChunkManager) SubInFlightBytes(n int64) {
+// SubInFlightBytes decrements the un-uploaded scratch bytes and signals waiting workers.
+func (m *ScratchChunkManager) SubInFlightBytes(n int64) {
 	if m == nil || n <= 0 {
 		return
 	}
@@ -212,18 +215,18 @@ func (m *S3ChunkManager) SubInFlightBytes(n int64) {
 	}
 }
 
-// TotalParts returns the total calculated chunk count
-func (m *S3ChunkManager) TotalParts() int {
+// TotalParts returns the total calculated chunk count.
+func (m *ScratchChunkManager) TotalParts() int {
 	return m.totalParts
 }
 
-// ChunkSize returns the chunk size
-func (m *S3ChunkManager) ChunkSize() int64 {
+// ChunkSize returns the chunk size.
+func (m *ScratchChunkManager) ChunkSize() int64 {
 	return m.chunkSize
 }
 
-// IsChunkUploaded returns true if the specified chunk is safely in S3
-func (m *S3ChunkManager) IsChunkUploaded(chunkIndex int) bool {
+// IsChunkUploaded returns true if the specified chunk is safely stored remotely.
+func (m *ScratchChunkManager) IsChunkUploaded(chunkIndex int) bool {
 	if m == nil {
 		return false
 	}
@@ -234,22 +237,22 @@ func (m *S3ChunkManager) IsChunkUploaded(chunkIndex int) bool {
 
 // SetTrackDiskFlushes controls whether CheckAndTriggerUploads gates on DiskRangeSet
 // (bytes flushed to disk by WritebackPipeline) vs RangeSet.
-func (m *S3ChunkManager) SetTrackDiskFlushes(enabled bool) {
+func (m *ScratchChunkManager) SetTrackDiskFlushes(enabled bool) {
 	if m == nil {
 		return
 	}
 	m.trackDiskFlushes.Store(enabled)
 }
 
-func (m *S3ChunkManager) activeRangeSet() *RangeSet {
+func (m *ScratchChunkManager) activeRangeSet() *RangeSet {
 	if m.trackDiskFlushes.Load() && m.state.DiskRangeSet != nil {
 		return m.state.DiskRangeSet
 	}
 	return m.state.RangeSet
 }
 
-// CheckAndTriggerUploads inspects RangeSet (or DiskRangeSet when pipelined) to see if any new chunks can be uploaded
-func (m *S3ChunkManager) CheckAndTriggerUploads() {
+// CheckAndTriggerUploads inspects RangeSet (or DiskRangeSet when pipelined) to see if any new chunks can be uploaded.
+func (m *ScratchChunkManager) CheckAndTriggerUploads() {
 	if m == nil || m.storage == nil {
 		return
 	}
@@ -257,7 +260,7 @@ func (m *S3ChunkManager) CheckAndTriggerUploads() {
 	rs := m.activeRangeSet()
 
 	m.mu.Lock()
-	if m.recomposed {
+	if m.recomposed || m.permanentErr != nil {
 		m.mu.Unlock()
 		return
 	}
@@ -294,9 +297,19 @@ func (m *S3ChunkManager) CheckAndTriggerUploads() {
 	}
 }
 
-func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
+func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 	defer m.wg.Done()
 	defer atomic.AddInt32(&m.activeUploads, -1)
+
+	select {
+	case m.uploadSem <- struct{}{}:
+	case <-m.ctx.Done():
+		m.mu.Lock()
+		m.uploading[chunkIndex] = false
+		m.mu.Unlock()
+		return
+	}
+	defer func() { <-m.uploadSem }()
 
 	chunkStart := int64(chunkIndex) * m.chunkSize
 	chunkLen := m.chunkSize
@@ -307,7 +320,7 @@ func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
 	// Open read-write handle so fallocate(FALLOC_FL_PUNCH_HOLE) succeeds (O_RDONLY fails with EBADF)
 	f, err := os.OpenFile(m.state.PartPath, os.O_RDWR, 0644)
 	if err != nil {
-		log.Printf("[S3ChunkManager] Failed to open local scratch for chunk %d of %s: %v", chunkIndex, m.key, err)
+		log.Printf("[ScratchChunkManager] Failed to open local scratch for chunk %d of %s: %v", chunkIndex, m.key, err)
 		m.mu.Lock()
 		m.uploading[chunkIndex] = false
 		m.mu.Unlock()
@@ -324,23 +337,49 @@ func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
 			break
 		}
 		backoff := time.Duration(1<<(attempt-1)) * 500 * time.Millisecond
-		log.Printf("[S3ChunkManager] S3 UploadChunk failed for %s chunk %d (attempt %d/3): %v. Retrying in %s...",
+		log.Printf("[ScratchChunkManager] S3 UploadChunk failed for %s chunk %d (attempt %d/3): %v. Retrying in %s...",
 			m.key, chunkIndex, attempt, uploadErr, backoff)
+		timer := time.NewTimer(backoff)
 		select {
-		case <-time.After(backoff):
+		case <-timer.C:
 		case <-m.ctx.Done():
+			timer.Stop()
+			m.mu.Lock()
+			m.uploading[chunkIndex] = false
+			m.mu.Unlock()
 			return
 		}
 	}
 
 	if uploadErr != nil {
 		if m.ctx.Err() != nil {
+			m.mu.Lock()
+			m.uploading[chunkIndex] = false
+			m.mu.Unlock()
 			return
 		}
-		log.Printf("[S3ChunkManager] S3 UploadChunk permanently failed for %s chunk %d after 3 attempts: %v", m.key, chunkIndex, uploadErr)
+		log.Printf("[ScratchChunkManager] S3 UploadChunk permanently failed for %s chunk %d after 3 attempts: %v", m.key, chunkIndex, uploadErr)
 		m.mu.Lock()
 		m.uploading[chunkIndex] = false
+		if m.permanentErr == nil {
+			m.permanentErr = uploadErr
+		}
 		m.mu.Unlock()
+		m.cancel()
+		select {
+		case m.budgetChan <- struct{}{}:
+		default:
+		}
+		if cleaner, ok := m.storage.(ChunkCleanupBackend); ok {
+			key := m.key
+			go func() {
+				delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := cleaner.DeleteChunks(delCtx, key); err != nil {
+					log.Printf("[ScratchChunkManager] Async DeleteChunks failed for %s: %v", key, err)
+				}
+			}()
+		}
 		return
 	}
 
@@ -352,7 +391,7 @@ func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
 
 	// 1. Deallocate physical disk blocks (Linux hole punching)
 	if punchErr := PunchHole(f.Fd(), chunkStart, chunkLen); punchErr != nil {
-		log.Printf("[S3ChunkManager] WARNING: PunchHole failed for %s chunk %d [%d, %d): %v",
+		log.Printf("[ScratchChunkManager] WARNING: PunchHole failed for %s chunk %d [%d, %d): %v",
 			m.key, chunkIndex, chunkStart, chunkStart+chunkLen, punchErr)
 	}
 
@@ -362,7 +401,7 @@ func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
 	// 3. Release scratch budget and signal download workers
 	m.SubInFlightBytes(chunkLen)
 
-	log.Printf("[S3ChunkManager] Successfully committed chunk %d/%d (%.2f MB) to S3 for %s",
+	log.Printf("[ScratchChunkManager] Successfully committed chunk %d/%d (%.2f MB) to S3 for %s",
 		chunkIndex+1, m.totalParts, float64(chunkLen)/(1024*1024), m.key)
 
 	// If all chunks uploaded, attempt recomposition
@@ -371,8 +410,8 @@ func (m *S3ChunkManager) uploadWorker(chunkIndex int) {
 	}
 }
 
-// IsRecomposed returns true if the monolithic S3 object has been sealed
-func (m *S3ChunkManager) IsRecomposed() bool {
+// IsRecomposed returns true if the monolithic S3 object has been sealed.
+func (m *ScratchChunkManager) IsRecomposed() bool {
 	if m == nil {
 		return false
 	}
@@ -382,7 +421,7 @@ func (m *S3ChunkManager) IsRecomposed() bool {
 }
 
 // setCommitProgress records the active commit stage and item progress under lock.
-func (m *S3ChunkManager) setCommitProgress(stage string, completed, total int) {
+func (m *ScratchChunkManager) setCommitProgress(stage string, completed, total int) {
 	if m == nil {
 		return
 	}
@@ -394,7 +433,7 @@ func (m *S3ChunkManager) setCommitProgress(stage string, completed, total int) {
 }
 
 // GetCommitProgress returns the current S3 commit/recomposition stage and phase counts.
-func (m *S3ChunkManager) GetCommitProgress() *CommitProgress {
+func (m *ScratchChunkManager) GetCommitProgress() *CommitProgress {
 	if m == nil {
 		return nil
 	}
@@ -440,10 +479,10 @@ func (m *S3ChunkManager) GetCommitProgress() *CommitProgress {
 	}
 }
 
-// AttemptRecompose stitches uploaded chunks into the monolithic S3 object
-func (m *S3ChunkManager) AttemptRecompose() {
+// AttemptRecompose stitches uploaded chunks into the monolithic S3 object.
+func (m *ScratchChunkManager) AttemptRecompose() {
 	m.mu.Lock()
-	if m.recomposing || m.recomposed {
+	if m.recomposing || m.recomposed || m.permanentErr != nil {
 		m.mu.Unlock()
 		return
 	}
@@ -480,14 +519,14 @@ func (m *S3ChunkManager) AttemptRecompose() {
 
 		var err error
 		if !m.isMultipart {
-			log.Printf("[S3ChunkManager] Non-multipart asset (%.2f MB). Committing direct to S3 for %s...",
+			log.Printf("[ScratchChunkManager] Non-multipart asset (%.2f MB). Committing direct to S3 for %s...",
 				float64(m.totalSize)/(1024*1024), m.key)
 			err = m.storage.CommitLocalFile(m.ctx, m.key, m.state.PartPath, meta)
 			if err == nil {
 				m.setCommitProgress("finalizing", 1, 1)
 			}
 		} else {
-			log.Printf("[S3ChunkManager] All %d chunks uploaded to S3. Starting server-side recomposition for %s...", m.totalParts, m.key)
+			log.Printf("[ScratchChunkManager] All %d chunks uploaded to S3. Starting server-side recomposition for %s...", m.totalParts, m.key)
 			recomposeCtx := WithCommitProgress(m.ctx, CommitProgressFunc(m.setCommitProgress))
 			err = m.storage.Recompose(recomposeCtx, m.key, m.totalParts, meta)
 			if err == nil {
@@ -505,7 +544,7 @@ func (m *S3ChunkManager) AttemptRecompose() {
 		}
 
 		if err != nil {
-			log.Printf("[S3ChunkManager] Server-side recomposition/commit failed for %s: %v", m.key, err)
+			log.Printf("[ScratchChunkManager] Server-side recomposition/commit failed for %s: %v", m.key, err)
 			m.mu.Lock()
 			m.recomposing = false
 			m.recomposeErr = err
@@ -519,7 +558,7 @@ func (m *S3ChunkManager) AttemptRecompose() {
 		m.recomposeErr = nil
 		m.mu.Unlock()
 
-		log.Printf("[S3ChunkManager] Server-side recomposition SUCCESS for %s. Monolithic object sealed.", m.key)
+		log.Printf("[ScratchChunkManager] Server-side recomposition SUCCESS for %s. Monolithic object sealed.", m.key)
 
 		// Wake up any waiting client readers
 		m.state.Lock.Lock()
@@ -532,7 +571,7 @@ func (m *S3ChunkManager) AttemptRecompose() {
 
 // WaitAndRecompose triggers any remaining chunk uploads, waits for all uploads to finish,
 // and waits for server-side recomposition (or direct CommitLocalFile) to seal the S3 object.
-func (m *S3ChunkManager) WaitAndRecompose(ctx context.Context) error {
+func (m *ScratchChunkManager) WaitAndRecompose(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
@@ -552,6 +591,12 @@ func (m *S3ChunkManager) WaitAndRecompose(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-m.ctx.Done():
+			m.mu.RLock()
+			permErr := m.permanentErr
+			m.mu.RUnlock()
+			if permErr != nil {
+				return permErr
+			}
 			return m.ctx.Err()
 		}
 	}
@@ -560,6 +605,13 @@ func (m *S3ChunkManager) WaitAndRecompose(ctx context.Context) error {
 	m.CheckAndTriggerUploads()
 	if err := waitWG(&m.wg); err != nil {
 		return err
+	}
+
+	m.mu.RLock()
+	permErr := m.permanentErr
+	m.mu.RUnlock()
+	if permErr != nil {
+		return permErr
 	}
 
 	// If any multipart chunk failed transiently and isn't uploaded yet, trigger one retry pass
@@ -574,7 +626,11 @@ func (m *S3ChunkManager) WaitAndRecompose(ctx context.Context) error {
 			}
 			m.mu.RLock()
 			uploadedCount = len(m.uploaded)
+			permErr = m.permanentErr
 			m.mu.RUnlock()
+			if permErr != nil {
+				return permErr
+			}
 			if uploadedCount < m.totalParts {
 				return fmt.Errorf("incomplete S3 chunk uploads (%d/%d) for %s", uploadedCount, m.totalParts, m.key)
 			}
@@ -600,8 +656,8 @@ func (m *S3ChunkManager) WaitAndRecompose(ctx context.Context) error {
 	return nil
 }
 
-// Close cancels in-flight chunk uploads and waits for workers to exit
-func (m *S3ChunkManager) Close() {
+// Close cancels in-flight chunk uploads and waits for workers to exit.
+func (m *ScratchChunkManager) Close() {
 	if m == nil {
 		return
 	}

@@ -30,9 +30,7 @@ It dynamically proxies video requests, downloads and caches content on-demand us
   - Uses an adaptive learning algorithm (in-memory thread-safe registry) to discover and cache the optimal probing method (`Range: bytes=0-0` or standard `GET`) per CDN host/IP on the fly.
   - Sequentially falls back from range requests to standard `GET` requests (inspecting headers and closing the body instantly to prevent downloading content) to handle CDNs that block range requests or reject HEAD requests.
   - Leverages HTTP conditional revalidation (`If-None-Match`/`If-Modified-Since`) to return fast `304 Not Modified` responses, conserving upstream bandwidth.
-- **Dynamic Metadata & Legacy Migration Recovery**: 
-  - *Legacy Cache Migration*: Automatically detects and migrates legacy cache files (extensionless `[key]` format) to the new cache standard (`[key].ext` and companion `.json` metadata file) on-demand when requested by a client.
-  - *Missing Metadata Recovery*: If a cached media file's companion `.json` metadata file is missing or deleted, the proxy dynamically regenerates it using the file's size and original disk modification time (`ModTime`) rather than evicting the file, ensuring seamless integration with the revalidation pipeline with zero redundant downloads.
+- **Dynamic Missing Metadata Recovery**: If a cached media file's companion `.json` metadata file is missing or deleted, the proxy dynamically regenerates it using the file's size and original disk modification time (`ModTime`) rather than evicting the file, ensuring seamless integration with the revalidation pipeline with zero redundant downloads.
 - **Dual Proxy Formats**: Supports query parameters (`/stream?url=...`) as well as clean, Base64-encoded URL paths (`/u/<base64_url>`).
 - **SSE Web Dashboard & Telemetry Visualizers**: Includes a high-performance web dashboard powered by a unified, authoritative SSE stream (dynamic 250ms cadence during active transfers/playback, scaling down to 3s when idle). Features include:
   - *Dual-Color Playback Needles & Canvas Overlays*: Real-time canvas overlay rendering continuous green download chunks, orange starving hashed regions, and client playback position needles (**Neon Cyan** for normal/buffered playback, **Alert Red** for starved playback) with interactive hover tooltips.
@@ -48,11 +46,27 @@ streamcache is configured using environment variables. Default fallback values a
 | Environment Variable | Default | Description |
 |---|---|---|
 | `PORT` | `:8080` | Port the proxy server listens on. |
+| `STORAGE_BACKEND` | `disk` | Storage backend (`disk` or `s3`). |
 | `CACHE_DIR` | `./cache/files` | Location where completed cached media files and JSON metadata are stored. |
-| `TMP_DIR` | `./cache/tmp` | Location where active `.part` downloads are assembled. |
+| `TMP_DIR` | `./cache/tmp` | Location where active `.part` scratch downloads are assembled (keep bind-mounted on a native hole-punching host SSD/NVMe filesystem). |
+| `TMP_FILE_MAX_BYTES` | `512MB` | Per-file in-flight scratch budget in `TMP_DIR` before hole-punched upload catches up (floored to at least `2 × S3_CHUNK_SIZE`). |
+| `TMP_MIN_DISK_FREE_BYTES` | `1GB` | Hard physical free-space floor monitored on `TMP_DIR`. |
 | `CACHE_MAX_BYTES` | `50GB` | Maximum size of the cache directory. Set to `0`, `none`, or `off` to disable the limit and rely solely on disk space checks. Supports size units (e.g. `50GB`, `1TB`). |
-| `MIN_DISK_FREE_BYTES` | `10GB` | Safety buffer for physical disk space that overrides the cache size limit to prevent disk filling. Supports size units (e.g. `10GB`). |
+| `CACHE_MIN_DISK_FREE_BYTES` | `10GB` | Safety buffer for physical disk space on `CACHE_DIR` that overrides the cache size limit to prevent disk filling. Supports size units (e.g. `10GB`). |
+| `CACHE_MAX_IDLE_AGE` | `720h` | Maximum idle age before unused cached objects are evicted. |
+| `CACHE_EVICT_INTERVAL` | `6h` | Background interval for idle-age cache & stale chunk cleanup sweeps. |
 | `CACHE_REVALIDATE_INTERVAL` | `1h` | Cache expiration age before forcing an HTTP revalidation probe to the source host. |
+| `S3_ENDPOINT` | *(empty)* | Custom S3-compatible endpoint URL (used when `STORAGE_BACKEND=s3`). |
+| `S3_BUCKET` | *(empty)* | Target S3 bucket name (`STORAGE_BACKEND=s3`). |
+| `S3_REGION` | `us-east-1` | AWS/S3 region name. |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | *(empty)* | Static S3 credentials. |
+| `S3_USE_PATH_STYLE` | `true` | Use path-style S3 addressing (`endpoint/bucket/key`). |
+| `S3_DISABLE_SSL` | `false` | Use HTTP instead of HTTPS when `S3_ENDPOINT` omits a scheme. |
+| `S3_CHUNK_SIZE` | `64MB` | Target multipart chunk size for S3 staging uploads (`>= 5MB` in production). |
+| `S3_UPLOAD_CONCURRENCY` | `4` | Concurrent chunk `PutObject` uploads per active stream (`1–16`). |
+| `S3_RECOMPOSE_CONCURRENCY` | `6` | Parallel server-side `UploadPartCopy` workers during S3 recomposition (`1–16`). |
+| `MIN_READ_THRESHOLD_BYTES` | `5MB` | Minimum player read threshold before promoting a probe buffer into a full persistent hydration. |
+| `MAX_PROBE_BUFFERS` | `128` | Maximum in-flight probe buffers retained in LRU before oldest probes are evicted. |
 | `ALLOWED_HOSTS` | *(empty)* | Optional comma-separated list of domain names (e.g. `cdn.example.com`) to restrict which upstreams can be proxied. |
 | `SCHEDULER_MIN_TIME` | `2s` | Minimum duration to stream a segment before switching worker targets (debouncer against seek thrashing and startup grace period). Set to `0` or `none` to disable. |
 | `STARVATION_STALL_TIMEOUT` | `30s` | Duration a downloading worker must be throttled without download activity before a starving client triggers the coordinator to abort the stalled worker and reconnect directly at the starving offset. |
@@ -113,7 +127,7 @@ If you have Docker installed, the easiest way to start the service is via Docker
    docker compose down
    ```
 
-*Note: Docker Compose pulls and builds directly from the public GitHub repository (`https://github.com/bruor/streamcache.git#main`). If you prefer to build from your local repository files instead, simply change `context:` to `.` in `docker-compose.yml`.*
+*Notes: Keep `./tmp:/var/cache/streamcache/tmp` explicitly mounted on a native hole-punching host SSD/NVMe filesystem so scratch I/O never fills Docker container layers. If `./cache` is backed by a network share (NFS or SMB/CIFS), configure the host mount with `soft` timeout options (e.g., `soft,timeo=30` on NFS) so transient NAS outages fail cleanly instead of stalling in kernel D-state. Docker Compose pulls and builds directly from the public GitHub repository (`https://github.com/bruor/streamcache.git#main`); change `context:` to `.` in `docker-compose.yml` to build locally.*
 
 ---
 

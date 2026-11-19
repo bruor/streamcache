@@ -176,15 +176,15 @@ func CancelCoordinator(state *FileCacheState) {
 		if exists && (existingState == state || existingState == nil) {
 			delete(GlobalRegistry.Files, key)
 			GlobalRegistry.Lock.Unlock()
-			accounted := atomic.SwapInt64(&state.TotalBytesDownloaded, 0)
-			if accounted > 0 && GlobalRegistry != nil {
-				GlobalRegistry.UpdateSize(-accounted)
-			}
+			releaseAccountedCacheBytes(state)
 			if FileExists(partPath) {
 				_ = os.Remove(partPath)
 			}
 			if FileExists(metaPath) {
 				_ = os.Remove(metaPath)
+			}
+			if chunkManager == nil || !chunkManager.IsRecomposed() {
+				triggerAsyncChunkCleanup(GlobalStorage, key, "[Coord]")
 			}
 			log.Printf("[Coord] Manually cancelled hydration and removed partial cache files: %s", key)
 		} else {
@@ -343,12 +343,10 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 				if exists && (existingState == state || existingState == nil) {
 					delete(GlobalRegistry.Files, state.Key)
 					GlobalRegistry.Lock.Unlock()
-					accounted := atomic.SwapInt64(&state.TotalBytesDownloaded, 0)
-					if accounted > 0 && GlobalRegistry != nil {
-						GlobalRegistry.UpdateSize(-accounted)
-					}
+					releaseAccountedCacheBytes(state)
 					_ = os.Remove(state.PartPath)
 					_ = os.Remove(state.MetaPath)
+					triggerAsyncChunkCleanup(GlobalStorage, state.Key, "[Coord]")
 					log.Printf("[Coord] Removed incomplete cache file from registry and disk: %s", state.Key)
 				} else {
 					GlobalRegistry.Lock.Unlock()
@@ -1235,9 +1233,7 @@ func runDownloadWorker(
 			atomic.AddInt64(&w.connBytesWritten, int64(n))
 			atomic.StoreInt64(&w.lastByteTimeNano, time.Now().UnixNano())
 
-			atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
-			atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
-			GlobalRegistry.UpdateSize(int64(n))
+			recordDownloadedBytes(state, int64(n))
 
 			readElapsed := time.Since(readStartTime).Seconds()
 			if readElapsed > 0 {
@@ -1493,9 +1489,7 @@ func runInlineTailPrefetch(
 			currentOffset += int64(n)
 			atomic.StoreInt64(&w.currentOffset, currentOffset)
 
-			atomic.AddInt64(&state.BytesDownloadedSec, int64(n))
-			atomic.AddInt64(&state.TotalBytesDownloaded, int64(n))
-			GlobalRegistry.UpdateSize(int64(n))
+			recordDownloadedBytes(state, int64(n))
 		}
 
 		if err != nil {
@@ -1603,7 +1597,50 @@ func sniffAndSchedulePrefetch(state *FileCacheState, file *os.File) {
 	}
 }
 
+func recordDownloadedBytes(state *FileCacheState, n int64) {
+	if state == nil || n <= 0 {
+		return
+	}
+	atomic.AddInt64(&state.BytesDownloadedSec, n)
+	atomic.AddInt64(&state.TotalBytesDownloaded, n)
+	if state.GetTargetTier() == TierDisk && GlobalRegistry != nil {
+		atomic.AddInt64(&state.AccountedCacheBytes, n)
+		GlobalRegistry.UpdateSize(n)
+	}
+}
+
+func releaseAccountedCacheBytes(state *FileCacheState) {
+	if state == nil || GlobalRegistry == nil {
+		return
+	}
+	accounted := atomic.SwapInt64(&state.AccountedCacheBytes, 0)
+	if accounted > 0 {
+		GlobalRegistry.UpdateSize(-accounted)
+	}
+}
+
+func triggerAsyncChunkCleanup(storage StorageBackend, key string, logPrefix string) {
+	cleaner, ok := storage.(ChunkCleanupBackend)
+	if !ok || key == "" {
+		return
+	}
+	go func() {
+		delCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := cleaner.DeleteChunks(delCtx, key); err != nil {
+			log.Printf("%s Async DeleteChunks failed for %s: %v", logPrefix, key, err)
+		}
+	}()
+}
+
 func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipeline StorageSink) {
+	commitCompletedFile(state, fileToClose, pipeline, true, "[Coord]")
+}
+
+func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline StorageSink, earlyPrehydrateRelease bool, logPrefix string) {
+	if state == nil {
+		return
+	}
 	defer func() {
 		state.Lock.Lock()
 		state.WriterActive = false
@@ -1611,77 +1648,89 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 		state.Lock.Unlock()
 	}()
 
-	if pipeline != nil {
-		if err := pipeline.FlushAndClose(); err != nil {
-			log.Printf("[Coord] Error flushing writeback pipeline during commit: %v", err)
-		}
-	}
-
-	if fileToClose != nil {
-		FadviseDontNeed(fileToClose.Fd(), 0, 0)
-		if err := fileToClose.Close(); err != nil {
-			log.Printf("[Coord] Error closing part file during commit: %v", err)
-		}
-	}
-
 	state.Lock.Lock()
+	if fileToClose == nil && state.File != nil {
+		fileToClose = state.File
+		state.File = nil
+	}
+	if pipeline == nil && state.Pipeline != nil {
+		pipeline = state.Pipeline
+		state.Pipeline = nil
+	}
 	if state.LiveBuffer != nil {
 		state.LiveBuffer.Clear()
 		state.LiveBuffer = nil
 	}
 	state.Lock.Unlock()
 
-	if GlobalStorage != nil && GlobalStorage.Type() == "s3" {
-		// Upstream download is complete and all provider connections are closed;
-		// release the prehydration chain before S3 recomposition so the next episode
-		// can begin downloading immediately instead of waiting for Recompose.
-		if GlobalPrehydrationManager != nil {
-			GlobalPrehydrationManager.OnHydrationCompleted(state)
+	if pipeline != nil {
+		if err := pipeline.FlushAndClose(); err != nil {
+			log.Printf("%s Error flushing writeback pipeline during commit: %v", logPrefix, err)
 		}
+	}
 
-		meta := FileMeta{
-			URL:           state.URL,
-			TotalSize:     state.TotalSize,
-			ContentType:   state.ContentType,
-			ETag:          state.ETag,
-			LastModified:  state.LastModified,
-			LastValidated: time.Now().Unix(),
-			Completed:     true,
+	if fileToClose != nil {
+		FadviseDontNeed(fileToClose.Fd(), 0, 0)
+		if err := fileToClose.Close(); err != nil {
+			log.Printf("%s Error closing part file during commit: %v", logPrefix, err)
+		}
+	}
+
+	meta := FileMeta{
+		URL:           state.URL,
+		TotalSize:     state.TotalSize,
+		ContentType:   state.ContentType,
+		ETag:          state.ETag,
+		LastModified:  state.LastModified,
+		LastValidated: time.Now().Unix(),
+		Completed:     true,
+	}
+
+	if state.GetTargetTier() == TierS3 {
+		// Release the prehydration chain before S3 recomposition when called from coordinator completion
+		// so the next queued episode can start downloading immediately instead of waiting for Recompose.
+		if earlyPrehydrateRelease && GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(state)
 		}
 
 		var commitErr error
 		if cm := state.GetChunkManager(); cm != nil {
 			commitErr = cm.WaitAndRecompose(context.Background())
-		} else {
+		} else if GlobalStorage != nil {
 			commitErr = GlobalStorage.CommitLocalFile(context.Background(), state.Key, state.PartPath, meta)
 		}
 
 		_ = os.Remove(state.PartPath)
 		_ = os.Remove(state.MetaPath)
+		releaseAccountedCacheBytes(state)
 
-		accounted := atomic.SwapInt64(&state.TotalBytesDownloaded, 0)
-		if accounted > 0 && GlobalRegistry != nil {
-			GlobalRegistry.UpdateSize(-accounted)
+		if GlobalRegistry != nil {
+			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
 		}
-
-		GlobalRegistry.MarkConnectionsAsInCache(state.Key)
 		if commitErr != nil {
-			log.Printf("[Coord] S3 commit/recomposition FAILED for %s: %v", state.Key, commitErr)
+			log.Printf("%s S3 commit/recomposition FAILED for %s: %v", logPrefix, state.Key, commitErr)
 			state.SetUpstreamStatus("Error")
 		} else {
 			state.SetUpstreamStatus("Completed")
-			log.Printf("[Coord] Cached file finalized and committed to S3: %s", state.Key)
+			log.Printf("%s Cached file finalized and committed to S3: %s", logPrefix, state.Key)
 			if GlobalS3Index != nil {
 				GlobalS3Index.RecordCommit(state.Key, state.URL, state.TotalSize)
 			}
 		}
 
-		GlobalRegistry.Lock.Lock()
-		delete(GlobalRegistry.Files, state.Key)
-		GlobalRegistry.Lock.Unlock()
+		if GlobalRegistry != nil {
+			GlobalRegistry.Lock.Lock()
+			if cur, exists := GlobalRegistry.Files[state.Key]; exists && cur == state {
+				delete(GlobalRegistry.Files, state.Key)
+			}
+			GlobalRegistry.Lock.Unlock()
+		}
 
 		if GlobalLogBroker != nil {
 			go GlobalLogBroker.BroadcastStateUpdate()
+		}
+		if !earlyPrehydrateRelease && commitErr == nil && GlobalPrehydrationManager != nil {
+			GlobalPrehydrationManager.OnHydrationCompleted(state)
 		}
 
 		runtime.GC()
@@ -1689,63 +1738,69 @@ func finalizeAndCommitCache(state *FileCacheState, fileToClose *os.File, pipelin
 		return
 	}
 
+	renameOK := false
 	if !FileExists(state.Path) {
 		err := os.Rename(state.PartPath, state.Path)
 		if err == nil {
-			// Evict the committed file from OS page cache
+			renameOK = true
 			if cf, ferr := os.Open(state.Path); ferr == nil {
 				FadviseDontNeed(cf.Fd(), 0, 0)
 				_ = cf.Close()
 			}
 
-			// Save final metadata JSON confirming completion
 			metaPath := state.Path + ".json"
-			meta := FileMeta{
-				URL:           state.URL,
-				TotalSize:     state.TotalSize,
-				ContentType:   state.ContentType,
-				ETag:          state.ETag,
-				LastModified:  state.LastModified,
-				LastValidated: time.Now().Unix(),
-				Completed:     true,
-			}
-			newBytes, err := json.Marshal(meta)
-			if err == nil {
+			if newBytes, merr := json.Marshal(meta); merr == nil {
 				_ = writeMetaFileAtomic(metaPath, newBytes)
 			}
-			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+			if GlobalRegistry != nil {
+				GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+			}
 			state.SetUpstreamStatus("Completed")
 
-			GlobalRegistry.Lock.Lock()
-			delete(GlobalRegistry.Files, state.Key)
-			GlobalRegistry.Lock.Unlock()
+			if GlobalRegistry != nil {
+				GlobalRegistry.Lock.Lock()
+				if cur, exists := GlobalRegistry.Files[state.Key]; exists && cur == state {
+					delete(GlobalRegistry.Files, state.Key)
+				}
+				GlobalRegistry.Lock.Unlock()
+			}
 
 			if GlobalLogBroker != nil {
 				go GlobalLogBroker.BroadcastStateUpdate()
 			}
-			log.Printf("[Coord] Cached file finalized and committed to disk: %s", state.Key)
+			log.Printf("%s Cached file finalized and committed to disk: %s", logPrefix, state.Key)
 		} else {
-			log.Printf("[Coord] Commit rename failed (likely Windows lock, deferring to reader exit): %v", err)
-			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+			log.Printf("%s Commit rename failed (deferring finalization): %v", logPrefix, err)
+			if !earlyPrehydrateRelease {
+				return
+			}
+			if GlobalRegistry != nil {
+				GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+			}
 			state.SetUpstreamStatus("Completed")
 		}
 	} else {
-		// Evict existing file from OS page cache
 		if cf, ferr := os.Open(state.Path); ferr == nil {
 			FadviseDontNeed(cf.Fd(), 0, 0)
 			_ = cf.Close()
 		}
-		GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+		if GlobalRegistry != nil {
+			GlobalRegistry.MarkConnectionsAsInCache(state.Key)
+		}
 		state.SetUpstreamStatus("Completed")
-		GlobalRegistry.Lock.Lock()
-		delete(GlobalRegistry.Files, state.Key)
-		GlobalRegistry.Lock.Unlock()
+		if GlobalRegistry != nil {
+			GlobalRegistry.Lock.Lock()
+			if cur, exists := GlobalRegistry.Files[state.Key]; exists && cur == state {
+				delete(GlobalRegistry.Files, state.Key)
+			}
+			GlobalRegistry.Lock.Unlock()
+		}
 		if GlobalLogBroker != nil {
 			go GlobalLogBroker.BroadcastStateUpdate()
 		}
 	}
 
-	if GlobalPrehydrationManager != nil {
+	if (renameOK || earlyPrehydrateRelease || FileExists(state.Path)) && GlobalPrehydrationManager != nil {
 		GlobalPrehydrationManager.OnHydrationCompleted(state)
 	}
 

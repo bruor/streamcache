@@ -619,7 +619,7 @@ func TestS3ViewerTransitionAcrossRecomposition(t *testing.T) {
 	}
 	state.RangeSet.Add(0, 64*1024)
 
-	chunkMgr := NewS3ChunkManager(state, backend, chunkSize)
+	chunkMgr := NewScratchChunkManager(state, backend, chunkSize)
 	state.ChunkManager = chunkMgr
 
 	// 1. Upload first 2 chunks
@@ -827,7 +827,7 @@ func TestS3SmallFileSinglePutObject(t *testing.T) {
 		ContentType: "video/mp4",
 	}
 
-	chunkMgr := NewS3ChunkManager(state, backend, s3Config.ChunkSize)
+	chunkMgr := NewScratchChunkManager(state, backend, s3Config.ChunkSize)
 	state.ChunkManager = chunkMgr
 
 	if chunkMgr.IsMultipart() {
@@ -917,16 +917,14 @@ func TestS3BackpressureScratchBudget(t *testing.T) {
 	defer mockS3.Close()
 
 	s3Config := S3Config{
-		Endpoint:            mockS3.URL(),
-		Bucket:              "backpressure-bucket",
-		Region:              "us-east-1",
-		AccessKey:           "test-access",
-		SecretKey:           "test-secret",
-		UsePathStyle:        true,
-		DisableSSL:          true,
-		ChunkSize:           32 * 1024,
-		ScratchMaxBytes:     64 * 1024, // 64 KB max budget = 2 chunks
-		ScratchMinFreeBytes: 1024,
+		Endpoint:     mockS3.URL(),
+		Bucket:       "backpressure-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    32 * 1024,
 	}
 
 	backend, err := NewS3StorageBackend(s3Config)
@@ -948,7 +946,7 @@ func TestS3BackpressureScratchBudget(t *testing.T) {
 		Clients:   make(map[string]chan struct{}),
 	}
 
-	chunkMgr := NewS3ChunkManager(state, backend, s3Config.ChunkSize)
+	chunkMgr := NewScratchChunkManager(state, backend, s3Config.ChunkSize)
 	chunkMgr.maxInFlightBytes = 64 * 1024 // 64 KB cap
 	chunkMgr.minFreeDiskBytes = 1024
 
@@ -1165,13 +1163,13 @@ func TestS3SynchronousFinalizeAndReaderTransition(t *testing.T) {
 	GlobalConfig = &Config{
 		CacheDir:                filepath.Join(tempDir, "files"),
 		TmpDir:                  filepath.Join(tempDir, "tmp"),
+		TmpFileMaxBytes:         10 * 1024 * 1024,
+		TmpMinDiskFreeBytes:     1024,
 		CacheRevalidateInterval: 1 * time.Hour,
 		WritebackBufferSize:     64 * 1024,
 		StorageBackend:          "s3",
 		S3Config: S3Config{
-			ChunkSize:           32 * 1024,
-			ScratchMaxBytes:     10 * 1024 * 1024,
-			ScratchMinFreeBytes: 1024,
+			ChunkSize: 32 * 1024,
 		},
 	}
 	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)
@@ -1179,16 +1177,14 @@ func TestS3SynchronousFinalizeAndReaderTransition(t *testing.T) {
 	defer func() { GlobalConfig = oldConfig }()
 
 	rawBackend, err := NewS3StorageBackend(S3Config{
-		Endpoint:            mockS3.URL(),
-		Bucket:              "sync-commit-bucket",
-		Region:              "us-east-1",
-		AccessKey:           "test-access",
-		SecretKey:           "test-secret",
-		UsePathStyle:        true,
-		DisableSSL:          true,
-		ChunkSize:           32 * 1024,
-		ScratchMaxBytes:     10 * 1024 * 1024,
-		ScratchMinFreeBytes: 1024,
+		Endpoint:     mockS3.URL(),
+		Bucket:       "sync-commit-bucket",
+		Region:       "us-east-1",
+		AccessKey:    "test-access",
+		SecretKey:    "test-secret",
+		UsePathStyle: true,
+		DisableSSL:   true,
+		ChunkSize:    32 * 1024,
 	})
 	if err != nil {
 		t.Fatalf("NewS3StorageBackend error: %v", err)
@@ -1239,15 +1235,14 @@ func TestS3SynchronousFinalizeAndReaderTransition(t *testing.T) {
 	reader := NewCacheReader(ctx, state, nil)
 	defer reader.Close()
 
-	// Simulate streaming all 3 chunks through WritebackPipeline
+	// Simulate streaming all 3 chunks through WritebackPipeline (TierS3 never adds scratch bytes to TotalCacheSize)
 	for off := int64(0); off < totalSize; off += 16 * 1024 {
 		end := off + 16*1024
 		if err := wp.WriteChunk(off, fullData[off:end]); err != nil {
 			t.Fatalf("WriteChunk error: %v", err)
 		}
 		state.RangeSet.Add(off, end)
-		atomic.AddInt64(&state.TotalBytesDownloaded, end-off)
-		GlobalRegistry.UpdateSize(end - off)
+		recordDownloadedBytes(state, end-off)
 	}
 
 	// Simulate coordinator finishing download and starting finalizeAndCommitCache asynchronously
@@ -1434,7 +1429,7 @@ func TestS3UploadWorkerPunchesHole(t *testing.T) {
 		RangeSet:  NewRangeSet(),
 		Clients:   make(map[string]chan struct{}),
 	}
-	chunkMgr := NewS3ChunkManager(state, backend, chunkSize)
+	chunkMgr := NewScratchChunkManager(state, backend, chunkSize)
 
 	// Upload only chunk 0 via uploadWorker
 	state.RangeSet.Add(0, chunkSize)
@@ -1549,9 +1544,9 @@ func TestS3CommitProgressStagesAndPayloads(t *testing.T) {
 		}
 	}
 
-	// Verify S3ChunkManager.GetCommitProgress() + SSE/Debug payload exposure
+	// Verify ScratchChunkManager.GetCommitProgress() + SSE/Debug payload exposure
 	state := NewFileCacheState(key, "http://origin/"+key, filepath.Join(tempDir, key), partPath, partPath+".json", "video/x-matroska", "", "", totalSize)
-	cm := NewS3ChunkManager(state, backend, chunkSize)
+	cm := NewScratchChunkManager(state, backend, chunkSize)
 	cm.mu.Lock()
 	cm.uploaded[0] = true
 	cm.mu.Unlock()

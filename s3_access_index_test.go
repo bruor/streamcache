@@ -32,17 +32,17 @@ func newTestS3Backend(t *testing.T, mock *MockS3Server, bucket string) *S3Storag
 }
 
 func TestS3ConfigDefaults(t *testing.T) {
-	t.Setenv("S3_MAX_IDLE_AGE", "")
-	_ = os.Unsetenv("S3_MAX_IDLE_AGE")
-	t.Setenv("S3_EVICT_INTERVAL", "")
-	_ = os.Unsetenv("S3_EVICT_INTERVAL")
+	t.Setenv("CACHE_MAX_IDLE_AGE", "")
+	_ = os.Unsetenv("CACHE_MAX_IDLE_AGE")
+	t.Setenv("CACHE_EVICT_INTERVAL", "")
+	_ = os.Unsetenv("CACHE_EVICT_INTERVAL")
 
 	cfg := parseConfigFromEnv()
-	if cfg.GetS3MaxIdleAge() != 720*time.Hour {
-		t.Fatalf("Expected default S3MaxIdleAge=720h, got %s", cfg.GetS3MaxIdleAge())
+	if cfg.GetCacheMaxIdleAge() != 720*time.Hour {
+		t.Fatalf("Expected default CacheMaxIdleAge=720h, got %s", cfg.GetCacheMaxIdleAge())
 	}
-	if cfg.GetS3EvictInterval() != 6*time.Hour {
-		t.Fatalf("Expected default S3EvictInterval=6h, got %s", cfg.GetS3EvictInterval())
+	if cfg.GetCacheEvictInterval() != 6*time.Hour {
+		t.Fatalf("Expected default CacheEvictInterval=6h, got %s", cfg.GetCacheEvictInterval())
 	}
 }
 
@@ -263,8 +263,8 @@ func TestS3AccessIndex_ProbeIgnoredVsPlaybackAndChainTouch(t *testing.T) {
 		MinReadThresholdBytes:     64 * 1024, // 64 KB threshold for test speed
 		EnableEpisodePrehydration: true,
 		StorageBackend:            "s3",
-		S3MaxIdleAge:              720 * time.Hour,
-		S3EvictInterval:           6 * time.Hour,
+		CacheMaxIdleAge:           720 * time.Hour,
+		CacheEvictInterval:        6 * time.Hour,
 	}
 	GlobalStorage = backend
 	GlobalRegistry = &CacheRegistry{
@@ -403,10 +403,10 @@ func TestS3PrehydrationChainsBeforeRecomposeCompletes(t *testing.T) {
 		CacheRevalidateInterval: 1 * time.Hour,
 		WritebackBufferSize:     64 * 1024,
 		StorageBackend:          "s3",
+		TmpFileMaxBytes:         10 * 1024 * 1024,
+		TmpMinDiskFreeBytes:     1024,
 		S3Config: S3Config{
-			ChunkSize:           32 * 1024,
-			ScratchMaxBytes:     10 * 1024 * 1024,
-			ScratchMinFreeBytes: 1024,
+			ChunkSize: 32 * 1024,
 		},
 	}
 	_ = os.MkdirAll(GlobalConfig.CacheDir, 0755)

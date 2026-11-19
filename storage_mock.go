@@ -29,6 +29,7 @@ type MockS3Server struct {
 	uploadKeys   map[string]string                 // uploadId -> "bucket/key"
 	uploadSeq    uint64
 	FailureCodes map[string]int                    // key/endpoint -> HTTP status code to simulate
+	RequestHook  func(r *http.Request) int         // optional hook run before locking m.mu; return >0 for HTTP status
 }
 
 // NewMockS3Server starts a new in-memory S3 test server
@@ -76,6 +77,19 @@ func (m *MockS3Server) ActiveUploads() int {
 }
 
 func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
+	m.mu.RLock()
+	hook := m.RequestHook
+	m.mu.RUnlock()
+	if hook != nil {
+		if status := hook(r); status > 0 {
+			http.Error(w, fmt.Sprintf("Hook Error %d", status), status)
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -252,6 +266,12 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 		if uploadID != "" && partNumberStr != "" {
 			// UploadPart or UploadPartCopy
+			partsMap, uploadExists := m.uploads[uploadID]
+			if !uploadExists {
+				http.Error(w, "NoSuchUpload", http.StatusNotFound)
+				return
+			}
+
 			partNumber, err := strconv.Atoi(partNumberStr)
 			if err != nil {
 				http.Error(w, "Invalid partNumber", http.StatusBadRequest)
@@ -273,7 +293,7 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 				partBytes = make([]byte, len(srcContent))
 				copy(partBytes, srcContent)
 
-				m.uploads[uploadID][partNumber] = partBytes
+				partsMap[partNumber] = partBytes
 				eTag := fmt.Sprintf("\"%x\"", md5.Sum(partBytes))
 
 				type CopyPartResult struct {
@@ -298,7 +318,7 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			partBytes = body
-			m.uploads[uploadID][partNumber] = partBytes
+			partsMap[partNumber] = partBytes
 			eTag := fmt.Sprintf("\"%x\"", md5.Sum(partBytes))
 			w.Header().Set("ETag", eTag)
 			w.WriteHeader(http.StatusOK)
@@ -397,7 +417,13 @@ func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 
 			var combined []byte
+			prevPart := 0
 			for _, p := range req.Parts {
+				if p.PartNumber <= prevPart {
+					http.Error(w, fmt.Sprintf("InvalidPartOrder: %d after %d", p.PartNumber, prevPart), http.StatusBadRequest)
+					return
+				}
+				prevPart = p.PartNumber
 				chunkData, exists := partsMap[p.PartNumber]
 				if !exists {
 					http.Error(w, fmt.Sprintf("Part %d not found", p.PartNumber), http.StatusBadRequest)
@@ -507,6 +533,12 @@ func (m *MockS3Server) SetObjectModTime(bucket, key string, t time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.modTimes[bucket+"/"+key] = t.UTC()
+}
+
+func (m *MockS3Server) SetRequestHook(hook func(r *http.Request) int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.RequestHook = hook
 }
 
 func computeMD5(data []byte) string {

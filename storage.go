@@ -22,9 +22,25 @@ type StorageReadSeeker interface {
 	Size() int64
 }
 
+// StorageTier identifies which tier a media file is currently served from or routed to.
+type StorageTier string
+
+const (
+	TierDisk  StorageTier = "disk"
+	TierS3    StorageTier = "s3"
+	TierProbe StorageTier = "probe"
+)
+
+// ChunkCleanupBackend is optionally implemented by remote chunked backends (such as S3)
+// so callers can clean up staging chunks on failure, cancellation, or eviction.
+type ChunkCleanupBackend interface {
+	DeleteChunks(ctx context.Context, key string) error
+	SweepStaleChunks(ctx context.Context, maxAge time.Duration) (int, error)
+}
+
 // StorageBackend defines the interface for persisting and serving media cache assets
 type StorageBackend interface {
-	// Type returns the storage backend identifier (e.g., "local", "s3")
+	// Type returns the storage backend identifier (e.g., "disk", "s3")
 	Type() string
 
 	// Stat checks whether an asset exists in storage and returns its metadata and completion status

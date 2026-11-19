@@ -392,7 +392,7 @@ func NewWritebackPipeline(file *os.File, state *FileCacheState, bufferBytes int6
 	}
 
 	var lb *LiveBuffer
-	var cm *S3ChunkManager
+	var cm *ScratchChunkManager
 	if state != nil {
 		state.Lock.Lock()
 		if state.LiveBuffer == nil {

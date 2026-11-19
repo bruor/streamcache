@@ -24,12 +24,12 @@ const (
 
 // S3StorageBackend implements StorageBackend using any S3-compatible service
 type S3StorageBackend struct {
-	client              *s3.Client
-	bucket              string
-	chunkSize           int64
-	scratchMaxBytes     int64
-	scratchMinFreeBytes int64
-	mu                  sync.RWMutex
+	client               *s3.Client
+	bucket               string
+	chunkSize            int64
+	uploadConcurrency    int
+	recomposeConcurrency int
+	mu                   sync.RWMutex
 }
 
 // NewS3StorageBackend initializes an S3StorageBackend from S3Config
@@ -64,22 +64,15 @@ func NewS3StorageBackend(cfg S3Config) (*S3StorageBackend, error) {
 		chunkSize = 64 * 1024 * 1024
 	}
 
-	scratchMax := cfg.ScratchMaxBytes
-	if scratchMax <= 0 {
-		scratchMax = 2 * 1024 * 1024 * 1024
-	}
-
-	scratchMinFree := cfg.ScratchMinFreeBytes
-	if scratchMinFree <= 0 {
-		scratchMinFree = 1 * 1024 * 1024 * 1024
-	}
+	uploadConc := clampConcurrency(cfg.UploadConcurrency, 4)
+	recomposeConc := clampConcurrency(cfg.RecomposeConcurrency, 6)
 
 	return &S3StorageBackend{
-		client:              client,
-		bucket:              cfg.Bucket,
-		chunkSize:           chunkSize,
-		scratchMaxBytes:     scratchMax,
-		scratchMinFreeBytes: scratchMinFree,
+		client:               client,
+		bucket:               cfg.Bucket,
+		chunkSize:            chunkSize,
+		uploadConcurrency:    uploadConc,
+		recomposeConcurrency: recomposeConc,
 	}, nil
 }
 
@@ -87,12 +80,12 @@ func (b *S3StorageBackend) ChunkSize() int64 {
 	return b.chunkSize
 }
 
-func (b *S3StorageBackend) ScratchMaxBytes() int64 {
-	return b.scratchMaxBytes
+func (b *S3StorageBackend) UploadConcurrency() int {
+	return b.uploadConcurrency
 }
 
-func (b *S3StorageBackend) ScratchMinFreeBytes() int64 {
-	return b.scratchMinFreeBytes
+func (b *S3StorageBackend) RecomposeConcurrency() int {
+	return b.recomposeConcurrency
 }
 
 func (b *S3StorageBackend) Type() string {
@@ -182,12 +175,16 @@ func (b *S3StorageBackend) Stat(ctx context.Context, key string) (*FileMeta, boo
 	return &meta, true, nil
 }
 
+const s3ReadRequestTimeout = 30 * time.Second
+
 type s3ReadSeeker struct {
 	client    *s3.Client
 	bucket    string
 	key       string
 	totalSize int64
 	offset    int64
+	ctx       context.Context
+	cancel    context.CancelFunc
 
 	mu        sync.Mutex
 	buf       []byte
@@ -199,6 +196,9 @@ func (r *s3ReadSeeker) Size() int64 {
 }
 
 func (r *s3ReadSeeker) Close() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.buf = nil
@@ -228,10 +228,65 @@ func (r *s3ReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	return r.offset, nil
 }
 
+func (r *s3ReadSeeker) contextErr() error {
+	if r.ctx != nil {
+		return r.ctx.Err()
+	}
+	return nil
+}
+
+func (r *s3ReadSeeker) fetchWindowLocked(off, toRead int64) error {
+	baseCtx := r.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	if err := baseCtx.Err(); err != nil {
+		return err
+	}
+
+	fetchSize := int64(defaultS3ReadAheadSize)
+	if toRead > fetchSize {
+		fetchSize = toRead
+	}
+	if off+fetchSize > r.totalSize {
+		fetchSize = r.totalSize - off
+	}
+
+	reqCtx, cancel := context.WithTimeout(baseCtx, s3ReadRequestTimeout)
+	defer cancel()
+
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", off, off+fetchSize-1)
+	resp, err := r.client.GetObject(reqCtx, &s3.GetObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(r.key),
+		Range:  aws.String(rangeHeader),
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	r.buf = buf
+	r.bufOffset = off
+	return nil
+}
+
 func (r *s3ReadSeeker) Read(p []byte) (int, error) {
+	if err := r.contextErr(); err != nil {
+		return 0, err
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if err := r.contextErr(); err != nil {
+		return 0, err
+	}
 	if r.offset >= r.totalSize {
 		return 0, io.EOF
 	}
@@ -243,56 +298,27 @@ func (r *s3ReadSeeker) Read(p []byte) (int, error) {
 
 	// 1. Check if covered by read-ahead buffer
 	bufEnd := r.bufOffset + int64(len(r.buf))
-	if r.buf != nil && r.offset >= r.bufOffset && r.offset < bufEnd {
-		relStart := r.offset - r.bufOffset
-		avail := int64(len(r.buf)) - relStart
-		n := toRead
-		if n > avail {
-			n = avail
+	if r.buf == nil || r.offset < r.bufOffset || r.offset >= bufEnd {
+		if err := r.fetchWindowLocked(r.offset, toRead); err != nil {
+			return 0, err
 		}
-		copy(p[:n], r.buf[relStart:relStart+n])
-		r.offset += n
-		return int(n), nil
 	}
 
-	// 2. Fetch new window into buffer with read-ahead
-	fetchSize := int64(defaultS3ReadAheadSize)
-	if toRead > fetchSize {
-		fetchSize = toRead
+	relStart := r.offset - r.bufOffset
+	avail := int64(len(r.buf)) - relStart
+	n := toRead
+	if n > avail {
+		n = avail
 	}
-	if r.offset+fetchSize > r.totalSize {
-		fetchSize = r.totalSize - r.offset
-	}
-
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", r.offset, r.offset+fetchSize-1)
-	resp, err := r.client.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(r.bucket),
-		Key:    aws.String(r.key),
-		Range:  aws.String(rangeHeader),
-	})
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	buf, err := io.ReadAll(resp.Body)
-	if err != nil && err != io.EOF {
-		return 0, err
-	}
-
-	r.buf = buf
-	r.bufOffset = r.offset
-
-	n := int64(len(p))
-	if n > int64(len(r.buf)) {
-		n = int64(len(r.buf))
-	}
-	copy(p[:n], r.buf[:n])
+	copy(p[:n], r.buf[relStart:relStart+n])
 	r.offset += n
 	return int(n), nil
 }
 
 func (r *s3ReadSeeker) ReadAt(p []byte, off int64) (int, error) {
+	if err := r.contextErr(); err != nil {
+		return 0, err
+	}
 	if off >= r.totalSize {
 		return 0, io.EOF
 	}
@@ -305,50 +331,24 @@ func (r *s3ReadSeeker) ReadAt(p []byte, off int64) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if err := r.contextErr(); err != nil {
+		return 0, err
+	}
+
 	bufEnd := r.bufOffset + int64(len(r.buf))
-	if r.buf != nil && off >= r.bufOffset && off < bufEnd {
-		relStart := off - r.bufOffset
-		avail := int64(len(r.buf)) - relStart
-		n := toRead
-		if n > avail {
-			n = avail
+	if r.buf == nil || off < r.bufOffset || off >= bufEnd {
+		if err := r.fetchWindowLocked(off, toRead); err != nil {
+			return 0, err
 		}
-		copy(p[:n], r.buf[relStart:relStart+n])
-		return int(n), nil
 	}
 
-	fetchSize := int64(defaultS3ReadAheadSize)
-	if toRead > fetchSize {
-		fetchSize = toRead
-	}
-	if off+fetchSize > r.totalSize {
-		fetchSize = r.totalSize - off
-	}
-
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", off, off+fetchSize-1)
-	resp, err := r.client.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(r.bucket),
-		Key:    aws.String(r.key),
-		Range:  aws.String(rangeHeader),
-	})
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	buf, err := io.ReadAll(resp.Body)
-	if err != nil && err != io.EOF {
-		return 0, err
-	}
-
-	r.buf = buf
-	r.bufOffset = off
-
+	relStart := off - r.bufOffset
+	avail := int64(len(r.buf)) - relStart
 	n := toRead
-	if n > int64(len(r.buf)) {
-		n = int64(len(r.buf))
+	if n > avail {
+		n = avail
 	}
-	copy(p[:n], r.buf[:n])
+	copy(p[:n], r.buf[relStart:relStart+n])
 	return int(n), nil
 }
 
@@ -361,11 +361,19 @@ func (b *S3StorageBackend) Open(ctx context.Context, key string) (StorageReadSee
 		return nil, os.ErrNotExist
 	}
 
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	readerCtx, cancel := context.WithCancel(baseCtx)
+
 	return &s3ReadSeeker{
 		client:    b.client,
 		bucket:    b.bucket,
 		key:       b.monolithicKey(key),
 		totalSize: meta.TotalSize,
+		ctx:       readerCtx,
+		cancel:    cancel,
 	}, nil
 }
 
@@ -433,13 +441,40 @@ func (b *S3StorageBackend) OpenChunkRange(ctx context.Context, key string, chunk
 func (b *S3StorageBackend) UploadChunk(ctx context.Context, key string, chunkIndex int, r io.Reader, size int64) error {
 	chunkKey := b.chunkKey(key, chunkIndex)
 	var body io.Reader = r
-	if size > 0 {
-		// Read into memory or limit reader
-		buf := make([]byte, size)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return err
+	if size == 0 {
+		body = bytes.NewReader(nil)
+	} else if size > 0 {
+		if rs, ok := r.(io.ReadSeeker); ok {
+			pos, seekErr := rs.Seek(0, io.SeekCurrent)
+			if seekErr == nil {
+				if endPos, endErr := rs.Seek(0, io.SeekEnd); endErr == nil {
+					if _, err := rs.Seek(pos, io.SeekStart); err != nil {
+						return err
+					}
+					avail := endPos - pos
+					if avail < size {
+						return io.ErrUnexpectedEOF
+					}
+					if avail == size {
+						body = rs
+					} else if ra, okAt := r.(io.ReaderAt); okAt {
+						body = io.NewSectionReader(ra, pos, size)
+					} else {
+						body = io.LimitReader(rs, size)
+					}
+				} else {
+					body = rs
+				}
+			} else {
+				body = rs
+			}
+		} else {
+			buf := make([]byte, size)
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return err
+			}
+			body = bytes.NewReader(buf)
 		}
-		body = bytes.NewReader(buf)
 	}
 
 	_, err := b.client.PutObject(ctx, &s3.PutObjectInput{
@@ -483,7 +518,10 @@ func (b *S3StorageBackend) RecomposeWithProgress(ctx context.Context, key string
 	var completedSuccessfully bool
 	defer func() {
 		if !completedSuccessfully && uploadID != nil && *uploadID != "" {
-			_, _ = b.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+			// Detach abort cleanup from a canceled/timed-out request context so multipart state never leaks in S3.
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer abortCancel()
+			_, _ = b.client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
 				Bucket:   aws.String(b.bucket),
 				Key:      aws.String(targetKey),
 				UploadId: uploadID,
@@ -491,34 +529,112 @@ func (b *S3StorageBackend) RecomposeWithProgress(ctx context.Context, key string
 		}
 	}()
 
-	completedParts := make([]types.CompletedPart, 0, totalParts)
-	chunkKeys := make([]types.ObjectIdentifier, 0, totalParts)
+	completedParts := make([]types.CompletedPart, totalParts)
+	chunkKeys := make([]types.ObjectIdentifier, totalParts)
+	for i := 0; i < totalParts; i++ {
+		chunkKeys[i] = types.ObjectIdentifier{Key: aws.String(b.chunkKey(key, i))}
+	}
 
 	report("recomposing", 0, totalParts)
 
-	// 2. UploadPartCopy for each chunk
+	workers := clampConcurrency(b.recomposeConcurrency, 6)
+	if workers > totalParts {
+		workers = totalParts
+	}
+
+	recomposeCtx, cancelRecompose := context.WithCancel(ctx)
+	defer cancelRecompose()
+
+	jobs := make(chan int, totalParts)
 	for i := 0; i < totalParts; i++ {
-		partNumber := int32(i + 1)
-		chunkKey := b.chunkKey(key, i)
-		chunkKeys = append(chunkKeys, types.ObjectIdentifier{Key: aws.String(chunkKey)})
+		jobs <- i
+	}
+	close(jobs)
 
-		copySource := b.bucket + "/" + chunkKey
-		copyResp, err := b.client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
-			Bucket:     aws.String(b.bucket),
-			Key:        aws.String(targetKey),
-			UploadId:   uploadID,
-			PartNumber: aws.Int32(partNumber),
-			CopySource: aws.String(copySource),
-		})
-		if err != nil {
-			return fmt.Errorf("UploadPartCopy failed for part %d: %w", partNumber, err)
-		}
+	var progressMu sync.Mutex
+	completedCount := 0
+	var errOnce sync.Once
+	var firstErr error
 
-		completedParts = append(completedParts, types.CompletedPart{
-			PartNumber: aws.Int32(partNumber),
-			ETag:       copyResp.CopyPartResult.ETag,
-		})
-		report("recomposing", i+1, totalParts)
+	// 2. Parallel UploadPartCopy with jittered retry; each slot writes exclusively to completedParts[i]
+	// so CompleteMultipartUpload always receives parts in strict 1..totalParts order.
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := range jobs {
+				if recomposeCtx.Err() != nil {
+					return
+				}
+
+				partNumber := int32(i + 1)
+				copySource := b.bucket + "/" + aws.ToString(chunkKeys[i].Key)
+
+				var copyResp *s3.UploadPartCopyOutput
+				var partErr error
+				for attempt := 1; attempt <= 3; attempt++ {
+					if recomposeCtx.Err() != nil {
+						partErr = recomposeCtx.Err()
+						break
+					}
+
+					copyResp, partErr = b.client.UploadPartCopy(recomposeCtx, &s3.UploadPartCopyInput{
+						Bucket:     aws.String(b.bucket),
+						Key:        aws.String(targetKey),
+						UploadId:   uploadID,
+						PartNumber: aws.Int32(partNumber),
+						CopySource: aws.String(copySource),
+					})
+					if partErr == nil {
+						if copyResp == nil || copyResp.CopyPartResult == nil || copyResp.CopyPartResult.ETag == nil {
+							partErr = fmt.Errorf("UploadPartCopy returned empty ETag for part %d", partNumber)
+						} else {
+							break
+						}
+					}
+
+					if attempt < 3 {
+						jitter := time.Duration((time.Now().UnixNano()+int64(i*37+workerID*13))%50) * time.Millisecond
+						backoff := time.Duration(75*attempt)*time.Millisecond + jitter
+						timer := time.NewTimer(backoff)
+						select {
+						case <-recomposeCtx.Done():
+							timer.Stop()
+							partErr = recomposeCtx.Err()
+							attempt = 3
+						case <-timer.C:
+						}
+					}
+				}
+
+				if partErr != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("UploadPartCopy failed for part %d: %w", partNumber, partErr)
+						cancelRecompose()
+					})
+					return
+				}
+
+				completedParts[i] = types.CompletedPart{
+					PartNumber: aws.Int32(partNumber),
+					ETag:       copyResp.CopyPartResult.ETag,
+				}
+				progressMu.Lock()
+				completedCount++
+				done := completedCount
+				report("recomposing", done, totalParts)
+				progressMu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	const maxDeleteBatch = 1000
@@ -596,7 +712,103 @@ func (b *S3StorageBackend) Delete(ctx context.Context, key string) error {
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(targetKey),
 	})
+	_ = b.DeleteChunks(ctx, key)
 	return err
+}
+
+func (b *S3StorageBackend) deleteKeyBatch(ctx context.Context, keys []types.ObjectIdentifier) error {
+	const maxDeleteBatch = 1000
+	var firstErr error
+	for start := 0; start < len(keys); start += maxDeleteBatch {
+		end := start + maxDeleteBatch
+		if end > len(keys) {
+			end = len(keys)
+		}
+		if _, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(b.bucket),
+			Delete: &types.Delete{
+				Objects: keys[start:end],
+				Quiet:   aws.Bool(true),
+			},
+		}); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// DeleteChunks deletes all uploaded temporary staging chunks for a single key under chunks/<key>/.
+func (b *S3StorageBackend) DeleteChunks(ctx context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
+	prefix := fmt.Sprintf("chunks/%s/", key)
+	paginator := s3.NewListObjectsV2Paginator(b.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(b.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var toDelete []types.ObjectIdentifier
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		for _, obj := range page.Contents {
+			if obj.Key != nil {
+				toDelete = append(toDelete, types.ObjectIdentifier{Key: obj.Key})
+			}
+		}
+	}
+	if len(toDelete) == 0 {
+		return nil
+	}
+	return b.deleteKeyBatch(ctx, toDelete)
+}
+
+// SweepStaleChunks removes orphaned staging chunk objects older than maxAge (default 24h).
+func (b *S3StorageBackend) SweepStaleChunks(ctx context.Context, maxAge time.Duration) (int, error) {
+	if maxAge <= 0 {
+		maxAge = 24 * time.Hour
+	}
+
+	const prefix = "chunks/"
+	paginator := s3.NewListObjectsV2Paginator(b.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(b.bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	now := time.Now()
+	var toDelete []types.ObjectIdentifier
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return 0, err
+		}
+		for _, obj := range page.Contents {
+			if obj.Key == nil || obj.LastModified == nil {
+				continue
+			}
+			fullKey := *obj.Key
+			rel := strings.TrimPrefix(fullKey, prefix)
+			if idx := strings.LastIndex(rel, "/chunk_"); idx > 0 {
+				assetKey := rel[:idx]
+				if GlobalRegistry != nil && GlobalRegistry.IsKeyInUse(assetKey) {
+					continue
+				}
+			}
+			if now.Sub(aws.ToTime(obj.LastModified)) >= maxAge {
+				toDelete = append(toDelete, types.ObjectIdentifier{Key: aws.String(fullKey)})
+			}
+		}
+	}
+	if len(toDelete) == 0 {
+		return 0, nil
+	}
+	if err := b.deleteKeyBatch(ctx, toDelete); err != nil {
+		return 0, err
+	}
+	return len(toDelete), nil
 }
 
 func (b *S3StorageBackend) UpdateMetadata(ctx context.Context, key string, meta FileMeta) error {

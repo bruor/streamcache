@@ -1727,17 +1727,17 @@ func TestPreEvictAccountsForConcurrentActiveUnwrittenBytes(t *testing.T) {
 	GlobalConfig.Lock()
 	oldCacheDir := GlobalConfig.CacheDir
 	oldMaxBytes := GlobalConfig.CacheMaxBytes
-	oldMinFree := GlobalConfig.MinDiskFreeBytes
+	oldMinFree := GlobalConfig.CacheMinDiskFreeBytes
 	GlobalConfig.CacheDir = tmpDir
 	GlobalConfig.CacheMaxBytes = 300
-	GlobalConfig.MinDiskFreeBytes = 0
+	GlobalConfig.CacheMinDiskFreeBytes = 0
 	GlobalConfig.Unlock()
 
 	defer func() {
 		GlobalConfig.Lock()
 		GlobalConfig.CacheDir = oldCacheDir
 		GlobalConfig.CacheMaxBytes = oldMaxBytes
-		GlobalConfig.MinDiskFreeBytes = oldMinFree
+		GlobalConfig.CacheMinDiskFreeBytes = oldMinFree
 		GlobalConfig.Unlock()
 	}()
 
