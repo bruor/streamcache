@@ -562,6 +562,7 @@ func (m *StorageHealthMonitor) ProbeS3Once(ctx context.Context) error {
 
 func (m *StorageHealthMonitor) notifyRecovery(tier string) {
 	if pm := GlobalPrehydrationManager; pm != nil {
+		pm.ClearTierContention(tier)
 		pm.NotifyStorageRecovered()
 	}
 	if d := getGlobalHybridDemoter(); d != nil {

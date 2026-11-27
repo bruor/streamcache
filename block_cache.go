@@ -499,6 +499,31 @@ func (s *FileCacheState) GetReaderOffsetBounds() (minOff int64, maxOff int64, pr
 	return minOff, maxOff, protectedOffsets, hasReaders
 }
 
+// OldestStarvationDuration reports how long the longest-waiting active starving client
+// has been continuously stalled waiting for data.
+func (s *FileCacheState) OldestStarvationDuration() (time.Duration, bool) {
+	if s == nil {
+		return 0, false
+	}
+	s.Lock.Lock()
+	defer s.Lock.Unlock()
+	if len(s.Starving) == 0 || len(s.StarvingSince) == 0 {
+		return 0, false
+	}
+	var oldest time.Time
+	for clientID := range s.Starving {
+		if since, ok := s.StarvingSince[clientID]; ok && !since.IsZero() {
+			if oldest.IsZero() || since.Before(oldest) {
+				oldest = since
+			}
+		}
+	}
+	if oldest.IsZero() {
+		return 0, false
+	}
+	return time.Since(oldest), true
+}
+
 func resolveS3TargetBackend() (StorageBackend, int64) {
 	s3Target := GlobalStorage
 	if tb, ok := GlobalStorage.(*TieredStorageBackend); ok && tb.S3() != nil {
@@ -1181,9 +1206,9 @@ func (r *CacheRegistry) startDiskFreeMonitor(cfg *Config) {
 			if cfg.EffectiveStorageBackend() == "hybrid" {
 				if demoter := getGlobalHybridDemoter(); demoter != nil && demoter.registry == r {
 					if maxBytes := cfg.GetCacheMaxBytes(); maxBytes > 0 {
-						if highPct := cfg.GetHybridDemoteHighWatermark(); highPct > 0 {
-							highBytes := int64(float64(maxBytes) * float64(highPct) / 100.0)
-							if r.GetTotalCacheSize() >= highBytes {
+						if thresholdPct := cfg.GetHybridDemoteThreshold(); thresholdPct > 0 {
+							thresholdBytes := int64(float64(maxBytes) * float64(thresholdPct) / 100.0)
+							if r.GetTotalCacheSize() > thresholdBytes {
 								demoter.TriggerWatermarkDemotion()
 							}
 						}

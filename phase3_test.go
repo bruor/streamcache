@@ -23,67 +23,38 @@ func TestPhase3ConfigHybridWatermarksAndEagerBackup(t *testing.T) {
 	// 1. Defaults
 	LoadConfig()
 	cfg := GlobalConfig
-	if cfg.GetHybridDemoteHighWatermark() != 80 {
-		t.Errorf("Expected default HYBRID_DEMOTE_HIGH_WATERMARK=80, got %d", cfg.GetHybridDemoteHighWatermark())
-	}
-	if cfg.GetHybridDemoteLowWatermark() != 70 {
-		t.Errorf("Expected default HYBRID_DEMOTE_LOW_WATERMARK=70, got %d", cfg.GetHybridDemoteLowWatermark())
+	if cfg.GetHybridDemoteThreshold() != 80 {
+		t.Errorf("Expected default HYBRID_DEMOTE_THRESHOLD=80, got %d", cfg.GetHybridDemoteThreshold())
 	}
 	if cfg.GetHybridEagerS3Backup() {
 		t.Errorf("Expected default HYBRID_EAGER_S3_BACKUP=false, got true")
 	}
 
-	// 2. Custom valid values
-	t.Setenv("HYBRID_DEMOTE_HIGH_WATERMARK", "85")
-	t.Setenv("HYBRID_DEMOTE_LOW_WATERMARK", "65")
+	// 2. Custom valid value
+	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "85")
 	t.Setenv("HYBRID_EAGER_S3_BACKUP", "true")
 	LoadConfig()
 	cfg = GlobalConfig
-	if cfg.GetHybridDemoteHighWatermark() != 85 {
-		t.Errorf("Expected custom HYBRID_DEMOTE_HIGH_WATERMARK=85, got %d", cfg.GetHybridDemoteHighWatermark())
-	}
-	if cfg.GetHybridDemoteLowWatermark() != 65 {
-		t.Errorf("Expected custom HYBRID_DEMOTE_LOW_WATERMARK=65, got %d", cfg.GetHybridDemoteLowWatermark())
+	if cfg.GetHybridDemoteThreshold() != 85 {
+		t.Errorf("Expected custom HYBRID_DEMOTE_THRESHOLD=85, got %d", cfg.GetHybridDemoteThreshold())
 	}
 	if !cfg.GetHybridEagerS3Backup() {
 		t.Errorf("Expected custom HYBRID_EAGER_S3_BACKUP=true, got false")
 	}
 
-	// 3. Clamping > 100 and < 0, plus low <= high
-	t.Setenv("HYBRID_DEMOTE_HIGH_WATERMARK", "120")
-	t.Setenv("HYBRID_DEMOTE_LOW_WATERMARK", "95")
+	// 3. Clamping > 100 and < 0
+	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "120")
 	LoadConfig()
 	cfg = GlobalConfig
-	if cfg.GetHybridDemoteHighWatermark() != 100 || cfg.GetHybridDemoteLowWatermark() != 95 {
-		t.Errorf("Expected clamped high=100, low=95; got high=%d, low=%d",
-			cfg.GetHybridDemoteHighWatermark(), cfg.GetHybridDemoteLowWatermark())
+	if cfg.GetHybridDemoteThreshold() != 100 {
+		t.Errorf("Expected clamped threshold=100; got %d", cfg.GetHybridDemoteThreshold())
 	}
 
-	t.Setenv("HYBRID_DEMOTE_HIGH_WATERMARK", "60")
-	t.Setenv("HYBRID_DEMOTE_LOW_WATERMARK", "95")
+	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "-5")
 	LoadConfig()
 	cfg = GlobalConfig
-	if cfg.GetHybridDemoteHighWatermark() != 60 || cfg.GetHybridDemoteLowWatermark() != 60 {
-		t.Errorf("Expected low clamped to high=60; got high=%d, low=%d",
-			cfg.GetHybridDemoteHighWatermark(), cfg.GetHybridDemoteLowWatermark())
-	}
-
-	clearPhase0ConfigEnv(t)
-	t.Setenv("HYBRID_DEMOTE_HIGH_WATERMARK", "50")
-	LoadConfig()
-	cfg = GlobalConfig
-	if cfg.GetHybridDemoteHighWatermark() != 50 || cfg.GetHybridDemoteLowWatermark() != 50 {
-		t.Errorf("Expected unset low watermark (default 70) clamped to high=50; got high=%d, low=%d",
-			cfg.GetHybridDemoteHighWatermark(), cfg.GetHybridDemoteLowWatermark())
-	}
-
-	t.Setenv("HYBRID_DEMOTE_HIGH_WATERMARK", "-5")
-	t.Setenv("HYBRID_DEMOTE_LOW_WATERMARK", "-10")
-	LoadConfig()
-	cfg = GlobalConfig
-	if cfg.GetHybridDemoteHighWatermark() != 80 || cfg.GetHybridDemoteLowWatermark() != 70 {
-		t.Errorf("Expected negative watermarks to fall back to defaults high=80, low=70; got high=%d, low=%d",
-			cfg.GetHybridDemoteHighWatermark(), cfg.GetHybridDemoteLowWatermark())
+	if cfg.GetHybridDemoteThreshold() != 80 {
+		t.Errorf("Expected negative threshold to fall back to default=80; got %d", cfg.GetHybridDemoteThreshold())
 	}
 }
 
@@ -507,7 +478,7 @@ func TestPhase3WatermarkDemotionEagerBackupAndPreEvictDemoteFirst(t *testing.T) 
 	}
 
 	// Subtest A: Watermark demotion 80% -> 70%, AlreadyOnS3 first, active skipped, LRU ordering
-	t.Run("WatermarkDemotion_80To70", func(t *testing.T) {
+	t.Run("WatermarkDemotion_80", func(t *testing.T) {
 		base := t.TempDir()
 		localDir := filepath.Join(base, "cache")
 		tmpDir := filepath.Join(base, "tmp")
@@ -522,14 +493,13 @@ func TestPhase3WatermarkDemotionEagerBackupAndPreEvictDemoteFirst(t *testing.T) 
 		tiered := NewTieredStorageBackend(local, s3Backend)
 
 		cfg := &Config{
-			StorageBackend:             "hybrid",
-			CacheDir:                   localDir,
-			TmpDir:                     tmpDir,
-			StateDir:                   stateDir,
-			CacheMaxBytes:              1000,
-			HybridDemoteHighWatermark:  80,
-			HybridDemoteLowWatermark:   70,
-			CacheRevalidateInterval:    1 * time.Hour,
+			StorageBackend:          "hybrid",
+			CacheDir:                localDir,
+			TmpDir:                  tmpDir,
+			StateDir:                stateDir,
+			CacheMaxBytes:           1000,
+			HybridDemoteThreshold:   80,
+			CacheRevalidateInterval: 1 * time.Hour,
 		}
 		reg := &CacheRegistry{
 			Files: make(map[string]*FileCacheState),
@@ -555,26 +525,26 @@ func TestPhase3WatermarkDemotionEagerBackupAndPreEvictDemoteFirst(t *testing.T) 
 			idx.mu.Unlock()
 		}
 
-		// 5 files * 180B = 900B (90% >= 80% high watermark 800B; target <= 700B)
-		mBoth := seedLocalFile(local, "ep_both.mp4", 180, now.Add(-1*time.Hour))
+		// 5 files * 210B = 1050B (> 80% threshold 800B -> demotes 2 files to reach 630B <= 800B)
+		mBoth := seedLocalFile(local, "ep_both.mp4", 210, now.Add(-1*time.Hour))
 		if err := s3Backend.UploadFromFile(ctx, "ep_both.mp4", local.FilePath("ep_both.mp4"), mBoth); err != nil {
 			t.Fatalf("seed S3 ep_both: %v", err)
 		}
 		seedIdx("ep_both.mp4", mBoth, IndexTierBoth, now.Add(-1*time.Hour))
 
-		mAct := seedLocalFile(local, "ep_active_oldest.mp4", 180, now.Add(-10*time.Hour))
+		mAct := seedLocalFile(local, "ep_active_oldest.mp4", 210, now.Add(-10*time.Hour))
 		seedIdx("ep_active_oldest.mp4", mAct, IndexTierDisk, now.Add(-10*time.Hour))
 
-		mOld := seedLocalFile(local, "ep_disk_old.mp4", 180, now.Add(-5*time.Hour))
+		mOld := seedLocalFile(local, "ep_disk_old.mp4", 210, now.Add(-5*time.Hour))
 		seedIdx("ep_disk_old.mp4", mOld, IndexTierDisk, now.Add(-5*time.Hour))
 
-		mNew1 := seedLocalFile(local, "ep_disk_new1.mp4", 180, now.Add(-2*time.Hour))
+		mNew1 := seedLocalFile(local, "ep_disk_new1.mp4", 210, now.Add(-2*time.Hour))
 		seedIdx("ep_disk_new1.mp4", mNew1, IndexTierDisk, now.Add(-2*time.Hour))
 
-		mNew2 := seedLocalFile(local, "ep_disk_new2.mp4", 180, now.Add(-1*time.Hour))
+		mNew2 := seedLocalFile(local, "ep_disk_new2.mp4", 210, now.Add(-1*time.Hour))
 		seedIdx("ep_disk_new2.mp4", mNew2, IndexTierDisk, now.Add(-1*time.Hour))
 
-		reg.TotalCacheSize = 900
+		reg.TotalCacheSize = 1050
 		putsBefore := s3PutCount.Load()
 
 		demoter := NewHybridDemoter(tiered, idx, reg, cfg)
@@ -584,8 +554,8 @@ func TestPhase3WatermarkDemotionEagerBackupAndPreEvictDemoteFirst(t *testing.T) 
 		if derr != nil {
 			t.Fatalf("RunDemotionPass error: %v", derr)
 		}
-		if demoted != 2 || freed != 360 {
-			t.Errorf("Expected 2 demotions freeing 360B (900->540<=700), got demoted=%d freed=%d", demoted, freed)
+		if demoted != 2 || freed != 420 {
+			t.Errorf("Expected 2 demotions freeing 420B (1050->630<=800), got demoted=%d freed=%d", demoted, freed)
 		}
 
 		// ep_both freed locally without any S3 PUT; ep_disk_old uploaded (1 PUT) then freed locally
@@ -609,8 +579,8 @@ func TestPhase3WatermarkDemotionEagerBackupAndPreEvictDemoteFirst(t *testing.T) 
 				t.Errorf("Expected %s to remain on L1 local disk", keepKey)
 			}
 		}
-		if got := reg.GetTotalCacheSize(); got != 540 {
-			t.Errorf("Expected TotalCacheSize=540 after demotion, got %d", got)
+		if got := reg.GetTotalCacheSize(); got != 630 {
+			t.Errorf("Expected TotalCacheSize=630 after demotion, got %d", got)
 		}
 	})
 
@@ -630,14 +600,13 @@ func TestPhase3WatermarkDemotionEagerBackupAndPreEvictDemoteFirst(t *testing.T) 
 		tiered := NewTieredStorageBackend(local, s3Backend)
 
 		cfg := &Config{
-			StorageBackend:            "hybrid",
-			CacheDir:                  localDir,
-			TmpDir:                    tmpDir,
-			StateDir:                  stateDir,
-			CacheMaxBytes:             1000,
-			HybridDemoteHighWatermark: 80,
-			HybridDemoteLowWatermark:  70,
-			CacheRevalidateInterval:   1 * time.Hour,
+			StorageBackend:          "hybrid",
+			CacheDir:                localDir,
+			TmpDir:                  tmpDir,
+			StateDir:                stateDir,
+			CacheMaxBytes:           1000,
+			HybridDemoteThreshold:   80,
+			CacheRevalidateInterval: 1 * time.Hour,
 		}
 		reg := &CacheRegistry{
 			Files:          make(map[string]*FileCacheState),
@@ -721,15 +690,14 @@ func TestPhase3WatermarkDemotionEagerBackupAndPreEvictDemoteFirst(t *testing.T) 
 		tiered := NewTieredStorageBackend(local, s3Backend)
 
 		cfg := &Config{
-			StorageBackend:            "hybrid",
-			CacheDir:                  localDir,
-			TmpDir:                    tmpDir,
-			StateDir:                  stateDir,
-			CacheMaxBytes:             100000,
-			HybridDemoteHighWatermark: 80,
-			HybridDemoteLowWatermark:  70,
-			HybridEagerS3Backup:       true,
-			CacheRevalidateInterval:   1 * time.Hour,
+			StorageBackend:          "hybrid",
+			CacheDir:                localDir,
+			TmpDir:                  tmpDir,
+			StateDir:                stateDir,
+			CacheMaxBytes:           100000,
+			HybridDemoteThreshold:   80,
+			HybridEagerS3Backup:     true,
+			CacheRevalidateInterval: 1 * time.Hour,
 		}
 		reg := &CacheRegistry{
 			Files:          make(map[string]*FileCacheState),

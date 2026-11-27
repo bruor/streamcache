@@ -57,8 +57,7 @@ streamcache is configured using environment variables. Default fallback values a
 | `CACHE_MAX_ITEM_PCT` | `50` | Maximum percentage of `CACHE_MAX_BYTES` allowed for any single L1 disk item (`0` disables; oversized or un-admissible items bypass L1 via `TierTmp` / S3). |
 | `CACHE_MIN_DISK_FREE_BYTES` | `10GB` | Safety buffer for physical disk space on `CACHE_DIR` (auto-raised to `max(CACHE_MIN_DISK_FREE_BYTES, effectiveTmpMinFree + TMP_FILE_MAX_BYTES)` when `TMP_DIR` and `CACHE_DIR` share a volume). |
 | `NAS_SEQUENTIAL_STAGE` | `auto` | Cross-filesystem `TMP_DIR` -> `CACHE_DIR` chunk staging mode (`auto` forces sequential offset order on CIFS/SMB/FUSE shares; `true` / `false` overrides). |
-| `HYBRID_DEMOTE_HIGH_WATERMARK` | `80` | `CACHE_DIR` usage percentage of `CACHE_MAX_BYTES` that triggers proactive background demotion (`DISK` → `S3`). |
-| `HYBRID_DEMOTE_LOW_WATERMARK` | `70` | Target `CACHE_DIR` usage percentage to demote down to once triggered. |
+| `HYBRID_DEMOTE_THRESHOLD` | `80` | `CACHE_DIR` usage percentage of `CACHE_MAX_BYTES` above which cold entries proactively demote (`DISK` → `S3`). |
 | `HYBRID_EAGER_S3_BACKUP` | `false` | When `true` in `hybrid` mode, asynchronously uploads newly committed L1 files to S3 while keeping the warm L1 copy (`Tier: "both"`). |
 | `CACHE_MAX_IDLE_AGE` | `720h` | Maximum idle age before unused cached objects are evicted. |
 | `CACHE_EVICT_INTERVAL` | `6h` | Background interval for idle-age cache & stale chunk cleanup sweeps. |

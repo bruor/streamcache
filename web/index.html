@@ -2973,8 +2973,7 @@
                     evicted_capacity_bytes: 0,
                     evicted_ttl: 0,
                     evicted_ttl_bytes: 0,
-                    hybrid_demote_high_watermark_pct: 0,
-                    hybrid_demote_low_watermark_pct: 0,
+                    hybrid_demote_threshold_pct: 0,
                     hybrid_eager_s3_backup: false,
                 };
                 const ttlShort = formatTTLShort(st.cache_max_idle_age_seconds);
@@ -3132,15 +3131,12 @@
                             }
                         }
                         const isHybridDisk = Boolean(st.cache_enabled && st.s3_enabled);
-                        const demoteHighPct = isHybridDisk ? (st.hybrid_demote_high_watermark_pct || 0) : 0;
-                        const demoteLowPct = isHybridDisk ? (st.hybrid_demote_low_watermark_pct || 0) : 0;
-                        let demoteHighBytes = 0;
-                        let demoteLowBytes = 0;
+                        const demotePct = isHybridDisk ? (st.hybrid_demote_threshold_pct || 0) : 0;
+                        let demoteBytes = 0;
                         if (cacheDemoteEl) {
-                            if (demoteHighPct > 0 && cacheMax > 0 && cacheTotalSpan > 0) {
-                                demoteHighBytes = cacheMax * (demoteHighPct / 100);
-                                demoteLowBytes = cacheMax * (demoteLowPct / 100);
-                                const demotePosPct = Math.min(100, (demoteHighBytes / cacheTotalSpan) * 100);
+                            if (demotePct > 0 && cacheMax > 0 && cacheTotalSpan > 0) {
+                                demoteBytes = cacheMax * (demotePct / 100);
+                                const demotePosPct = Math.min(100, (demoteBytes / cacheTotalSpan) * 100);
                                 cacheDemoteEl.style.display = 'block';
                                 cacheDemoteEl.style.left = demotePosPct >= 99.5 ? 'calc(100% - 1.5px)' : `${demotePosPct.toFixed(1)}%`;
                             } else {
@@ -3160,8 +3156,8 @@
                             `Disk Free: ${formatCleanBytes(cacheFree)} − ${formatCleanBytes(cacheMin)} res = ${formatCleanBytes(cacheAvail)} avail`,
                             `Unallocated: ${formatCleanBytes(cacheUnallocatedBytes)} • Total Pool: ${formatCleanBytes(cacheTotalSpan)}`,
                         ];
-                        if (demoteHighBytes > 0) {
-                            let demoteLine = `S3 Upload Threshold: ${formatCleanBytes(demoteHighBytes)} (${demoteHighPct}%) → target ${formatCleanBytes(demoteLowBytes)} (${demoteLowPct}%)`;
+                        if (demoteBytes > 0) {
+                            let demoteLine = `S3 Demote Threshold: ${formatCleanBytes(demoteBytes)} (${demotePct}%)`;
                             if (st.hybrid_eager_s3_backup) demoteLine += ' • Eager backup ON';
                             cacheTooltipLines.push(demoteLine);
                         }

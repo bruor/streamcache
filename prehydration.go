@@ -65,8 +65,9 @@ type PrehydrationManager struct {
 	lastPollTime                      time.Time
 	discoveredDispatcharrURL          string
 	queue                             []*PrehydrationTask
-	activePrehydrations               map[string]bool // Set of canonical cacheFileNames actively running prehydration
-	prehydrationsStartedSinceLastPoll int             // Tracks prehydrations started/resumed since the last capacity poll
+	activePrehydrations               map[string]bool      // Set of canonical cacheFileNames actively running prehydration
+	tierContentionUntil               map[string]time.Time // Backoff cooldown per contended tier ("disk", "s3", or "" for all)
+	prehydrationsStartedSinceLastPoll int                  // Tracks prehydrations started/resumed since the last capacity poll
 	stopCh                            chan struct{}
 	notifyCh                          chan struct{}
 	pollCh                            chan struct{}
@@ -79,6 +80,7 @@ func InitPrehydrationManager() {
 	prehydrationOnce.Do(func() {
 		GlobalPrehydrationManager = &PrehydrationManager{
 			activePrehydrations: make(map[string]bool),
+			tierContentionUntil: make(map[string]time.Time),
 			stopCh:              make(chan struct{}),
 			notifyCh:            make(chan struct{}, 10),
 			pollCh:              make(chan struct{}, 1),
@@ -302,6 +304,114 @@ func (pm *PrehydrationManager) PauseForStorageOutageWith(cfg *Config, storage St
 	}
 }
 
+func normalizeContentionTier(target string) string {
+	switch strings.ToLower(strings.TrimSpace(target)) {
+	case "s3":
+		return "s3"
+	case "nas", "disk":
+		return "disk"
+	default:
+		return ""
+	}
+}
+
+// IsTierUnderContention returns whether prehydrations targeting tier ("disk", "s3", or "")
+// are currently paused due to live playback write/upload contention.
+func (pm *PrehydrationManager) IsTierUnderContention(target string) bool {
+	if pm == nil {
+		return false
+	}
+	now := time.Now()
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if until, ok := pm.tierContentionUntil[""]; ok && now.Before(until) {
+		return true
+	}
+	if norm := normalizeContentionTier(target); norm != "" {
+		if until, ok := pm.tierContentionUntil[norm]; ok && now.Before(until) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClearTierContention removes any active contention backoff for tier (or all tiers if tier == "").
+func (pm *PrehydrationManager) ClearTierContention(tier string) {
+	if pm == nil {
+		return
+	}
+	pm.mu.Lock()
+	if tier == "" {
+		clear(pm.tierContentionUntil)
+	} else if norm := normalizeContentionTier(tier); norm != "" {
+		delete(pm.tierContentionUntil, norm)
+	}
+	delete(pm.tierContentionUntil, "")
+	pm.mu.Unlock()
+}
+
+// YieldForTierContention temporarily yields active background prehydrations targeting the contended
+// storage tier (or all tiers when targetName is "") so live viewers have uncontested I/O headroom.
+func (pm *PrehydrationManager) YieldForTierContention(targetName, reason string) int {
+	if pm == nil {
+		return 0
+	}
+	norm := normalizeContentionTier(targetName)
+	backoff := 30 * time.Second
+	if GlobalConfig != nil {
+		backoff = GlobalConfig.GetPrehydrateYieldBackoff()
+	}
+
+	pm.mu.Lock()
+	if pm.tierContentionUntil == nil {
+		pm.tierContentionUntil = make(map[string]time.Time)
+	}
+	pm.tierContentionUntil[norm] = time.Now().Add(backoff)
+	pm.mu.Unlock()
+
+	reg := GlobalRegistry
+	if reg == nil {
+		return 0
+	}
+	reg.Lock.RLock()
+	files := make([]*FileCacheState, 0, len(reg.Files))
+	for _, fs := range reg.Files {
+		if fs != nil {
+			files = append(files, fs)
+		}
+	}
+	reg.Lock.RUnlock()
+
+	yielded := 0
+	for _, fs := range files {
+		fs.Lock.Lock()
+		isEligible := !fs.IsProbe && fs.IsPrehydrating && !fs.IsYielding && !fs.IsCommitting && fs.WriterActive && len(fs.Clients) == 0
+		tier := fs.targetTierLocked()
+		cmTarget := ""
+		if fs.ChunkManager != nil {
+			cmTarget = fs.ChunkManager.TargetName()
+		}
+		fs.Lock.Unlock()
+		if !isEligible {
+			continue
+		}
+		matches := false
+		switch norm {
+		case "":
+			matches = true
+		case "s3":
+			matches = tier == TierS3 || cmTarget == "s3"
+		case "disk":
+			matches = tier == TierDisk
+		}
+		if matches {
+			pm.YieldState(fs, reason)
+			yielded++
+		}
+	}
+	return yielded
+}
+
 // CanStartPrehydration determines if spare capacity exists to launch a new prehydration worker.
 // Requires effective available streams >= PREHYDRATE_CAPACITY_RESERVATION + 1 so that after claiming 1 slot,
 // at least PREHYDRATE_CAPACITY_RESERVATION slots remain free for live viewers.
@@ -311,6 +421,25 @@ func (pm *PrehydrationManager) CanStartPrehydration(targetURL string) bool {
 	}
 	if !HasHealthyPersistentTier(GlobalConfig, GlobalStorage) {
 		return false
+	}
+	if pm.IsTierUnderContention("") {
+		return false
+	}
+	if GlobalConfig != nil {
+		switch GlobalConfig.EffectiveStorageBackend() {
+		case "s3":
+			if pm.IsTierUnderContention("s3") {
+				return false
+			}
+		case "disk":
+			if pm.IsTierUnderContention("disk") {
+				return false
+			}
+		case "hybrid":
+			if pm.IsTierUnderContention("disk") && pm.IsTierUnderContention("s3") {
+				return false
+			}
+		}
 	}
 
 	reservation := 1
@@ -978,10 +1107,12 @@ func (pm *PrehydrationManager) processNextTask() {
 	var yieldedCandidates []*FileCacheState
 	for _, fs := range files {
 		fs.Lock.Lock()
-		if !fs.IsProbe && fs.IsYielding && len(fs.Clients) == 0 && time.Now().After(fs.YieldCooldownUntil) {
+		eligible := !fs.IsProbe && fs.IsYielding && len(fs.Clients) == 0 && time.Now().After(fs.YieldCooldownUntil)
+		tier := fs.targetTierLocked()
+		fs.Lock.Unlock()
+		if eligible && !pm.IsTierUnderContention(string(tier)) {
 			yieldedCandidates = append(yieldedCandidates, fs)
 		}
-		fs.Lock.Unlock()
 	}
 
 	// Sort yielded candidates by completion percentage descending (highest completion resumes first)

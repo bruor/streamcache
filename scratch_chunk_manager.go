@@ -118,12 +118,16 @@ type ScratchChunkManager struct {
 	activeUploads    int32
 	ringBufferMode   atomic.Bool
 	degradedErr      error
-	ringPunchedCount atomic.Int64
-	ringPunchedBytes atomic.Int64
-	ctx              context.Context
-	cancel           context.CancelFunc
-	wg               sync.WaitGroup // tracks chunk upload workers
-	recomposeWg      sync.WaitGroup // tracks server-side recomposition / commit
+	ringPunchedCount   atomic.Int64
+	ringPunchedBytes   atomic.Int64
+	starveYieldDelay   time.Duration
+	starveDegradeDelay time.Duration
+	ctx                context.Context
+	cancel             context.CancelFunc
+	uploadCtx          context.Context
+	uploadCancel       context.CancelFunc
+	wg                 sync.WaitGroup // tracks chunk upload workers
+	recomposeWg        sync.WaitGroup // tracks server-side recomposition / commit
 }
 
 // CalculateDynamicChunkConfig calculates the optimal chunk size and determines
@@ -224,6 +228,7 @@ func NewScratchChunkManagerWithTarget(state *FileCacheState, target ChunkTarget,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	uploadCtx, uploadCancel := context.WithCancel(ctx)
 
 	return &ScratchChunkManager{
 		key:                     state.Key,
@@ -241,8 +246,12 @@ func NewScratchChunkManagerWithTarget(state *FileCacheState, target ChunkTarget,
 		uploadSem:               make(chan struct{}, uploadConc),
 		uploaded:                make(map[int]bool),
 		uploading:               make(map[int]bool),
+		starveYieldDelay:        2 * time.Second,
+		starveDegradeDelay:      5 * time.Second,
 		ctx:                     ctx,
 		cancel:                  cancel,
+		uploadCtx:               uploadCtx,
+		uploadCancel:            uploadCancel,
 	}
 }
 
@@ -284,6 +293,7 @@ func NewRingBufferScratchChunkManager(state *FileCacheState) *ScratchChunkManage
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	uploadCtx, uploadCancel := context.WithCancel(ctx)
 	m := &ScratchChunkManager{
 		key:                     key,
 		state:                   state,
@@ -298,8 +308,12 @@ func NewRingBufferScratchChunkManager(state *FileCacheState) *ScratchChunkManage
 		uploadSem:               make(chan struct{}, 1),
 		uploaded:                make(map[int]bool),
 		uploading:               make(map[int]bool),
+		starveYieldDelay:        2 * time.Second,
+		starveDegradeDelay:      5 * time.Second,
 		ctx:                     ctx,
 		cancel:                  cancel,
+		uploadCtx:               uploadCtx,
+		uploadCancel:            uploadCancel,
 	}
 	m.ringBufferMode.Store(true)
 	return m
@@ -378,6 +392,9 @@ func (m *ScratchChunkManager) WaitScratchBudget(ctx context.Context) error {
 		return nil
 	}
 
+	var blockedSince time.Time
+	yieldedForContention := false
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -411,6 +428,41 @@ func (m *ScratchChunkManager) WaitScratchBudget(ctx context.Context) error {
 
 		if budgetOK && diskOK {
 			return nil
+		}
+
+		if blockedSince.IsZero() {
+			blockedSince = time.Now()
+		}
+
+		if !m.IsRingBufferMode() && m.target != nil && m.state != nil {
+			starveAge, hasStarving := m.state.OldestStarvationDuration()
+			blockAge := time.Since(blockedSince)
+			yieldDelay := m.starveYieldDelay
+			if yieldDelay <= 0 {
+				yieldDelay = 2 * time.Second
+			}
+			degradeDelay := m.starveDegradeDelay
+			if degradeDelay <= 0 {
+				degradeDelay = 5 * time.Second
+			}
+
+			if hasStarving && !yieldedForContention && blockAge >= yieldDelay && starveAge >= yieldDelay {
+				yieldedForContention = true
+				if GlobalPrehydrationManager != nil {
+					contendedTier := m.target.Name()
+					if !diskOK {
+						contendedTier = ""
+					}
+					GlobalPrehydrationManager.YieldForTierContention(contendedTier, fmt.Sprintf("Live playback %s upload contention", m.target.Name()))
+				}
+			}
+
+			if hasStarving && blockAge >= degradeDelay && starveAge >= degradeDelay {
+				log.Printf("[ScratchChunkManager] %s upload for %s too slow for live playback (blocked=%s, starving=%s); unpairing to TMP_DIR ring buffer",
+					m.target.Name(), m.key, blockAge.Round(time.Millisecond), starveAge.Round(time.Millisecond))
+				m.enterRingBufferMode(fmt.Errorf("%s target upload too slow for live playback", m.target.Name()))
+				continue
+			}
 		}
 
 		allowPunch := m.IsRingBufferMode() || (m.target != nil && m.target.IsSequential() && atomic.LoadInt32(&m.activeUploads) == 0)
@@ -613,17 +665,21 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 
 	// Retry up to 3 times with exponential backoff
 	targetName := m.target.Name()
+	upCtx := m.uploadCtx
+	if upCtx == nil {
+		upCtx = m.ctx
+	}
 	var uploadErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		if m.IsRingBufferMode() || m.ctx.Err() != nil {
+		if m.IsRingBufferMode() || m.ctx.Err() != nil || upCtx.Err() != nil {
 			m.mu.Lock()
 			m.uploading[chunkIndex] = false
 			m.mu.Unlock()
 			return
 		}
 		sectionReader := io.NewSectionReader(f, chunkStart, chunkLen)
-		uploadErr = m.target.PushChunk(m.ctx, m.key, chunkIndex, chunkStart, sectionReader, chunkLen)
-		if uploadErr == nil || m.ctx.Err() != nil || m.IsRingBufferMode() {
+		uploadErr = m.target.PushChunk(upCtx, m.key, chunkIndex, chunkStart, sectionReader, chunkLen)
+		if uploadErr == nil || m.ctx.Err() != nil || upCtx.Err() != nil || m.IsRingBufferMode() {
 			break
 		}
 		backoff := time.Duration(1<<(attempt-1)) * 500 * time.Millisecond
@@ -638,10 +694,16 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 			m.uploading[chunkIndex] = false
 			m.mu.Unlock()
 			return
+		case <-upCtx.Done():
+			timer.Stop()
+			m.mu.Lock()
+			m.uploading[chunkIndex] = false
+			m.mu.Unlock()
+			return
 		}
 	}
 
-	if m.IsRingBufferMode() {
+	if m.IsRingBufferMode() || upCtx.Err() != nil {
 		m.mu.Lock()
 		m.uploading[chunkIndex] = false
 		m.mu.Unlock()
@@ -787,7 +849,12 @@ func (m *ScratchChunkManager) enterRingBufferMode(err error) {
 	m.uploading = make(map[int]bool)
 	target := m.target
 	key := m.key
+	uploadCancel := m.uploadCancel
 	m.mu.Unlock()
+
+	if uploadCancel != nil {
+		uploadCancel()
+	}
 
 	if m.state != nil {
 		minOff, _, _, hasReaders := m.state.GetReaderOffsetBounds()
@@ -1283,6 +1350,9 @@ func (m *ScratchChunkManager) WaitAndRecompose(ctx context.Context) error {
 func (m *ScratchChunkManager) Close() {
 	if m == nil {
 		return
+	}
+	if m.uploadCancel != nil {
+		m.uploadCancel()
 	}
 	m.cancel()
 	select {

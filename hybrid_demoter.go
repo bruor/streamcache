@@ -217,9 +217,9 @@ type demoteCandidate struct {
 	LastAccessed time.Time
 }
 
-// RunDemotionPass checks L1 local cache occupancy against HYBRID_DEMOTE_HIGH_WATERMARK
-// and demotes least-recently-accessed inactive entries to L2 S3 until occupancy reaches
-// or drops below HYBRID_DEMOTE_LOW_WATERMARK. If an S3 upload fails, the local file is
+// RunDemotionPass checks L1 local cache occupancy against HYBRID_DEMOTE_THRESHOLD
+// and demotes least-recently-accessed inactive entries to L2 S3 until occupancy drops
+// to or below HYBRID_DEMOTE_THRESHOLD. If an S3 upload fails, the local file is
 // preserved and the pass aborts so L1 never loses unbacked data.
 func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error) {
 	if d == nil || d.storage == nil || d.storage.Local() == nil || d.storage.S3() == nil || d.cfg == nil {
@@ -236,20 +236,12 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 	defer d.passMu.Unlock()
 
 	maxBytes := d.cfg.GetCacheMaxBytes()
-	highPct := d.cfg.GetHybridDemoteHighWatermark()
-	lowPct := d.cfg.GetHybridDemoteLowWatermark()
-	if maxBytes <= 0 || highPct <= 0 {
+	thresholdPct := d.cfg.GetHybridDemoteThreshold()
+	if maxBytes <= 0 || thresholdPct <= 0 {
 		return 0, 0, nil
 	}
-	if lowPct > highPct {
-		lowPct = highPct
-	}
-	if lowPct < 0 {
-		lowPct = 0
-	}
 
-	highBytes := int64(float64(maxBytes) * float64(highPct) / 100.0)
-	lowBytes := int64(float64(maxBytes) * float64(lowPct) / 100.0)
+	thresholdBytes := int64(float64(maxBytes) * float64(thresholdPct) / 100.0)
 
 	localObjs, err := d.storage.Local().List(ctx)
 	if err != nil {
@@ -260,7 +252,7 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 	for _, obj := range localObjs {
 		localTotalBytes += obj.Size
 	}
-	if localTotalBytes < highBytes {
+	if localTotalBytes <= thresholdBytes {
 		return 0, 0, nil
 	}
 
@@ -312,7 +304,7 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 	demoted := 0
 	var freed int64
 	for _, cand := range candidates {
-		if localTotalBytes <= lowBytes {
+		if localTotalBytes <= thresholdBytes {
 			break
 		}
 		if err := ctx.Err(); err != nil {
@@ -387,7 +379,7 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 		if d.index != nil {
 			_ = d.index.Flush()
 		}
-		log.Printf("[HybridDemoter] Demoted %d asset(s) (%d bytes) from L1 to L2 S3 (remaining L1: %d bytes, target <= %d bytes)", demoted, freed, localTotalBytes, lowBytes)
+		log.Printf("[HybridDemoter] Demoted %d asset(s) (%d bytes) from L1 to L2 S3 (remaining L1: %d bytes, target <= %d bytes)", demoted, freed, localTotalBytes, thresholdBytes)
 	}
 	return demoted, freed, nil
 }

@@ -43,8 +43,7 @@ services:
       - CACHE_REVALIDATE_INTERVAL=1h
 
       # --- Hybrid L1 -> S3 Tiering (`STORAGE_BACKEND=hybrid`) ---
-      # - HYBRID_DEMOTE_HIGH_WATERMARK=80
-      # - HYBRID_DEMOTE_LOW_WATERMARK=70
+      # - HYBRID_DEMOTE_THRESHOLD=80
       # - HYBRID_EAGER_S3_BACKUP=false
 
       # --- S3 Storage Backend (`STORAGE_BACKEND=s3` or `hybrid`) ---

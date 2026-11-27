@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -881,5 +883,159 @@ func TestDashboardSnapshotIncludesStorageTiers(t *testing.T) {
 	}
 	if st.CacheObjects != 1 || st.CacheMaxIdleAgeSec != int64((24*time.Hour).Seconds()) {
 		t.Errorf("Unexpected cache objects/TTL fields: %+v", st)
+	}
+}
+
+type slowMockChunkTarget struct {
+	name      string
+	chunkSize int64
+	started   chan struct{}
+	startOnce sync.Once
+	aborted   atomic.Bool
+	cleanedUp atomic.Bool
+}
+
+func (t *slowMockChunkTarget) Name() string     { return t.name }
+func (t *slowMockChunkTarget) IsSequential() bool { return false }
+func (t *slowMockChunkTarget) Concurrency() int   { return 1 }
+func (t *slowMockChunkTarget) SupportsMultipart(totalSize, configuredChunkSize int64) (int64, bool) {
+	return t.chunkSize, true
+}
+func (t *slowMockChunkTarget) PushChunk(ctx context.Context, key string, chunkIndex int, chunkStart int64, r io.Reader, size int64) error {
+	t.startOnce.Do(func() { close(t.started) })
+	<-ctx.Done()
+	t.aborted.Store(true)
+	return ctx.Err()
+}
+func (t *slowMockChunkTarget) Commit(ctx context.Context, key string, isMultipart bool, totalParts int, localPartPath string, meta FileMeta, onProgress CommitProgressFunc) error {
+	return nil
+}
+func (t *slowMockChunkTarget) ReadCommittedChunk(ctx context.Context, key string, chunkIndex int, chunkStart, offsetInChunk, length int64) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+func (t *slowMockChunkTarget) Cleanup(ctx context.Context, key string) error {
+	t.cleanedUp.Store(true)
+	return nil
+}
+
+func TestSlowTargetUploadYieldsPrehydrationThenUnpairsToRingBuffer(t *testing.T) {
+	saveAndRestoreResilienceGlobals(t)
+	setGlobalStorageHealth(nil)
+
+	tempDir := t.TempDir()
+	GlobalConfig = &Config{
+		StorageBackend:            "s3",
+		TmpDir:                    filepath.Join(tempDir, "tmp"),
+		StateDir:                  filepath.Join(tempDir, "state"),
+		TmpFileMaxBytes:           64 * 1024,
+		PrehydrateYieldBackoff:    5 * time.Second,
+		EnableEpisodePrehydration: true,
+		S3Config: S3Config{
+			Bucket:            "slow-s3-bucket",
+			ChunkSize:         16 * 1024,
+			UploadConcurrency: 1,
+		},
+	}
+	_ = os.MkdirAll(GlobalConfig.TmpDir, 0755)
+	_ = os.MkdirAll(GlobalConfig.StateDir, 0755)
+	GlobalStorage = nil
+	InitRegistry()
+	t.Cleanup(func() {
+		if GlobalRegistry != nil {
+			GlobalRegistry.Stop()
+		}
+	})
+	if curHealth := getGlobalStorageHealth(); curHealth != nil {
+		curHealth.Stop()
+	}
+	setGlobalStorageHealth(nil)
+	GlobalPrehydrationManager = &PrehydrationManager{
+		activePrehydrations: make(map[string]bool),
+		tierContentionUntil: make(map[string]time.Time),
+		stopCh:              make(chan struct{}),
+		notifyCh:            make(chan struct{}, 10),
+		pollCh:              make(chan struct{}, 1),
+	}
+
+	// 1. Register an active competing S3 prehydration that must yield under contention.
+	preCtx, preCancel := context.WithCancel(context.Background())
+	defer preCancel()
+	preKey := "competing_prehydrate.mkv"
+	preState := NewFileCacheState(preKey, "http://origin/pre.mkv", "", filepath.Join(GlobalConfig.TmpDir, preKey+".part"), "", "video/mp4", "", "", 128*1024)
+	preState.Lock.Lock()
+	preState.TargetTier = TierS3
+	preState.IsPrehydrating = true
+	preState.WriterActive = true
+	preState.Cancel = preCancel
+	preState.Lock.Unlock()
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[preKey] = preState
+	GlobalRegistry.Lock.Unlock()
+	GlobalPrehydrationManager.mu.Lock()
+	GlobalPrehydrationManager.activePrehydrations[preKey] = true
+	GlobalPrehydrationManager.mu.Unlock()
+
+	// 2. Set up live stream hitting scratch budget with a starving client and stalled S3 upload.
+	liveKey := "live_slow_s3.mkv"
+	livePart := filepath.Join(GlobalConfig.TmpDir, liveKey+".part")
+	if err := os.WriteFile(livePart, make([]byte, 48*1024), 0644); err != nil {
+		t.Fatalf("WriteFile error: %v", err)
+	}
+	liveState := NewFileCacheState(liveKey, "http://origin/live.mkv", "", livePart, "", "video/mp4", "", "", 128*1024)
+	liveState.Lock.Lock()
+	liveState.TargetTier = TierS3
+	liveState.DiskMaterialized = true
+	liveState.RangeSet.Add(0, 48*1024)
+	liveState.DiskRangeSet.Add(0, 48*1024)
+	liveState.ClientOffsets["viewer-1"] = 32 * 1024
+	liveState.Starving["viewer-1"] = 32 * 1024
+	liveState.StarvingSince["viewer-1"] = time.Now()
+	liveState.Lock.Unlock()
+
+	slowTarget := &slowMockChunkTarget{
+		name:      "s3",
+		chunkSize: 16 * 1024,
+		started:   make(chan struct{}),
+	}
+	cm := NewScratchChunkManagerWithTarget(liveState, slowTarget, 16*1024)
+	defer cm.Close()
+	cm.maxInFlightBytes = 32 * 1024
+	cm.starveYieldDelay = 40 * time.Millisecond
+	cm.starveDegradeDelay = 120 * time.Millisecond
+	liveState.Lock.Lock()
+	liveState.ChunkManager = cm
+	liveState.Lock.Unlock()
+
+	cm.AddInFlightBytes(48 * 1024)
+	cm.CheckAndTriggerUploads()
+	<-slowTarget.started
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer waitCancel()
+	if err := cm.WaitScratchBudget(waitCtx); err != nil {
+		t.Fatalf("Expected WaitScratchBudget to degrade to ring buffer and unblock, got: %v", err)
+	}
+
+	if !cm.IsRingBufferMode() || liveState.GetTargetTier() != TierTmp {
+		t.Fatalf("Expected stream to unpair into TierTmp ring buffer (ring=%v, tier=%s)", cm.IsRingBufferMode(), liveState.GetTargetTier())
+	}
+	preState.Lock.Lock()
+	preYielding := preState.IsYielding
+	preState.Lock.Unlock()
+	if !preYielding || preCtx.Err() == nil {
+		t.Fatalf("Expected competing S3 prehydration to yield (yielding=%v, ctxErr=%v)", preYielding, preCtx.Err())
+	}
+	if !GlobalPrehydrationManager.IsTierUnderContention("s3") || GlobalPrehydrationManager.CanStartPrehydration("http://origin/other.mkv") {
+		t.Fatalf("Expected S3 tier contention to temporarily block new S3 prehydrations")
+	}
+
+	if !waitForPhase1Condition(2*time.Second, func() bool {
+		return slowTarget.aborted.Load() && slowTarget.cleanedUp.Load()
+	}) {
+		t.Fatalf("Expected slow in-flight PushChunk to abort (%v) and trigger Cleanup (%v)",
+			slowTarget.aborted.Load(), slowTarget.cleanedUp.Load())
+	}
+	if !IsS3Healthy() {
+		t.Fatalf("Expected S3 circuit breaker to stay closed during slow-upload unpair")
 	}
 }
