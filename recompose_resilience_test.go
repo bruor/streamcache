@@ -894,6 +894,129 @@ func TestDashboardSnapshotIncludesStorageTiers(t *testing.T) {
 	}
 }
 
+func TestSameFSTierDiskStagesPartInCacheDirAndAccountsUnderDisk(t *testing.T) {
+	saveAndRestoreResilienceGlobals(t)
+
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+	tmpDir := filepath.Join(tempDir, "tmp")
+	stateDir := filepath.Join(tempDir, "state")
+	_ = os.MkdirAll(cacheDir, 0755)
+	_ = os.MkdirAll(tmpDir, 0755)
+	_ = os.MkdirAll(stateDir, 0755)
+
+	mockS3 := NewMockS3Server("disk-part-bucket")
+	defer mockS3.Close()
+
+	GlobalConfig = &Config{
+		StorageBackend:        "hybrid",
+		CacheDir:              cacheDir,
+		TmpDir:                tmpDir,
+		StateDir:              stateDir,
+		CacheMaxBytes:         10 * 1024 * 1024,
+		CacheMaxItemPct:       50,
+		CacheMinDiskFreeBytes: 0,
+		TmpFileMaxBytes:       1024 * 1024,
+		TmpMinDiskFreeBytes:   0,
+		S3Config: S3Config{
+			Endpoint:     mockS3.URL(),
+			Bucket:       "disk-part-bucket",
+			Region:       "us-east-1",
+			AccessKey:    "ak",
+			SecretKey:    "sk",
+			UsePathStyle: true,
+			DisableSSL:   true,
+			ChunkSize:    64 * 1024,
+		},
+	}
+	GlobalStorage = nil
+	if err := InitStorage(); err != nil {
+		t.Fatalf("InitStorage error: %v", err)
+	}
+	InitRegistry()
+	if GlobalRegistry != nil {
+		t.Cleanup(func() { GlobalRegistry.Stop() })
+	}
+
+	// 1. Eligible TierDisk file on same-FS mount stages .part directly in CACHE_DIR and accounts under DISK.
+	diskKey := "samefs_disk_item.mkv"
+	diskState := NewFileCacheState(
+		diskKey,
+		"http://origin/"+diskKey,
+		filepath.Join(cacheDir, diskKey),
+		filepath.Join(tmpDir, diskKey+".part"),
+		filepath.Join(cacheDir, diskKey+".json"),
+		"video/x-matroska",
+		"", "",
+		4096,
+	)
+	if cm := diskState.GetChunkManager(); cm != nil {
+		defer cm.Close()
+	}
+	wantPartPath := filepath.Join(cacheDir, diskKey+".part")
+	if diskState.PartPath != wantPartPath {
+		t.Fatalf("Expected same-FS TierDisk PartPath=%q, got %q", wantPartPath, diskState.PartPath)
+	}
+	if err := diskState.MaterializeDiskFile(); err != nil {
+		t.Fatalf("MaterializeDiskFile error: %v", err)
+	}
+	if !FileExists(wantPartPath) {
+		t.Fatalf("Expected materialized part file at %s", wantPartPath)
+	}
+	if FileExists(filepath.Join(tmpDir, diskKey+".part")) {
+		t.Errorf("Expected same-FS TierDisk NOT to create .part file in TMP_DIR")
+	}
+	diskState.DiskRangeSet.Add(0, 2048)
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[diskKey] = diskState
+	GlobalRegistry.Lock.Unlock()
+
+	snap1 := collectDashboardSnapshot()
+	if snap1.Storage.CacheUsedBytes != 2048 {
+		t.Errorf("Expected TierDisk in-flight bytes accounted under CacheUsedBytes=2048, got %d", snap1.Storage.CacheUsedBytes)
+	}
+	if snap1.Storage.TmpUsedBytes != 0 || snap1.Storage.TmpObjects != 0 {
+		t.Errorf("Expected TmpUsedBytes=0 and TmpObjects=0 for same-FS TierDisk download, got used=%d objs=%d",
+			snap1.Storage.TmpUsedBytes, snap1.Storage.TmpObjects)
+	}
+
+	// 2. Oversized TierS3 file still uses TMP_DIR and accounts in-flight scratch under TMP.
+	s3Key := "s3_scratch_item.mkv"
+	s3TmpPart := filepath.Join(tmpDir, s3Key+".part")
+	s3State := NewFileCacheState(
+		s3Key,
+		"http://origin/"+s3Key,
+		filepath.Join(cacheDir, s3Key),
+		s3TmpPart,
+		"",
+		"video/x-matroska",
+		"", "",
+		8*1024*1024, // > 50% of 10MB -> bypasses L1 to TierS3
+	)
+	cm := s3State.GetChunkManager()
+	if cm == nil {
+		t.Fatalf("Expected TierS3 stream to use ScratchChunkManager")
+	}
+	defer cm.Close()
+	if s3State.PartPath != s3TmpPart {
+		t.Errorf("Expected TierS3 PartPath=%q in TMP_DIR, got %q", s3TmpPart, s3State.PartPath)
+	}
+	cm.AddInFlightBytes(512)
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[s3Key] = s3State
+	GlobalRegistry.Lock.Unlock()
+
+	snap2 := collectDashboardSnapshot()
+	if snap2.Storage.TmpUsedBytes != 512 || snap2.Storage.TmpObjects != 1 {
+		t.Errorf("Expected TierS3 scratch accounted under TmpUsedBytes=512 TmpObjects=1, got used=%d objs=%d",
+			snap2.Storage.TmpUsedBytes, snap2.Storage.TmpObjects)
+	}
+	if snap2.Storage.CacheUsedBytes != 2048 {
+		t.Errorf("Expected CacheUsedBytes to remain 2048, got %d", snap2.Storage.CacheUsedBytes)
+	}
+}
+
 type slowMockChunkTarget struct {
 	name      string
 	chunkSize int64

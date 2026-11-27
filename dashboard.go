@@ -337,6 +337,7 @@ func collectDashboardSnapshot() dashboardSnapshot {
 	activeVODProbes := 0
 	var tmpUsedBytes int64
 	var tmpObjects int
+	var inFlightDiskBytes int64
 	var unsyncedDL, unsyncedSV int64
 	for _, fileState := range files {
 		fileDL, fileSV := fileState.UnsyncedTransferBytes()
@@ -347,11 +348,17 @@ func collectDashboardSnapshot() dashboardSnapshot {
 			tmpUsedBytes += fileState.ChunkManager.GetInFlightBytes()
 			tmpObjects++
 		} else if fileState.DiskMaterialized {
-			tmpObjects++
+			var diskBytes int64
 			if fileState.DiskRangeSet != nil {
-				tmpUsedBytes += fileState.DiskRangeSet.TotalBytes()
+				diskBytes = fileState.DiskRangeSet.TotalBytes()
 			} else if fileState.RangeSet != nil {
-				tmpUsedBytes += fileState.RangeSet.TotalBytes()
+				diskBytes = fileState.RangeSet.TotalBytes()
+			}
+			if fileState.targetTierLocked() == TierDisk && fileState.Path != "" {
+				inFlightDiskBytes += diskBytes
+			} else {
+				tmpUsedBytes += diskBytes
+				tmpObjects++
 			}
 		}
 		if fileState.IsProbe {
@@ -589,6 +596,7 @@ func collectDashboardSnapshot() dashboardSnapshot {
 	if cacheUsedBytes == 0 && diskIdxBytes > 0 {
 		cacheUsedBytes = diskIdxBytes
 	}
+	cacheUsedBytes += inFlightDiskBytes
 	s3Cfg := GlobalConfig.GetS3Config()
 
 	var hybridDemoteThresholdPct int

@@ -275,6 +275,10 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		}
 	}
 
+	if targetTier == TierDisk && !useScratch && cacheFilePath != "" {
+		s.PartPath = cacheFilePath + ".part"
+	}
+
 	s.TargetTier = targetTier
 	s.UseScratchManager = useScratch
 	s.Cond = sync.NewCond(&s.Lock)
@@ -800,6 +804,10 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 	etag := s.ETag
 	lastMod := s.LastModified
 	key := s.Key
+
+	if dir := filepath.Dir(partPath); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0755)
+	}
 
 	var file *os.File
 	var err error
