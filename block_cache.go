@@ -2147,7 +2147,10 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 					uploadMeta = FileMeta{TotalSize: file.Size, Completed: true}
 				}
 
-				if uploadErr := tieredStorage.S3().UploadFromFile(ctx, baseKey, file.Path, uploadMeta); uploadErr != nil {
+				opCtx, opCancel := context.WithTimeout(ctx, 10*time.Minute)
+				uploadErr := tieredStorage.S3().UploadFromFile(opCtx, baseKey, file.Path, uploadMeta)
+				opCancel()
+				if uploadErr != nil {
 					log.Printf("[Evictor] Warning: S3 demotion failed for %s during emergency PreEvict (%v); evicting local copy anyway to reclaim disk space", baseKey, uploadErr)
 				} else if idx != nil {
 					if _, exists := idx.Get(baseKey); !exists {

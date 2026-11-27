@@ -30,6 +30,7 @@ type MockS3Server struct {
 	uploadSeq    uint64
 	FailureCodes map[string]int                    // key/endpoint -> HTTP status code to simulate
 	RequestHook  func(r *http.Request) int         // optional hook run before locking m.mu; return >0 for HTTP status
+	RawHook      func(w http.ResponseWriter, r *http.Request) bool // optional raw hook; return true if response handled
 }
 
 // NewMockS3Server starts a new in-memory S3 test server
@@ -79,7 +80,11 @@ func (m *MockS3Server) ActiveUploads() int {
 func (m *MockS3Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	m.mu.RLock()
 	hook := m.RequestHook
+	rawHook := m.RawHook
 	m.mu.RUnlock()
+	if rawHook != nil && rawHook(w, r) {
+		return
+	}
 	if hook != nil {
 		if status := hook(r); status > 0 {
 			http.Error(w, fmt.Sprintf("Hook Error %d", status), status)
@@ -539,6 +544,12 @@ func (m *MockS3Server) SetRequestHook(hook func(r *http.Request) int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.RequestHook = hook
+}
+
+func (m *MockS3Server) SetRawHook(hook func(w http.ResponseWriter, r *http.Request) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.RawHook = hook
 }
 
 func computeMD5(data []byte) string {

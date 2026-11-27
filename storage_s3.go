@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -19,18 +22,26 @@ import (
 )
 
 const (
-	defaultS3ReadAheadSize = 2 * 1024 * 1024 // 2MB read-ahead buffer
+	defaultS3ReadAheadSize         = 2 * 1024 * 1024 // 2MB read-ahead buffer
+	defaultS3RequestTimeout        = 120 * time.Second
+	defaultS3ResponseHeaderTimeout = 60 * time.Second
+	defaultS3RecomposeTimeout      = 30 * time.Minute
+	defaultS3ControlTimeout        = 30 * time.Second
+	defaultS3DataTimeout           = 5 * time.Minute
 )
 
 // S3StorageBackend implements StorageBackend using any S3-compatible service
 type S3StorageBackend struct {
-	client               *s3.Client
-	bucket               string
-	chunkSize            int64
-	uploadConcurrency    int
-	recomposeConcurrency int
-	mu                   sync.RWMutex
-	metaCache            map[string]FileMeta
+	client                    *s3.Client
+	bucket                    string
+	chunkSize                 int64
+	uploadConcurrency         int
+	recomposeConcurrency      int
+	requestTimeout            time.Duration
+	recomposeTimeout          time.Duration
+	hasExplicitRequestTimeout bool
+	mu                        sync.RWMutex
+	metaCache                 map[string]FileMeta
 }
 
 // NewS3StorageBackend initializes an S3StorageBackend from S3Config
@@ -52,12 +63,47 @@ func NewS3StorageBackend(cfg S3Config) (*S3StorageBackend, error) {
 		baseEndpoint = aws.String(endpoint)
 	}
 
+	hasExplicitReqTimeout := cfg.RequestTimeout > 0
+	reqTimeout := cfg.RequestTimeout
+	if reqTimeout <= 0 {
+		reqTimeout = defaultS3RequestTimeout
+	}
+	recompTimeout := cfg.RecomposeTimeout
+	if recompTimeout <= 0 {
+		recompTimeout = defaultS3RecomposeTimeout
+	}
+	respHdrTimeout := cfg.ResponseHeaderTimeout
+	if respHdrTimeout <= 0 {
+		respHdrTimeout = defaultS3ResponseHeaderTimeout
+	}
+	if reqTimeout < respHdrTimeout {
+		respHdrTimeout = reqTimeout
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: respHdrTimeout,
+			ExpectContinueTimeout: 2 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   100,
+			IdleConnTimeout:       90 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
+	}
+
 	creds := credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, "")
 	client := s3.New(s3.Options{
 		Region:       cfg.Region,
 		BaseEndpoint: baseEndpoint,
 		UsePathStyle: cfg.UsePathStyle,
 		Credentials:  creds,
+		HTTPClient:   httpClient,
 	})
 
 	chunkSize := cfg.ChunkSize
@@ -69,13 +115,60 @@ func NewS3StorageBackend(cfg S3Config) (*S3StorageBackend, error) {
 	recomposeConc := clampConcurrency(cfg.RecomposeConcurrency, 6)
 
 	return &S3StorageBackend{
-		client:               client,
-		bucket:               cfg.Bucket,
-		chunkSize:            chunkSize,
-		uploadConcurrency:    uploadConc,
-		recomposeConcurrency: recomposeConc,
-		metaCache:            make(map[string]FileMeta),
+		client:                    client,
+		bucket:                    cfg.Bucket,
+		chunkSize:                 chunkSize,
+		uploadConcurrency:         uploadConc,
+		recomposeConcurrency:      recomposeConc,
+		requestTimeout:            reqTimeout,
+		recomposeTimeout:          recompTimeout,
+		hasExplicitRequestTimeout: hasExplicitReqTimeout,
+		metaCache:                 make(map[string]FileMeta),
 	}, nil
+}
+
+func withBoundedTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if d <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+func (b *S3StorageBackend) controlTimeout() time.Duration {
+	if b.hasExplicitRequestTimeout && b.requestTimeout > 0 {
+		return b.requestTimeout
+	}
+	if b.requestTimeout > 0 && b.requestTimeout < defaultS3ControlTimeout {
+		return b.requestTimeout
+	}
+	return defaultS3ControlTimeout
+}
+
+func (b *S3StorageBackend) partCopyTimeout() time.Duration {
+	if b.requestTimeout > 0 {
+		return b.requestTimeout
+	}
+	return defaultS3RequestTimeout
+}
+
+func (b *S3StorageBackend) dataTransferTimeout() time.Duration {
+	if b.hasExplicitRequestTimeout && b.requestTimeout > 0 {
+		return b.requestTimeout
+	}
+	if b.requestTimeout > defaultS3DataTimeout {
+		return b.requestTimeout
+	}
+	return defaultS3DataTimeout
+}
+
+func (b *S3StorageBackend) effectiveRecomposeTimeout() time.Duration {
+	if b.recomposeTimeout > 0 {
+		return b.recomposeTimeout
+	}
+	return defaultS3RecomposeTimeout
 }
 
 func (b *S3StorageBackend) ChunkSize() int64 {
@@ -183,10 +276,9 @@ func (b *S3StorageBackend) Ping(ctx context.Context) error {
 	if b == nil || b.client == nil {
 		return nil
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	_, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+	callCtx, cancel := withBoundedTimeout(ctx, b.controlTimeout())
+	defer cancel()
+	_, err := b.client.ListObjectsV2(callCtx, &s3.ListObjectsV2Input{
 		Bucket:  aws.String(b.bucket),
 		Prefix:  aws.String("vod/"),
 		MaxKeys: aws.Int32(1),
@@ -196,7 +288,9 @@ func (b *S3StorageBackend) Ping(ctx context.Context) error {
 
 func (b *S3StorageBackend) StatWithTier(ctx context.Context, key string) (*FileMeta, StorageTier, bool, error) {
 	targetKey := b.monolithicKey(key)
-	resp, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
+	callCtx, cancel := withBoundedTimeout(ctx, b.controlTimeout())
+	defer cancel()
+	resp, err := b.client.HeadObject(callCtx, &s3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(targetKey),
 	})
@@ -492,7 +586,9 @@ func (b *S3StorageBackend) OpenRange(ctx context.Context, key string, offset, le
 
 func (b *S3StorageBackend) HasChunk(ctx context.Context, key string, chunkIndex int) (bool, error) {
 	chunkKey := b.chunkKey(key, chunkIndex)
-	_, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{
+	callCtx, cancel := withBoundedTimeout(ctx, b.controlTimeout())
+	defer cancel()
+	_, err := b.client.HeadObject(callCtx, &s3.HeadObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(chunkKey),
 	})
@@ -572,7 +668,9 @@ func (b *S3StorageBackend) UploadChunk(ctx context.Context, key string, chunkInd
 		}
 	}
 
-	_, err := b.client.PutObject(ctx, &s3.PutObjectInput{
+	putCtx, cancel := withBoundedTimeout(ctx, b.dataTransferTimeout())
+	defer cancel()
+	_, err := b.client.PutObject(putCtx, &s3.PutObjectInput{
 		Bucket:        aws.String(b.bucket),
 		Key:           aws.String(chunkKey),
 		Body:          body,
@@ -593,6 +691,11 @@ func (b *S3StorageBackend) RecomposeWithProgress(ctx context.Context, key string
 }
 
 func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key string, totalParts int, meta FileMeta, onProgress CommitProgressFunc) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	overallCtx, overallCancel := withBoundedTimeout(ctx, b.effectiveRecomposeTimeout())
+	defer overallCancel()
 
 	report := func(stage string, done, total int) {
 		if onProgress != nil {
@@ -604,11 +707,13 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 	metaMap := b.metaToMap(meta)
 
 	// 1. CreateMultipartUpload
-	createResp, err := b.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+	createCtx, createCancel := withBoundedTimeout(overallCtx, b.controlTimeout())
+	createResp, err := b.client.CreateMultipartUpload(createCtx, &s3.CreateMultipartUploadInput{
 		Bucket:   aws.String(b.bucket),
 		Key:      aws.String(targetKey),
 		Metadata: metaMap,
 	})
+	createCancel()
 	if err != nil {
 		return err
 	}
@@ -641,8 +746,9 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 		workers = totalParts
 	}
 
-	recomposeCtx, cancelRecompose := context.WithCancel(ctx)
+	recomposeCtx, cancelRecompose := context.WithCancel(overallCtx)
 	defer cancelRecompose()
+	partTimeout := b.partCopyTimeout()
 
 	jobs := make(chan int, totalParts)
 	for i := 0; i < totalParts; i++ {
@@ -655,8 +761,8 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 	var errOnce sync.Once
 	var firstErr error
 
-	// 2. Parallel UploadPartCopy with jittered retry; each slot writes exclusively to completedParts[i]
-	// so CompleteMultipartUpload always receives parts in strict 1..totalParts order.
+	// 2. Parallel UploadPartCopy with per-attempt timeout & jittered retry; each slot writes exclusively
+	// to completedParts[i] so CompleteMultipartUpload always receives parts in strict 1..totalParts order.
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -678,13 +784,15 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 						break
 					}
 
-					copyResp, partErr = b.client.UploadPartCopy(recomposeCtx, &s3.UploadPartCopyInput{
+					attemptCtx, attemptCancel := withBoundedTimeout(recomposeCtx, partTimeout)
+					copyResp, partErr = b.client.UploadPartCopy(attemptCtx, &s3.UploadPartCopyInput{
 						Bucket:     aws.String(b.bucket),
 						Key:        aws.String(targetKey),
 						UploadId:   uploadID,
 						PartNumber: aws.Int32(partNumber),
 						CopySource: aws.String(copySource),
 					})
+					attemptCancel()
 					if partErr == nil {
 						if copyResp == nil || copyResp.CopyPartResult == nil || copyResp.CopyPartResult.ETag == nil {
 							partErr = fmt.Errorf("UploadPartCopy returned empty ETag for part %d", partNumber)
@@ -693,7 +801,8 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 						}
 					}
 
-					if attempt < 3 {
+					if attempt < 3 && recomposeCtx.Err() == nil {
+						log.Printf("[S3] UploadPartCopy part %d/%d for %s failed (attempt %d/3): %v; retrying...", partNumber, totalParts, key, attempt, partErr)
 						jitter := time.Duration((time.Now().UnixNano()+int64(i*37+workerID*13))%50) * time.Millisecond
 						backoff := time.Duration(75*attempt)*time.Millisecond + jitter
 						timer := time.NewTimer(backoff)
@@ -732,8 +841,8 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 	if firstErr != nil {
 		return firstErr
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if overallCtx.Err() != nil {
+		return overallCtx.Err()
 	}
 
 	const maxDeleteBatch = 1000
@@ -742,7 +851,8 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 	report("finalizing", 0, finalizeTotal)
 
 	// 3. CompleteMultipartUpload
-	_, err = b.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	completeCtx, completeCancel := withBoundedTimeout(overallCtx, b.dataTransferTimeout())
+	_, err = b.client.CompleteMultipartUpload(completeCtx, &s3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(b.bucket),
 		Key:      aws.String(targetKey),
 		UploadId: uploadID,
@@ -750,6 +860,7 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 			Parts: completedParts,
 		},
 	})
+	completeCancel()
 	if err != nil {
 		return fmt.Errorf("CompleteMultipartUpload failed: %w", err)
 	}
@@ -765,13 +876,15 @@ func (b *S3StorageBackend) recomposeWithProgressInner(ctx context.Context, key s
 		if end > len(chunkKeys) {
 			end = len(chunkKeys)
 		}
-		_, _ = b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		delCtx, delCancel := withBoundedTimeout(ctx, b.controlTimeout())
+		_, _ = b.client.DeleteObjects(delCtx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(b.bucket),
 			Delete: &types.Delete{
 				Objects: chunkKeys[start:end],
 				Quiet:   aws.Bool(true),
 			},
 		})
+		delCancel()
 		finalizeStep++
 		report("finalizing", finalizeStep, finalizeTotal)
 	}
@@ -827,13 +940,15 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 	}
 	if !isMultipart || fileSize == 0 || partSize <= 0 || totalParts <= 1 {
 		report("uploading", 0, 1)
-		_, err := b.client.PutObject(ctx, &s3.PutObjectInput{
+		putCtx, putCancel := withBoundedTimeout(ctx, b.dataTransferTimeout())
+		_, err := b.client.PutObject(putCtx, &s3.PutObjectInput{
 			Bucket:        aws.String(b.bucket),
 			Key:           aws.String(targetKey),
 			Body:          f,
 			ContentLength: aws.Int64(fileSize),
 			Metadata:      b.metaToMap(meta),
 		})
+		putCancel()
 		FadviseDontNeed(f.Fd(), 0, 0)
 		if err != nil {
 			return err
@@ -843,11 +958,13 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 		return nil
 	}
 
-	createResp, err := b.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+	createCtx, createCancel := withBoundedTimeout(ctx, b.controlTimeout())
+	createResp, err := b.client.CreateMultipartUpload(createCtx, &s3.CreateMultipartUploadInput{
 		Bucket:   aws.String(b.bucket),
 		Key:      aws.String(targetKey),
 		Metadata: b.metaToMap(meta),
 	})
+	createCancel()
 	if err != nil {
 		return err
 	}
@@ -874,8 +991,12 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 		workers = totalParts
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	uploadCtx, cancelUpload := context.WithCancel(ctx)
 	defer cancelUpload()
+	partUploadTimeout := b.dataTransferTimeout()
 
 	jobs := make(chan int, totalParts)
 	for i := 0; i < totalParts; i++ {
@@ -914,7 +1035,8 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 					}
 
 					sr := io.NewSectionReader(f, partOffset, partLen)
-					upResp, partErr = b.client.UploadPart(uploadCtx, &s3.UploadPartInput{
+					attemptCtx, attemptCancel := withBoundedTimeout(uploadCtx, partUploadTimeout)
+					upResp, partErr = b.client.UploadPart(attemptCtx, &s3.UploadPartInput{
 						Bucket:        aws.String(b.bucket),
 						Key:           aws.String(targetKey),
 						UploadId:      uploadID,
@@ -922,6 +1044,7 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 						Body:          sr,
 						ContentLength: aws.Int64(partLen),
 					})
+					attemptCancel()
 					if partErr == nil {
 						if upResp == nil || upResp.ETag == nil {
 							partErr = fmt.Errorf("UploadPart returned empty ETag for part %d", partNumber)
@@ -930,7 +1053,7 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 						}
 					}
 
-					if attempt < 3 {
+					if attempt < 3 && uploadCtx.Err() == nil {
 						jitter := time.Duration((time.Now().UnixNano()+int64(i*37+workerID*13))%50) * time.Millisecond
 						backoff := time.Duration(75*attempt)*time.Millisecond + jitter
 						timer := time.NewTimer(backoff)
@@ -976,7 +1099,8 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 	}
 
 	report("finalizing", 0, 1)
-	_, err = b.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	completeCtx, completeCancel := withBoundedTimeout(ctx, b.dataTransferTimeout())
+	_, err = b.client.CompleteMultipartUpload(completeCtx, &s3.CompleteMultipartUploadInput{
 		Bucket:   aws.String(b.bucket),
 		Key:      aws.String(targetKey),
 		UploadId: uploadID,
@@ -984,6 +1108,7 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 			Parts: completedParts,
 		},
 	})
+	completeCancel()
 	if err != nil {
 		return fmt.Errorf("CompleteMultipartUpload failed: %w", err)
 	}
@@ -997,10 +1122,12 @@ func (b *S3StorageBackend) uploadFileWithProgressInner(ctx context.Context, key 
 
 func (b *S3StorageBackend) Delete(ctx context.Context, key string) error {
 	targetKey := b.monolithicKey(key)
-	_, err := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+	delCtx, cancel := withBoundedTimeout(ctx, b.controlTimeout())
+	_, err := b.client.DeleteObject(delCtx, &s3.DeleteObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(targetKey),
 	})
+	cancel()
 	_ = b.DeleteChunks(ctx, key)
 	b.clearCachedMeta(key)
 	return err
@@ -1022,13 +1149,16 @@ func (b *S3StorageBackend) deleteKeyBatch(ctx context.Context, keys []types.Obje
 		if end > len(keys) {
 			end = len(keys)
 		}
-		if _, err := b.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		delCtx, cancel := withBoundedTimeout(ctx, b.controlTimeout())
+		_, err := b.client.DeleteObjects(delCtx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(b.bucket),
 			Delete: &types.Delete{
 				Objects: keys[start:end],
 				Quiet:   aws.Bool(true),
 			},
-		}); err != nil && firstErr == nil {
+		})
+		cancel()
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1051,7 +1181,9 @@ func (b *S3StorageBackend) DeleteChunks(ctx context.Context, key string) error {
 
 	var toDelete []types.ObjectIdentifier
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		pageCtx, pageCancel := withBoundedTimeout(ctx, b.controlTimeout())
+		page, err := paginator.NextPage(pageCtx)
+		pageCancel()
 		if err != nil {
 			return err
 		}
@@ -1085,7 +1217,9 @@ func (b *S3StorageBackend) SweepStaleChunks(ctx context.Context, maxAge time.Dur
 	now := time.Now()
 	var toDelete []types.ObjectIdentifier
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		pageCtx, pageCancel := withBoundedTimeout(ctx, b.controlTimeout())
+		page, err := paginator.NextPage(pageCtx)
+		pageCancel()
 		if err != nil {
 			return 0, err
 		}
@@ -1140,7 +1274,9 @@ func (b *S3StorageBackend) List(ctx context.Context) ([]StorageObjectInfo, error
 
 	var result []StorageObjectInfo
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		pageCtx, pageCancel := withBoundedTimeout(ctx, b.controlTimeout())
+		page, err := paginator.NextPage(pageCtx)
+		pageCancel()
 		if err != nil {
 			return nil, err
 		}

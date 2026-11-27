@@ -1161,6 +1161,9 @@ func (m *ScratchChunkManager) WaitAndRecompose(ctx context.Context) error {
 	// Ensure any remaining completed chunks (e.g. final chunk after pipeline flush) are uploaded
 	m.CheckAndTriggerUploads()
 	if err := waitWG(&m.wg); err != nil {
+		if ctx.Err() != nil {
+			m.cancel()
+		}
 		return err
 	}
 
@@ -1179,6 +1182,9 @@ func (m *ScratchChunkManager) WaitAndRecompose(ctx context.Context) error {
 		if uploadedCount < m.totalParts {
 			m.CheckAndTriggerUploads()
 			if err := waitWG(&m.wg); err != nil {
+				if ctx.Err() != nil {
+					m.cancel()
+				}
 				return err
 			}
 			m.mu.RLock()
@@ -1196,6 +1202,10 @@ func (m *ScratchChunkManager) WaitAndRecompose(ctx context.Context) error {
 
 	m.AttemptRecompose()
 	if err := waitWG(&m.recomposeWg); err != nil {
+		if ctx.Err() != nil {
+			// Cancel m.ctx so the background AttemptRecompose/Commit goroutine unwinds instead of leaking.
+			m.cancel()
+		}
 		return err
 	}
 

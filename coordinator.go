@@ -1813,11 +1813,21 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 			GlobalPrehydrationManager.OnHydrationCompleted(state)
 		}
 
+		commitTimeout := 30 * time.Minute
+		if GlobalConfig != nil {
+			if rt := GlobalConfig.GetS3Config().RecomposeTimeout; rt > 0 {
+				commitTimeout = rt
+			}
+		}
+		commitCtx, commitCancel := context.WithTimeout(context.Background(), commitTimeout)
+		defer commitCancel()
+
 		var commitErr error
-		if cm := state.GetChunkManager(); cm != nil {
-			commitErr = cm.WaitAndRecompose(context.Background())
+		cm := state.GetChunkManager()
+		if cm != nil {
+			commitErr = cm.WaitAndRecompose(commitCtx)
 		} else if GlobalStorage != nil {
-			commitErr = GlobalStorage.CommitLocalFile(context.Background(), state.Key, state.PartPath, meta)
+			commitErr = GlobalStorage.CommitLocalFile(commitCtx, state.Key, state.PartPath, meta)
 		}
 
 		_ = os.Remove(state.PartPath)
@@ -1831,6 +1841,14 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 		}
 		if commitErr != nil {
 			log.Printf("%s S3 commit/recomposition FAILED for %s: %v", logPrefix, state.Key, commitErr)
+			if cm != nil {
+				cm.Close()
+				if IsS3Healthy() {
+					cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					_ = cm.Cleanup(cleanCtx)
+					cleanCancel()
+				}
+			}
 			state.SetUpstreamStatus("Error")
 		} else {
 			state.SetUpstreamStatus("Completed")

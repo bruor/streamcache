@@ -324,6 +324,219 @@ func TestS3ParallelRecomposeRetriesAndOrder(t *testing.T) {
 	}
 }
 
+func TestS3RecomposeStalledBodyTimeoutRetriesAndAborts(t *testing.T) {
+	const bucket = "recompose-stall-bucket"
+	mockS3 := NewMockS3Server(bucket)
+	defer mockS3.Close()
+
+	const chunkSize = int64(16 * 1024)
+	const totalParts = 4
+	backend, err := NewS3StorageBackend(S3Config{
+		Endpoint:              mockS3.URL(),
+		Bucket:                bucket,
+		Region:                "us-east-1",
+		AccessKey:             "test-access",
+		SecretKey:             "test-secret",
+		UsePathStyle:          true,
+		DisableSSL:            true,
+		ChunkSize:             chunkSize,
+		RecomposeConcurrency:  4,
+		RequestTimeout:        150 * time.Millisecond,
+		ResponseHeaderTimeout: 150 * time.Millisecond,
+		RecomposeTimeout:      5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewS3StorageBackend error: %v", err)
+	}
+
+	fullData := make([]byte, int(chunkSize)*totalParts)
+	_, _ = rand.Read(fullData)
+	ctx := context.Background()
+
+	// Subtest A: First UploadPartCopy attempt for part 2 sends 200 OK + partial chunked XML body and stalls;
+	// per-attempt timeout must unblock chunkedReader.Read, retry, and complete Recompose.
+	recoverKey := "stall_recover.mkv"
+	for i := 0; i < totalParts; i++ {
+		off := int64(i) * chunkSize
+		if err := backend.UploadChunk(ctx, recoverKey, i, bytes.NewReader(fullData[off:off+chunkSize]), chunkSize); err != nil {
+			t.Fatalf("UploadChunk %d error: %v", i, err)
+		}
+	}
+
+	var part2Attempts atomic.Int32
+	mockS3.SetRawHook(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodPut && r.Header.Get("x-amz-copy-source") != "" && r.URL.Query().Get("partNumber") == "2" {
+			if part2Attempts.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><CopyPartResult>`))
+				if fl, ok := w.(http.Flusher); ok {
+					fl.Flush()
+				}
+				<-r.Context().Done()
+				return true
+			}
+		}
+		return false
+	})
+
+	start := time.Now()
+	if err := backend.Recompose(ctx, recoverKey, totalParts, FileMeta{TotalSize: int64(len(fullData))}); err != nil {
+		t.Fatalf("Expected Recompose to recover after stalled UploadPartCopy attempt, got error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("Expected stalled UploadPartCopy retry recovery in <3s, took %s", elapsed)
+	}
+	if part2Attempts.Load() != 2 {
+		t.Errorf("Expected part 2 to take 2 attempts (1 stalled + 1 retry), got %d", part2Attempts.Load())
+	}
+	got, ok := mockS3.GetObject(bucket + "/vod/" + recoverKey)
+	if !ok || !bytes.Equal(got, fullData) {
+		t.Fatalf("Expected recovered monolithic vod/%s to match payload", recoverKey)
+	}
+	if mockS3.ActiveUploads() != 0 {
+		t.Errorf("Expected 0 active multipart uploads after recovery, got %d", mockS3.ActiveUploads())
+	}
+
+	// Subtest B: Permanently stalled UploadPartCopy body across all 3 attempts must fail quickly and abort upload.
+	failKey := "stall_fail.mkv"
+	for i := 0; i < totalParts; i++ {
+		off := int64(i) * chunkSize
+		if err := backend.UploadChunk(ctx, failKey, i, bytes.NewReader(fullData[off:off+chunkSize]), chunkSize); err != nil {
+			t.Fatalf("UploadChunk %d error: %v", i, err)
+		}
+	}
+
+	part2Attempts.Store(0)
+	mockS3.SetRawHook(func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodPut && r.Header.Get("x-amz-copy-source") != "" && r.URL.Query().Get("partNumber") == "2" {
+			part2Attempts.Add(1)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><CopyPartResult>`))
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			<-r.Context().Done()
+			return true
+		}
+		return false
+	})
+
+	start = time.Now()
+	err = backend.Recompose(ctx, failKey, totalParts, FileMeta{TotalSize: int64(len(fullData))})
+	if err == nil {
+		t.Fatalf("Expected Recompose error when all UploadPartCopy attempts stall")
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Errorf("Expected permanently stalled Recompose to fail within 4s, took %s", elapsed)
+	}
+	if part2Attempts.Load() != 3 {
+		t.Errorf("Expected 3 UploadPartCopy attempts for stalled part 2, got %d", part2Attempts.Load())
+	}
+	if mockS3.ActiveUploads() != 0 {
+		t.Errorf("Expected AbortMultipartUpload to clean up stalled upload, ActiveUploads=%d", mockS3.ActiveUploads())
+	}
+}
+
+type blockingCommitTarget struct {
+	commitStarted  chan struct{}
+	commitCanceled chan struct{}
+	onceStart      sync.Once
+	onceCancel     sync.Once
+}
+
+func (b *blockingCommitTarget) Name() string       { return "s3" }
+func (b *blockingCommitTarget) IsSequential() bool { return false }
+func (b *blockingCommitTarget) Concurrency() int   { return 1 }
+func (b *blockingCommitTarget) SupportsMultipart(totalSize, configuredChunkSize int64) (int64, bool) {
+	return totalSize, false
+}
+func (b *blockingCommitTarget) PushChunk(ctx context.Context, key string, chunkIndex int, chunkStart int64, r io.Reader, size int64) error {
+	return nil
+}
+func (b *blockingCommitTarget) Commit(ctx context.Context, key string, isMultipart bool, totalParts int, localPartPath string, meta FileMeta, onProgress CommitProgressFunc) error {
+	b.onceStart.Do(func() { close(b.commitStarted) })
+	<-ctx.Done()
+	b.onceCancel.Do(func() { close(b.commitCanceled) })
+	return ctx.Err()
+}
+func (b *blockingCommitTarget) ReadCommittedChunk(ctx context.Context, key string, chunkIndex int, chunkStart, offsetInChunk, length int64) (io.ReadCloser, error) {
+	return nil, io.EOF
+}
+func (b *blockingCommitTarget) Cleanup(ctx context.Context, key string) error { return nil }
+
+func TestWaitAndRecomposeContextTimeoutCancelsCommitGoroutine(t *testing.T) {
+	tempDir := t.TempDir()
+	partPath := filepath.Join(tempDir, "timeout_commit.mkv.part")
+	if err := os.WriteFile(partPath, []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &FileCacheState{
+		Key:               "timeout_commit.mkv",
+		URL:               "http://example.com/timeout_commit.mkv",
+		Path:              filepath.Join(tempDir, "timeout_commit.mkv"),
+		PartPath:          partPath,
+		MetaPath:          partPath + ".json",
+		TotalSize:         7,
+		RangeSet:          NewRangeSet(),
+		DiskRangeSet:      NewRangeSet(),
+		Clients:           make(map[string]chan struct{}),
+		TargetTier:        TierS3,
+		UseScratchManager: true,
+	}
+	state.RangeSet.Add(0, 7)
+
+	target := &blockingCommitTarget{
+		commitStarted:  make(chan struct{}),
+		commitCanceled: make(chan struct{}),
+	}
+	cm := NewScratchChunkManagerWithTarget(state, target, 64*1024)
+	defer cm.Close()
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	err := cm.WaitAndRecompose(waitCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Expected context.DeadlineExceeded from WaitAndRecompose, got %v", err)
+	}
+
+	select {
+	case <-target.commitStarted:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("Expected Commit to have started")
+	}
+	select {
+	case <-target.commitCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Expected WaitAndRecompose timeout to cancel AttemptRecompose Commit goroutine")
+	}
+}
+
+func TestPhase0S3TimeoutConfigDefaultsAndOverrides(t *testing.T) {
+	t.Setenv("S3_REQUEST_TIMEOUT", "")
+	t.Setenv("S3_RESPONSE_HEADER_TIMEOUT", "")
+	t.Setenv("S3_RECOMPOSE_TIMEOUT", "")
+
+	cfg := parseConfigFromEnv()
+	s3Cfg := cfg.GetS3Config()
+	if s3Cfg.RequestTimeout != 120*time.Second || s3Cfg.ResponseHeaderTimeout != 60*time.Second || s3Cfg.RecomposeTimeout != 30*time.Minute {
+		t.Errorf("Unexpected default S3 timeouts: req=%s hdr=%s recomp=%s", s3Cfg.RequestTimeout, s3Cfg.ResponseHeaderTimeout, s3Cfg.RecomposeTimeout)
+	}
+
+	t.Setenv("S3_REQUEST_TIMEOUT", "45s")
+	t.Setenv("S3_RESPONSE_HEADER_TIMEOUT", "20s")
+	t.Setenv("S3_RECOMPOSE_TIMEOUT", "10m")
+
+	cfg = parseConfigFromEnv()
+	s3Cfg = cfg.GetS3Config()
+	if s3Cfg.RequestTimeout != 45*time.Second || s3Cfg.ResponseHeaderTimeout != 20*time.Second || s3Cfg.RecomposeTimeout != 10*time.Minute {
+		t.Errorf("Unexpected overridden S3 timeouts: req=%s hdr=%s recomp=%s", s3Cfg.RequestTimeout, s3Cfg.ResponseHeaderTimeout, s3Cfg.RecomposeTimeout)
+	}
+}
+
 func TestS3UploadChunkStreamingAndConcurrencyCap(t *testing.T) {
 	const bucket = "upload-stream-cap-bucket"
 	mockS3 := NewMockS3Server(bucket)

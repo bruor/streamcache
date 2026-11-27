@@ -510,16 +510,19 @@ func (c *Config) SetWritebackBufferSize(val int64) {
 }
 
 type S3Config struct {
-	Endpoint             string
-	Bucket               string
-	Region               string
-	AccessKey            string
-	SecretKey            string
-	UsePathStyle         bool
-	DisableSSL           bool
-	ChunkSize            int64
-	UploadConcurrency    int
-	RecomposeConcurrency int
+	Endpoint              string
+	Bucket                string
+	Region                string
+	AccessKey             string
+	SecretKey             string
+	UsePathStyle          bool
+	DisableSSL            bool
+	ChunkSize             int64
+	UploadConcurrency     int
+	RecomposeConcurrency  int
+	RequestTimeout        time.Duration
+	ResponseHeaderTimeout time.Duration
+	RecomposeTimeout      time.Duration
 }
 
 func (c *Config) GetStorageBackend() string {
@@ -587,9 +590,12 @@ func clampConcurrency(val, fallback int) int {
 func (c *Config) GetS3Config() S3Config {
 	if c == nil {
 		return S3Config{
-			ChunkSize:            64 * 1024 * 1024,
-			UploadConcurrency:    4,
-			RecomposeConcurrency: 6,
+			ChunkSize:             64 * 1024 * 1024,
+			UploadConcurrency:     4,
+			RecomposeConcurrency:  6,
+			RequestTimeout:        120 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+			RecomposeTimeout:      30 * time.Minute,
 		}
 	}
 	c.mu.RLock()
@@ -600,6 +606,15 @@ func (c *Config) GetS3Config() S3Config {
 	}
 	cfg.UploadConcurrency = clampConcurrency(cfg.UploadConcurrency, 4)
 	cfg.RecomposeConcurrency = clampConcurrency(cfg.RecomposeConcurrency, 6)
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = 120 * time.Second
+	}
+	if cfg.ResponseHeaderTimeout <= 0 {
+		cfg.ResponseHeaderTimeout = 60 * time.Second
+	}
+	if cfg.RecomposeTimeout <= 0 {
+		cfg.RecomposeTimeout = 30 * time.Minute
+	}
 	return cfg
 }
 
@@ -823,16 +838,19 @@ func parseConfigFromEnv() *Config {
 		hybridLowWatermarkSet:     true,
 		HybridEagerS3Backup:       getEnvBool("HYBRID_EAGER_S3_BACKUP", false),
 		S3Config: S3Config{
-			Endpoint:             getEnv("S3_ENDPOINT", ""),
-			Bucket:               getEnv("S3_BUCKET", ""),
-			Region:               getEnv("S3_REGION", "us-east-1"),
-			AccessKey:            getEnv("S3_ACCESS_KEY", ""),
-			SecretKey:            getEnv("S3_SECRET_KEY", ""),
-			UsePathStyle:         getEnvBool("S3_USE_PATH_STYLE", true),
-			DisableSSL:           getEnvBool("S3_DISABLE_SSL", false),
-			ChunkSize:            getEnvSize("S3_CHUNK_SIZE", 64*1024*1024),
-			UploadConcurrency:    clampConcurrency(getEnvInt("S3_UPLOAD_CONCURRENCY", 4), 4),
-			RecomposeConcurrency: clampConcurrency(getEnvInt("S3_RECOMPOSE_CONCURRENCY", 6), 6),
+			Endpoint:              getEnv("S3_ENDPOINT", ""),
+			Bucket:                getEnv("S3_BUCKET", ""),
+			Region:                getEnv("S3_REGION", "us-east-1"),
+			AccessKey:             getEnv("S3_ACCESS_KEY", ""),
+			SecretKey:             getEnv("S3_SECRET_KEY", ""),
+			UsePathStyle:          getEnvBool("S3_USE_PATH_STYLE", true),
+			DisableSSL:            getEnvBool("S3_DISABLE_SSL", false),
+			ChunkSize:             getEnvSize("S3_CHUNK_SIZE", 64*1024*1024),
+			UploadConcurrency:     clampConcurrency(getEnvInt("S3_UPLOAD_CONCURRENCY", 4), 4),
+			RecomposeConcurrency:  clampConcurrency(getEnvInt("S3_RECOMPOSE_CONCURRENCY", 6), 6),
+			RequestTimeout:        getEnvDuration("S3_REQUEST_TIMEOUT", 120*time.Second),
+			ResponseHeaderTimeout: getEnvDuration("S3_RESPONSE_HEADER_TIMEOUT", 60*time.Second),
+			RecomposeTimeout:      getEnvDuration("S3_RECOMPOSE_TIMEOUT", 30*time.Minute),
 		},
 		CacheMaxIdleAge:               getEnvDuration("CACHE_MAX_IDLE_AGE", 720*time.Hour),
 		CacheEvictInterval:            getEnvDuration("CACHE_EVICT_INTERVAL", 6*time.Hour),
