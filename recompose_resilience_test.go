@@ -855,10 +855,20 @@ func TestDashboardSnapshotIncludesStorageTiers(t *testing.T) {
 	GlobalCacheIndex = idx
 	GlobalS3Index = idx
 
+	activeTmpState := NewFileCacheState("active_tmp.mkv", "http://origin/active.mkv", "", filepath.Join(tmpDir, "active_tmp.mkv.part"), "", "video/mp4", "", "", 4096)
+	activeTmpState.DiskMaterialized = true
+	activeTmpState.DiskRangeSet.Add(0, 1024)
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[activeTmpState.Key] = activeTmpState
+	GlobalRegistry.Lock.Unlock()
+
 	snap := collectDashboardSnapshot()
 	st := snap.Storage
 	if !st.CacheEnabled || !st.S3Enabled {
 		t.Fatalf("Expected hybrid snapshot to enable both Cache and S3 tiers, got %+v", st)
+	}
+	if st.TmpObjects != 1 || st.TmpUsedBytes != 1024 {
+		t.Errorf("Expected TmpObjects=1 and TmpUsedBytes=1024, got %+v", st)
 	}
 	if st.TmpDir != tmpDir || st.CacheDir != cacheDir {
 		t.Errorf("Unexpected tier dirs: tmp=%q (want %q), cache=%q (want %q)", st.TmpDir, tmpDir, st.CacheDir, cacheDir)

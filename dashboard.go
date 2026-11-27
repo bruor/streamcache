@@ -227,6 +227,7 @@ type dashboardStorageInfo struct {
 	EffectiveBackend   string `json:"effective_backend"`
 	TmpDir             string `json:"tmp_dir"`
 	TmpUsedBytes       int64  `json:"tmp_used_bytes"`
+	TmpObjects         int    `json:"tmp_objects"`
 	TmpFileMaxBytes    int64  `json:"tmp_file_max_bytes"`
 	TmpFreeBytes       uint64 `json:"tmp_free_bytes"`
 	TmpMinFreeBytes    int64  `json:"tmp_min_free_bytes"`
@@ -321,11 +322,14 @@ func collectDashboardSnapshot() dashboardSnapshot {
 	activeVODUpstream := 0
 	activeVODProbes := 0
 	var tmpUsedBytes int64
+	var tmpObjects int
 	for _, fileState := range files {
 		fileState.Lock.Lock()
 		if fileState.ChunkManager != nil {
 			tmpUsedBytes += fileState.ChunkManager.GetInFlightBytes()
+			tmpObjects++
 		} else if fileState.DiskMaterialized {
+			tmpObjects++
 			if fileState.DiskRangeSet != nil {
 				tmpUsedBytes += fileState.DiskRangeSet.TotalBytes()
 			} else if fileState.RangeSet != nil {
@@ -559,6 +563,7 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		EffectiveBackend:   effBackend,
 		TmpDir:             tmpDir,
 		TmpUsedBytes:       tmpUsedBytes,
+		TmpObjects:         tmpObjects,
 		TmpFileMaxBytes:    GlobalConfig.GetTmpFileMaxBytes(),
 		TmpFreeBytes:       atomic.LoadUint64(&GlobalTmpDiskFreeBytes),
 		TmpMinFreeBytes:    EffectiveTmpMinDiskFreeBytes(GlobalConfig, topo),

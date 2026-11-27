@@ -950,8 +950,8 @@
             flex-direction: column;
             justify-content: flex-start;
             gap: 3px;
-            min-width: 138px;
-            max-width: 195px;
+            min-width: 170px;
+            max-width: 250px;
         }
 
         .storage-tier-header {
@@ -1011,7 +1011,7 @@
             font-family: var(--font-mono);
             font-size: 0.66rem;
             font-weight: 700;
-            padding: 0 5px;
+            padding: 0 6px;
             height: 16px;
             line-height: 14px;
             border-radius: 4px;
@@ -1019,6 +1019,18 @@
             color: var(--text-sub);
             border: 1px solid rgba(255, 255, 255, 0.14);
             white-space: nowrap;
+        }
+
+        .storage-tier-pct.warn {
+            background: rgba(255, 159, 28, 0.14);
+            color: var(--accent-orange);
+            border-color: rgba(255, 159, 28, 0.35);
+        }
+
+        .storage-tier-pct.danger {
+            background: rgba(255, 75, 75, 0.15);
+            color: #ff6b6b;
+            border-color: rgba(255, 75, 75, 0.4);
         }
 
         .storage-tier-main {
@@ -1453,11 +1465,11 @@
                             <span class="storage-tier-dot"></span>
                             <span>TMP</span>
                         </span>
-                        <span class="storage-tier-pct" id="storage-tmp-pct">0%</span>
+                        <span class="storage-tier-pct" id="storage-tmp-pct">-- free</span>
                     </div>
-                    <div class="storage-tier-main" id="storage-tmp-main">0 B / --</div>
+                    <div class="storage-tier-main" id="storage-tmp-main">0.0 B / Unlimited</div>
                     <div class="storage-bar-track"><div class="storage-bar-fill tmp" id="storage-tmp-bar"></div></div>
-                    <div class="storage-tier-sub" id="storage-tmp-sub">Free --</div>
+                    <div class="storage-tier-sub" id="storage-tmp-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
                 </div>
                 <div class="storage-divider" id="storage-div-cache" style="display: none;"></div>
@@ -1467,11 +1479,11 @@
                             <span class="storage-tier-dot"></span>
                             <span>CACHE</span>
                         </span>
-                        <span class="storage-tier-pct" id="storage-cache-pct">0%</span>
+                        <span class="storage-tier-pct" id="storage-cache-pct">-- free</span>
                     </div>
-                    <div class="storage-tier-main" id="storage-cache-main">0 B / --</div>
+                    <div class="storage-tier-main" id="storage-cache-main">0.0 B / Unlimited</div>
                     <div class="storage-bar-track"><div class="storage-bar-fill cache" id="storage-cache-bar"></div></div>
-                    <div class="storage-tier-sub" id="storage-cache-sub">Free --</div>
+                    <div class="storage-tier-sub" id="storage-cache-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-cache-loc">--</div>
                 </div>
                 <div class="storage-divider" id="storage-div-s3" style="display: none;"></div>
@@ -1481,9 +1493,9 @@
                             <span class="storage-tier-dot"></span>
                             <span>S3</span>
                         </span>
-                        <span class="storage-tier-pct" id="storage-s3-pct">∞</span>
+                        <span class="storage-tier-pct" id="storage-s3-pct">∞ free</span>
                     </div>
-                    <div class="storage-tier-main" id="storage-s3-main">0 B / Unlimited</div>
+                    <div class="storage-tier-main" id="storage-s3-main">0.0 B / Unlimited</div>
                     <div class="storage-bar-track"><div class="storage-bar-fill s3" id="storage-s3-bar"></div></div>
                     <div class="storage-tier-sub" id="storage-s3-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-s3-loc">--</div>
@@ -2591,22 +2603,62 @@
                     return `${Math.max(1, Math.round(secs / 60))}m TTL`;
                 }
 
-                function updateTierBarAndPct(barEl, pctEl, baseClass, used, limit) {
-                    if (!barEl || !pctEl) return;
+                function pickUnit(bytes) {
+                    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                    if (!bytes || bytes <= 0) return { unit: 'B', div: 1 };
+                    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+                    return { unit: units[i], div: Math.pow(1024, i) };
+                }
+
+                function formatFixed1(bytes, unitOverride) {
+                    const u = unitOverride || pickUnit(bytes);
+                    const val = (bytes || 0) / u.div;
+                    return `${val.toFixed(1)} ${u.unit}`;
+                }
+
+                function formatDenom(bytes, div) {
+                    return String(Number(((bytes || 0) / div).toFixed(1)));
+                }
+
+                function formatFractionSameUnit(used, limit, unitSuffix = '') {
                     if (limit > 0) {
-                        const rawPct = (used / limit) * 100;
+                        const u = pickUnit(limit);
+                        const num = ((used || 0) / u.div).toFixed(1);
+                        const den = formatDenom(limit, u.div);
+                        return { text: `${num} / ${den} ${u.unit}${unitSuffix}`, unit: u.unit, div: u.div };
+                    }
+                    const u = pickUnit(used || 0);
+                    return { text: `${((used || 0) / u.div).toFixed(1)} ${u.unit} / Unlimited`, unit: u.unit, div: u.div };
+                }
+
+                function formatFileCount(n) {
+                    const count = n || 0;
+                    return `${count} ${count === 1 ? 'file' : 'files'}`;
+                }
+
+                function setTierBarOnly(barEl, baseClass, used, limit) {
+                    if (!barEl) return;
+                    if (limit > 0) {
+                        const rawPct = ((used || 0) / limit) * 100;
                         const clampedPct = Math.max(0, Math.min(100, rawPct));
-                        setTextIfChanged(pctEl, `${Math.round(rawPct)}%`);
                         barEl.style.width = `${clampedPct.toFixed(1)}%`;
                         let barCls = `storage-bar-fill ${baseClass}`;
                         if (rawPct >= 95) barCls = 'storage-bar-fill danger';
                         else if (rawPct >= 80) barCls = 'storage-bar-fill warn';
                         setClassIfChanged(barEl, barCls);
                     } else {
-                        setTextIfChanged(pctEl, '∞');
                         barEl.style.width = '0%';
                         setClassIfChanged(barEl, `storage-bar-fill ${baseClass}`);
                     }
+                }
+
+                function setFreeBadge(badgeEl, text, level) {
+                    if (!badgeEl) return;
+                    setTextIfChanged(badgeEl, text);
+                    let cls = 'storage-tier-pct';
+                    if (level === 'danger') cls = 'storage-tier-pct danger';
+                    else if (level === 'warn') cls = 'storage-tier-pct warn';
+                    setClassIfChanged(badgeEl, cls);
                 }
 
                 const backend = (data.storage_backend || 'disk').toLowerCase();
@@ -2614,6 +2666,7 @@
                     effective_backend: backend,
                     tmp_dir: './cache/tmp',
                     tmp_used_bytes: 0,
+                    tmp_objects: 0,
                     tmp_file_max_bytes: 0,
                     tmp_free_bytes: backend === 'tmp' ? (data.disk_free_bytes || 0) : 0,
                     tmp_min_free_bytes: 0,
@@ -2633,6 +2686,7 @@
                     s3_healthy: data.s3_healthy !== false,
                     cache_max_idle_age_seconds: data.cache_max_idle_age_seconds || 0,
                 };
+                const ttlShort = formatTTLShort(st.cache_max_idle_age_seconds);
 
                 // 1. TMP tier (always visible)
                 const tmpLabel = document.getElementById('storage-tmp-label');
@@ -2642,13 +2696,17 @@
                 const tmpSub = document.getElementById('storage-tmp-sub');
                 const tmpLoc = document.getElementById('storage-tmp-loc');
                 if (tmpMain && tmpSub && tmpLoc) {
-                    const tmpLow = st.tmp_min_free_bytes > 0 && st.tmp_free_bytes > 0 && st.tmp_free_bytes < st.tmp_min_free_bytes;
+                    const tmpFree = st.tmp_free_bytes || 0;
+                    const tmpMin = st.tmp_min_free_bytes || 0;
+                    const tmpLow = tmpMin > 0 && tmpFree < tmpMin;
+                    const tmpWarn = !tmpLow && tmpMin > 0 && tmpFree < tmpMin * 2;
                     setClassIfChanged(tmpLabel, tmpLow ? 'storage-tier-label unhealthy' : 'storage-tier-label tmp');
-                    const tmpCapText = st.tmp_file_max_bytes > 0 ? `${formatBytes(st.tmp_file_max_bytes)}/file` : 'Unlimited';
-                    setTextIfChanged(tmpMain, `${formatBytes(st.tmp_used_bytes || 0)} / ${tmpCapText}`);
-                    updateTierBarAndPct(tmpBar, tmpPct, 'tmp', st.tmp_used_bytes || 0, st.tmp_file_max_bytes || 0);
-                    const tmpMinText = st.tmp_min_free_bytes > 0 ? ` • Min ${formatBytes(st.tmp_min_free_bytes)}` : '';
-                    setTextIfChanged(tmpSub, `Free ${formatBytes(st.tmp_free_bytes || 0)}${tmpMinText}`);
+                    const tmpFrac = formatFractionSameUnit(st.tmp_used_bytes || 0, st.tmp_file_max_bytes || 0, '/file');
+                    setTextIfChanged(tmpMain, tmpFrac.text);
+                    setTierBarOnly(tmpBar, 'tmp', st.tmp_used_bytes || 0, st.tmp_file_max_bytes || 0);
+                    setFreeBadge(tmpPct, `${formatFixed1(tmpFree)} free`, tmpLow ? 'danger' : (tmpWarn ? 'warn' : ''));
+                    const tmpConstraints = tmpMin > 0 ? `Min ${formatFixed1(tmpMin)}` : 'No min';
+                    setTextIfChanged(tmpSub, `${formatFileCount(st.tmp_objects)} • ${tmpConstraints}`);
                     const tmpDirStr = st.tmp_dir || '--';
                     setTextIfChanged(tmpLoc, tmpDirStr);
                     if (tmpLoc.title !== tmpDirStr) tmpLoc.title = tmpDirStr;
@@ -2667,18 +2725,22 @@
                         const cacheBar = document.getElementById('storage-cache-bar');
                         const cacheSub = document.getElementById('storage-cache-sub');
                         const cacheLoc = document.getElementById('storage-cache-loc');
+                        const cacheFree = st.cache_free_bytes || 0;
+                        const cacheMin = st.cache_min_free_bytes || 0;
+                        const cacheDanger = st.cache_healthy === false || (cacheMin > 0 && cacheFree < cacheMin);
+                        const cacheWarn = !cacheDanger && cacheMin > 0 && cacheFree < cacheMin * 2;
                         setClassIfChanged(cacheLabel, st.cache_healthy === false ? 'storage-tier-label unhealthy' : 'storage-tier-label cache');
-                        const cacheCapText = st.cache_max_bytes > 0 ? formatBytes(st.cache_max_bytes) : 'Unlimited';
-                        setTextIfChanged(cacheMain, `${formatBytes(st.cache_used_bytes || 0)} / ${cacheCapText}`);
-                        updateTierBarAndPct(cacheBar, cachePct, 'cache', st.cache_used_bytes || 0, st.cache_max_bytes || 0);
-                        const cacheFilesText = st.cache_objects > 0 ? ` • ${st.cache_objects} files` : '';
-                        setTextIfChanged(cacheSub, `Free ${formatBytes(st.cache_free_bytes || 0)}${cacheFilesText}`);
+                        const cacheFrac = formatFractionSameUnit(st.cache_used_bytes || 0, st.cache_max_bytes || 0);
+                        setTextIfChanged(cacheMain, cacheFrac.text);
+                        setTierBarOnly(cacheBar, 'cache', st.cache_used_bytes || 0, st.cache_max_bytes || 0);
+                        setFreeBadge(cachePct, `${formatFixed1(cacheFree)} free`, cacheDanger ? 'danger' : (cacheWarn ? 'warn' : ''));
+                        const cacheParts = [formatFileCount(st.cache_objects)];
+                        if (cacheMin > 0) cacheParts.push(`Min ${formatFixed1(cacheMin)}`);
+                        if (ttlShort) cacheParts.push(ttlShort);
+                        setTextIfChanged(cacheSub, cacheParts.join(' • '));
                         const cacheDirStr = st.cache_dir || '--';
                         setTextIfChanged(cacheLoc, cacheDirStr);
-                        const cacheTitle = st.cache_min_free_bytes > 0
-                            ? `${cacheDirStr} (Min Free: ${formatBytes(st.cache_min_free_bytes)})`
-                            : cacheDirStr;
-                        if (cacheLoc.title !== cacheTitle) cacheLoc.title = cacheTitle;
+                        if (cacheLoc.title !== cacheDirStr) cacheLoc.title = cacheDirStr;
                     } else {
                         cacheDiv.style.display = 'none';
                         cacheTierEl.style.display = 'none';
@@ -2698,13 +2760,21 @@
                         const s3Bar = document.getElementById('storage-s3-bar');
                         const s3Sub = document.getElementById('storage-s3-sub');
                         const s3Loc = document.getElementById('storage-s3-loc');
+                        const s3Used = st.s3_used_bytes || 0;
+                        const s3Max = st.s3_max_bytes || 0;
                         setClassIfChanged(s3Label, st.s3_healthy === false ? 'storage-tier-label unhealthy' : 'storage-tier-label s3');
-                        const s3CapText = st.s3_max_bytes > 0 ? formatBytes(st.s3_max_bytes) : 'Unlimited';
-                        setTextIfChanged(s3Main, `${formatBytes(st.s3_used_bytes || 0)} / ${s3CapText}`);
-                        updateTierBarAndPct(s3Bar, s3Pct, 's3', st.s3_used_bytes || 0, st.s3_max_bytes || 0);
-                        const ttlShort = formatTTLShort(st.cache_max_idle_age_seconds);
-                        const ttlSuffix = ttlShort ? ` • ${ttlShort}` : '';
-                        setTextIfChanged(s3Sub, `${st.s3_objects || 0} files${ttlSuffix}`);
+                        const s3Frac = formatFractionSameUnit(s3Used, s3Max);
+                        setTextIfChanged(s3Main, s3Frac.text);
+                        setTierBarOnly(s3Bar, 's3', s3Used, s3Max);
+                        if (s3Max > 0) {
+                            const s3Remaining = Math.max(0, s3Max - s3Used);
+                            const usedPct = (s3Used / s3Max) * 100;
+                            const s3Level = (st.s3_healthy === false || usedPct >= 95) ? 'danger' : (usedPct >= 80 ? 'warn' : '');
+                            setFreeBadge(s3Pct, `${formatFixed1(s3Remaining, s3Frac)} free`, s3Level);
+                        } else {
+                            setFreeBadge(s3Pct, '∞ free', st.s3_healthy === false ? 'danger' : '');
+                        }
+                        setTextIfChanged(s3Sub, `${formatFileCount(st.s3_objects)} • ${ttlShort || 'No TTL'}`);
                         const bucketLabel = st.s3_bucket ? `bucket: ${st.s3_bucket}` : 'S3 Bucket';
                         setTextIfChanged(s3Loc, bucketLabel);
                         const s3Title = [st.s3_endpoint, st.s3_bucket].filter(Boolean).join(' / ') || bucketLabel;
