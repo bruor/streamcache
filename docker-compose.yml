@@ -56,6 +56,7 @@ services:
       # - S3_USE_PATH_STYLE=true
       # - S3_DISABLE_SSL=false
       # - S3_CHUNK_SIZE=64MB
+      # - S3_MAX_BYTES=0 # Optional S3 cache size cap (e.g. 500GB, 2TB, 3.5TB); 0/none/off disables (idle-age only)
       # - S3_UPLOAD_CONCURRENCY=4
       # - S3_RECOMPOSE_CONCURRENCY=6
 

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -627,5 +628,256 @@ func TestClientSessionCacheSourceS3(t *testing.T) {
 	}
 	if payload["storage_backend"] != "s3" {
 		t.Errorf("Expected storage_backend='s3' in SSE state, got %v", payload["storage_backend"])
+	}
+}
+
+func TestS3MaxBytesConfigParsing(t *testing.T) {
+	t.Setenv("S3_MAX_BYTES", "")
+	_ = os.Unsetenv("S3_MAX_BYTES")
+	cfg := parseConfigFromEnv()
+	if cfg.GetS3MaxBytes() != 0 {
+		t.Fatalf("Expected default S3_MAX_BYTES=0 (disabled), got %d", cfg.GetS3MaxBytes())
+	}
+
+	const gb = int64(1024 * 1024 * 1024)
+	const tb = int64(1024 * 1024 * 1024 * 1024)
+	cases := []struct {
+		raw  string
+		want int64
+	}{
+		{"500GB", 500 * gb},
+		{"2TB", 2 * tb},
+		{"3.5TB", int64(3.5 * float64(tb))},
+		{"1TiB", tb},
+		{"off", 0},
+		{"none", 0},
+		{"0", 0},
+	}
+	for _, tc := range cases {
+		t.Setenv("S3_MAX_BYTES", tc.raw)
+		parsed := parseConfigFromEnv()
+		if parsed.GetS3MaxBytes() != tc.want {
+			t.Errorf("S3_MAX_BYTES=%q: got %d, want %d", tc.raw, parsed.GetS3MaxBytes(), tc.want)
+		}
+	}
+}
+
+func putTestS3Object(t *testing.T, backend StorageBackend, tempDir, key string, data []byte) {
+	t.Helper()
+	partPath := filepath.Join(tempDir, key+".seed.part")
+	if err := os.WriteFile(partPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile %s error: %v", partPath, err)
+	}
+	if err := backend.CommitLocalFile(context.Background(), key, partPath, FileMeta{TotalSize: int64(len(data))}); err != nil {
+		t.Fatalf("CommitLocalFile %s error: %v", key, err)
+	}
+	_ = os.Remove(partPath)
+}
+
+func TestSweepS3OverCapacityLRUAndGuards(t *testing.T) {
+	const bucket = "s3-cap-lru-bucket"
+	mockS3 := NewMockS3Server(bucket)
+	defer mockS3.Close()
+
+	origHealth := getGlobalStorageHealth()
+	defer setGlobalStorageHealth(origHealth)
+	setGlobalStorageHealth(nil)
+	backend := newTestS3Backend(t, mockS3, bucket)
+	reg := &CacheRegistry{
+		Files:       make(map[string]*FileCacheState),
+		Connections: make(map[string]*ClientConnection),
+		Sessions:    make(map[string]*ClientSession),
+	}
+
+	tempDir := t.TempDir()
+	idx := NewCacheIndex(filepath.Join(tempDir, "s3_index.json"))
+	baseTime := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+
+	seed := func(key string, size int, lastAccessOffset time.Duration, pending bool) {
+		if !pending {
+			data := bytes.Repeat([]byte("A"), size)
+			putTestS3Object(t, backend, tempDir, key, data)
+		}
+		idx.mu.Lock()
+		e := &CacheIndexEntry{
+			Key:              key,
+			Size:             int64(size),
+			Tier:             IndexTierS3,
+			CreatedAt:        baseTime.Add(-10 * time.Hour).Unix(),
+			LastAccessed:     baseTime.Add(lastAccessOffset).Unix(),
+			PendingRecompose: pending,
+		}
+		idx.entries[key] = e
+		idx.mu.Unlock()
+	}
+
+	// Oldest (in use -> must be skipped), oldest pending (must be skipped), then oldest evictable a_old & b_mid, newest d_new kept.
+	seed("in_use_oldest.mkv", 1000, -5*time.Hour, false)
+	seed("pending_old.mkv", 1000, -4*time.Hour, true)
+	seed("lru_1.mkv", 1000, -3*time.Hour, false)
+	seed("lru_2.mkv", 1000, -2*time.Hour, false)
+	seed("mru_keep.mkv", 1000, -1*time.Hour, false)
+
+	reg.RegisterConnection("active-reader", &ClientConnection{
+		ID:        "active-reader",
+		Key:       "in_use_oldest.mkv",
+		TotalSize: 1000,
+		StartTime: baseTime.Unix(),
+		InCache:   true,
+	})
+	defer reg.UnregisterConnection("active-reader")
+
+	// Non-pending S3 total = 4000 bytes (in_use_oldest + lru_1 + lru_2 + mru_keep).
+	// Cap at 2000 bytes -> should evict lru_1 and lru_2 (2000 freed), keeping in_use_oldest, pending_old, and mru_keep.
+	evicted, freed := idx.SweepS3OverCapacity(context.Background(), backend, reg, 2000, true)
+	if evicted != 2 || freed != 2000 {
+		t.Fatalf("Expected evicted=2 freed=2000, got evicted=%d freed=%d", evicted, freed)
+	}
+	if mockS3.HasObject(bucket, "vod/lru_1.mkv") || mockS3.HasObject(bucket, "vod/lru_2.mkv") {
+		t.Errorf("Expected lru_1.mkv and lru_2.mkv to be evicted from S3")
+	}
+	if !mockS3.HasObject(bucket, "vod/in_use_oldest.mkv") {
+		t.Errorf("Expected in-use object in_use_oldest.mkv to be preserved in S3")
+	}
+	if !mockS3.HasObject(bucket, "vod/mru_keep.mkv") {
+		t.Errorf("Expected newest object mru_keep.mkv to be preserved in S3")
+	}
+	if _, ok := idx.Get("pending_old.mkv"); !ok {
+		t.Errorf("Expected PendingRecompose entry pending_old.mkv to remain tracked")
+	}
+}
+
+func TestSweepS3OverCapacityHybridPreservesDiskTier(t *testing.T) {
+	const bucket = "s3-cap-hybrid-bucket"
+	mockS3 := NewMockS3Server(bucket)
+	defer mockS3.Close()
+
+	origHealth := getGlobalStorageHealth()
+	defer setGlobalStorageHealth(origHealth)
+	setGlobalStorageHealth(nil)
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+	tmpDir := filepath.Join(tempDir, "tmp")
+	_ = os.MkdirAll(cacheDir, 0755)
+	_ = os.MkdirAll(tmpDir, 0755)
+
+	diskB := NewLocalStorageBackend(cacheDir, tmpDir)
+	s3B := newTestS3Backend(t, mockS3, bucket)
+	hybrid := NewTieredStorageBackend(diskB, s3B)
+
+	idx := NewCacheIndex(filepath.Join(tempDir, "s3_index.json"))
+	key := "hybrid_both.mkv"
+	data := bytes.Repeat([]byte("H"), 1500)
+	localPath := filepath.Join(cacheDir, key)
+	if err := os.WriteFile(localPath, data, 0644); err != nil {
+		t.Fatalf("WriteFile error: %v", err)
+	}
+	putTestS3Object(t, s3B, tempDir, key, data)
+	putTestS3Object(t, s3B, tempDir, "newer_s3.mkv", bytes.Repeat([]byte("N"), 1500))
+
+	now := time.Now().Unix()
+	idx.mu.Lock()
+	idx.entries[key] = &CacheIndexEntry{
+		Key:          key,
+		Size:         1500,
+		Tier:         IndexTierBoth,
+		CreatedAt:    now - 100,
+		LastAccessed: now - 100,
+	}
+	idx.entries["newer_s3.mkv"] = &CacheIndexEntry{
+		Key:          "newer_s3.mkv",
+		Size:         1500,
+		Tier:         IndexTierS3,
+		CreatedAt:    now - 50,
+		LastAccessed: now - 50,
+	}
+	idx.mu.Unlock()
+
+	evicted, freed := idx.SweepS3OverCapacity(context.Background(), hybrid, nil, 1500, true)
+	if evicted != 1 || freed != 1500 {
+		t.Fatalf("Expected evicted=1 freed=1500, got evicted=%d freed=%d", evicted, freed)
+	}
+	if mockS3.HasObject(bucket, "vod/"+key) {
+		t.Errorf("Expected S3 object vod/%s to be deleted", key)
+	}
+	if !FileExists(localPath) {
+		t.Fatalf("Expected warm L1 local disk file %s to remain intact", localPath)
+	}
+	if !mockS3.HasObject(bucket, "vod/newer_s3.mkv") {
+		t.Errorf("Expected newer S3 object newer_s3.mkv to remain in S3")
+	}
+	entry, ok := idx.Get(key)
+	if !ok || entry.Tier != IndexTierDisk {
+		t.Fatalf("Expected index entry for %s to downgrade to tier=%q, got %+v (ok=%v)", key, IndexTierDisk, entry, ok)
+	}
+}
+
+func TestS3MaxBytesPostCommitAutoEviction(t *testing.T) {
+	origCfg := GlobalConfig
+	origHealth := getGlobalStorageHealth()
+	defer func() {
+		GlobalConfig = origCfg
+		setGlobalStorageHealth(origHealth)
+	}()
+
+	const bucket = "s3-cap-autoevict-bucket"
+	mockS3 := NewMockS3Server(bucket)
+	defer mockS3.Close()
+
+	setGlobalStorageHealth(nil)
+	s3B := newTestS3Backend(t, mockS3, bucket)
+
+	tempDir := t.TempDir()
+	GlobalConfig = &Config{
+		StorageBackend:     "s3",
+		CacheMaxIdleAge:    0, // disable idle-age sweep so only S3_MAX_BYTES triggers
+		CacheEvictInterval: 1 * time.Hour,
+		S3Config: S3Config{
+			Bucket:   bucket,
+			MaxBytes: 1500,
+		},
+	}
+
+	idx := NewCacheIndex(filepath.Join(tempDir, "s3_index.json"))
+	baseNow := time.Now()
+	var mockClockUnix atomic.Int64
+	mockClockUnix.Store(baseNow.Unix())
+	idx.nowFn = func() time.Time { return time.Unix(mockClockUnix.Load(), 0) }
+
+	// Seed an initial object in S3 only, then wait for startup Reconcile to discover it
+	// deterministically before triggering post-commit eviction via RecordCommitForTier.
+	putTestS3Object(t, s3B, tempDir, "first.mkv", bytes.Repeat([]byte("1"), 1000))
+
+	idx.StartBackgroundLoops(s3B, nil)
+	defer idx.Stop()
+
+	reconcileDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(reconcileDeadline) {
+		if _, ok := idx.Get("first.mkv"); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := idx.Get("first.mkv"); !ok {
+		t.Fatalf("Timed out waiting for startup Reconcile to track first.mkv")
+	}
+
+	// Advance mock clock and commit a second 1000-byte object -> total 2000 > 1500 cap.
+	mockClockUnix.Store(baseNow.Add(10 * time.Minute).Unix())
+	putTestS3Object(t, s3B, tempDir, "second.mkv", bytes.Repeat([]byte("2"), 1000))
+	idx.RecordCommitForTier("second.mkv", FileMeta{TotalSize: 1000, URL: "http://origin/2.mkv"}, IndexTierS3)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !mockS3.HasObject(bucket, "vod/first.mkv") {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if mockS3.HasObject(bucket, "vod/first.mkv") {
+		t.Fatalf("Expected post-commit S3_MAX_BYTES trigger to evict older first.mkv")
+	}
+	if !mockS3.HasObject(bucket, "vod/second.mkv") {
+		t.Fatalf("Expected newer second.mkv to remain in S3")
 	}
 }

@@ -457,6 +457,17 @@ func (m *ScratchChunkManager) SubInFlightBytes(n int64) {
 	}
 }
 
+// GetInFlightBytes returns the current un-uploaded scratch bytes tracked for this file.
+func (m *ScratchChunkManager) GetInFlightBytes() int64 {
+	if m == nil {
+		return 0
+	}
+	m.budgetMu.Lock()
+	val := m.inFlightBytes
+	m.budgetMu.Unlock()
+	return val
+}
+
 // TotalParts returns the total calculated chunk count.
 func (m *ScratchChunkManager) TotalParts() int {
 	return m.totalParts

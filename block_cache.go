@@ -766,6 +766,7 @@ func (r *CacheRegistry) Stop() {
 
 var GlobalRegistry *CacheRegistry
 var GlobalDiskFreeBytes uint64
+var GlobalTmpDiskFreeBytes uint64
 
 func (r *CacheRegistry) RecordProbeActivity() {
 	if r == nil {
@@ -857,6 +858,9 @@ func InitRegistry() {
 
 	// Initial population of disk free space
 	if cfg != nil {
+		if tmpSpace, err := GetDiskFreeSpace(cfg.GetTmpDir()); err == nil {
+			atomic.StoreUint64(&GlobalTmpDiskFreeBytes, tmpSpace)
+		}
 		diskDir := cfg.GetTmpDir()
 		if cfg.UsesCacheDir() {
 			diskDir = cfg.GetCacheDir()
@@ -1094,6 +1098,9 @@ func (r *CacheRegistry) startDiskFreeMonitor(cfg *Config) {
 				continue
 			}
 			usesCacheDir := cfg.UsesCacheDir()
+			if tmpSpace, terr := GetDiskFreeSpace(cfg.GetTmpDir()); terr == nil {
+				atomic.StoreUint64(&GlobalTmpDiskFreeBytes, tmpSpace)
+			}
 			diskDir := cfg.GetTmpDir()
 			if usesCacheDir {
 				diskDir = cfg.GetCacheDir()

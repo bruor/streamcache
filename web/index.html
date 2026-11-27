@@ -935,40 +935,159 @@
             }
         }
 
-        .cache-status-pill {
+        .storage-widget-pill {
             display: flex;
-            align-items: center;
-            gap: 0.6rem;
+            align-items: stretch;
+            gap: 0.85rem;
             background: rgba(255, 255, 255, 0.05);
-            padding: 6px 14px;
+            padding: 7px 14px;
             border-radius: 12px;
             border: 1px solid rgba(255, 255, 255, 0.12);
         }
 
-        .cache-status-info {
+        .storage-tier {
             display: flex;
             flex-direction: column;
-            gap: 2px;
-            font-size: 0.82rem;
-            line-height: 1.25;
+            justify-content: flex-start;
+            gap: 3px;
+            min-width: 138px;
+            max-width: 195px;
         }
 
-        .cache-status-title {
-            font-size: 0.7rem;
-            font-weight: 700;
+        .storage-tier-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            height: 18px;
+            line-height: 18px;
+        }
+
+        .storage-tier-label {
+            font-family: var(--font-mono);
+            font-size: 0.68rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
-            color: var(--accent-secondary);
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
         }
 
-        #topbar-cache-text {
-            font-weight: 600;
-            color: var(--text-main);
+        .storage-tier-label.tmp { color: var(--accent-secondary); }
+        .storage-tier-label.cache { color: var(--accent-green); }
+        .storage-tier-label.s3 { color: #c084fc; }
+        .storage-tier-label.unhealthy { color: #ff5555; }
+
+        .storage-tier-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            display: inline-block;
+            flex-shrink: 0;
         }
 
-        #topbar-disk-text {
+        .storage-tier-label.tmp .storage-tier-dot {
+            background-color: var(--accent-secondary);
+            box-shadow: 0 0 6px var(--accent-secondary);
+        }
+
+        .storage-tier-label.cache .storage-tier-dot {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 6px var(--accent-green);
+        }
+
+        .storage-tier-label.s3 .storage-tier-dot {
+            background-color: #c084fc;
+            box-shadow: 0 0 6px #c084fc;
+        }
+
+        .storage-tier-label.unhealthy .storage-tier-dot {
+            background-color: #ff5555;
+            box-shadow: 0 0 6px #ff5555;
+        }
+
+        .storage-tier-pct {
+            font-family: var(--font-mono);
+            font-size: 0.66rem;
+            font-weight: 700;
+            padding: 0 5px;
+            height: 16px;
+            line-height: 14px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.08);
             color: var(--text-sub);
-            font-size: 0.78rem;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            white-space: nowrap;
+        }
+
+        .storage-tier-main {
+            font-family: var(--font-mono);
+            font-size: 0.76rem;
+            font-weight: 700;
+            color: var(--text-main);
+            white-space: nowrap;
+        }
+
+        .storage-bar-track {
+            width: 100%;
+            height: 4px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.1);
+            overflow: hidden;
+        }
+
+        .storage-bar-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: 999px;
+            transition: width 0.25s ease, background-color 0.25s ease;
+        }
+
+        .storage-bar-fill.tmp { background: var(--accent-secondary); }
+        .storage-bar-fill.cache { background: var(--accent-green); }
+        .storage-bar-fill.s3 { background: #c084fc; }
+        .storage-bar-fill.warn { background: var(--accent-orange); }
+        .storage-bar-fill.danger { background: #ff5555; }
+
+        .storage-tier-sub {
+            font-size: 0.7rem;
+            color: var(--text-sub);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .storage-tier-loc {
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            color: rgba(176, 179, 184, 0.72);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .storage-divider {
+            width: 1px;
+            background: rgba(255, 255, 255, 0.12);
+            align-self: stretch;
+            margin: 2px 0;
+        }
+
+        @media (max-width: 768px) {
+            .storage-widget-pill {
+                flex-direction: column;
+                gap: 0.55rem;
+            }
+            .storage-tier {
+                max-width: 100%;
+                min-width: 0;
+            }
+            .storage-divider {
+                width: 100%;
+                height: 1px;
+                margin: 0;
+            }
         }
 
         #topbar-provider-text {
@@ -1327,11 +1446,47 @@
                     </div>
                 </div>
             </div>
-            <div class="status-pill cache-status-pill">
-                <span style="font-size: 1.2rem;">💾</span>
-                <div class="cache-status-info">
-                    <div id="topbar-cache-text">Cache: 0.00 GB</div>
-                    <div id="topbar-disk-text">Disk Free: 0.00 GB</div>
+            <div class="status-pill storage-widget-pill" id="storage-widget-pill">
+                <div class="storage-tier" id="storage-tier-tmp">
+                    <div class="storage-tier-header">
+                        <span class="storage-tier-label tmp" id="storage-tmp-label">
+                            <span class="storage-tier-dot"></span>
+                            <span>TMP</span>
+                        </span>
+                        <span class="storage-tier-pct" id="storage-tmp-pct">0%</span>
+                    </div>
+                    <div class="storage-tier-main" id="storage-tmp-main">0 B / --</div>
+                    <div class="storage-bar-track"><div class="storage-bar-fill tmp" id="storage-tmp-bar"></div></div>
+                    <div class="storage-tier-sub" id="storage-tmp-sub">Free --</div>
+                    <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
+                </div>
+                <div class="storage-divider" id="storage-div-cache" style="display: none;"></div>
+                <div class="storage-tier" id="storage-tier-cache" style="display: none;">
+                    <div class="storage-tier-header">
+                        <span class="storage-tier-label cache" id="storage-cache-label">
+                            <span class="storage-tier-dot"></span>
+                            <span>CACHE</span>
+                        </span>
+                        <span class="storage-tier-pct" id="storage-cache-pct">0%</span>
+                    </div>
+                    <div class="storage-tier-main" id="storage-cache-main">0 B / --</div>
+                    <div class="storage-bar-track"><div class="storage-bar-fill cache" id="storage-cache-bar"></div></div>
+                    <div class="storage-tier-sub" id="storage-cache-sub">Free --</div>
+                    <div class="storage-tier-loc" id="storage-cache-loc">--</div>
+                </div>
+                <div class="storage-divider" id="storage-div-s3" style="display: none;"></div>
+                <div class="storage-tier" id="storage-tier-s3" style="display: none;">
+                    <div class="storage-tier-header">
+                        <span class="storage-tier-label s3" id="storage-s3-label">
+                            <span class="storage-tier-dot"></span>
+                            <span>S3</span>
+                        </span>
+                        <span class="storage-tier-pct" id="storage-s3-pct">∞</span>
+                    </div>
+                    <div class="storage-tier-main" id="storage-s3-main">0 B / Unlimited</div>
+                    <div class="storage-bar-track"><div class="storage-bar-fill s3" id="storage-s3-bar"></div></div>
+                    <div class="storage-tier-sub" id="storage-s3-sub">0 files</div>
+                    <div class="storage-tier-loc" id="storage-s3-loc">--</div>
                 </div>
             </div>
             <div class="status-pill" style="padding: 6px 14px; border-radius: 12px;">
@@ -1497,8 +1652,6 @@
 
         const downloadsContainer = document.getElementById('downloads-container');
         const activeCountEl = document.getElementById('active-count');
-        const topbarCacheText = document.getElementById('topbar-cache-text');
-        const topbarDiskText = document.getElementById('topbar-disk-text');
         const connectionDot = document.getElementById('connection-status-dot');
         const connectionText = document.getElementById('connection-status-text');
         const connectionsContainer = document.getElementById('connections-container');
@@ -2431,16 +2584,136 @@
                     }
                 }
 
-                const maxCache = data.max_cache_size_bytes || 0;
-                const totalCache = data.total_cache_size_bytes || 0;
-                const diskFree = data.disk_free_bytes || 0;
-                const minDiskFree = data.min_disk_free_bytes || 0;
-                
-                const maxCacheText = maxCache > 0 ? `${formatBytes(maxCache)} Limit` : 'Unlimited';
-                topbarCacheText.innerText = `Cache: ${formatBytes(totalCache)} / ${maxCacheText}`;
-                
-                const minDiskText = minDiskFree > 0 ? ` (${formatBytes(minDiskFree)} Reserved)` : '';
-                topbarDiskText.innerText = `Disk Free: ${formatBytes(diskFree)}${minDiskText}`;
+                function formatTTLShort(secs) {
+                    if (!secs || secs <= 0) return '';
+                    if (secs >= 86400) return `${Math.round(secs / 86400)}d TTL`;
+                    if (secs >= 3600) return `${Math.round(secs / 3600)}h TTL`;
+                    return `${Math.max(1, Math.round(secs / 60))}m TTL`;
+                }
+
+                function updateTierBarAndPct(barEl, pctEl, baseClass, used, limit) {
+                    if (!barEl || !pctEl) return;
+                    if (limit > 0) {
+                        const rawPct = (used / limit) * 100;
+                        const clampedPct = Math.max(0, Math.min(100, rawPct));
+                        setTextIfChanged(pctEl, `${Math.round(rawPct)}%`);
+                        barEl.style.width = `${clampedPct.toFixed(1)}%`;
+                        let barCls = `storage-bar-fill ${baseClass}`;
+                        if (rawPct >= 95) barCls = 'storage-bar-fill danger';
+                        else if (rawPct >= 80) barCls = 'storage-bar-fill warn';
+                        setClassIfChanged(barEl, barCls);
+                    } else {
+                        setTextIfChanged(pctEl, '∞');
+                        barEl.style.width = '0%';
+                        setClassIfChanged(barEl, `storage-bar-fill ${baseClass}`);
+                    }
+                }
+
+                const backend = (data.storage_backend || 'disk').toLowerCase();
+                const st = data.storage || {
+                    effective_backend: backend,
+                    tmp_dir: './cache/tmp',
+                    tmp_used_bytes: 0,
+                    tmp_file_max_bytes: 0,
+                    tmp_free_bytes: backend === 'tmp' ? (data.disk_free_bytes || 0) : 0,
+                    tmp_min_free_bytes: 0,
+                    cache_enabled: backend === 'disk' || backend === 'hybrid',
+                    cache_dir: './cache/files',
+                    cache_used_bytes: data.total_cache_size_bytes || 0,
+                    cache_objects: 0,
+                    cache_max_bytes: data.max_cache_size_bytes || 0,
+                    cache_free_bytes: data.disk_free_bytes || 0,
+                    cache_min_free_bytes: data.min_disk_free_bytes || 0,
+                    cache_healthy: data.nas_healthy !== false,
+                    s3_enabled: backend === 's3' || backend === 'hybrid',
+                    s3_bucket: '',
+                    s3_used_bytes: data.s3_cached_bytes || 0,
+                    s3_objects: data.s3_cached_objects || 0,
+                    s3_max_bytes: data.s3_max_bytes || 0,
+                    s3_healthy: data.s3_healthy !== false,
+                    cache_max_idle_age_seconds: data.cache_max_idle_age_seconds || 0,
+                };
+
+                // 1. TMP tier (always visible)
+                const tmpLabel = document.getElementById('storage-tmp-label');
+                const tmpPct = document.getElementById('storage-tmp-pct');
+                const tmpMain = document.getElementById('storage-tmp-main');
+                const tmpBar = document.getElementById('storage-tmp-bar');
+                const tmpSub = document.getElementById('storage-tmp-sub');
+                const tmpLoc = document.getElementById('storage-tmp-loc');
+                if (tmpMain && tmpSub && tmpLoc) {
+                    const tmpLow = st.tmp_min_free_bytes > 0 && st.tmp_free_bytes > 0 && st.tmp_free_bytes < st.tmp_min_free_bytes;
+                    setClassIfChanged(tmpLabel, tmpLow ? 'storage-tier-label unhealthy' : 'storage-tier-label tmp');
+                    const tmpCapText = st.tmp_file_max_bytes > 0 ? `${formatBytes(st.tmp_file_max_bytes)}/file` : 'Unlimited';
+                    setTextIfChanged(tmpMain, `${formatBytes(st.tmp_used_bytes || 0)} / ${tmpCapText}`);
+                    updateTierBarAndPct(tmpBar, tmpPct, 'tmp', st.tmp_used_bytes || 0, st.tmp_file_max_bytes || 0);
+                    const tmpMinText = st.tmp_min_free_bytes > 0 ? ` • Min ${formatBytes(st.tmp_min_free_bytes)}` : '';
+                    setTextIfChanged(tmpSub, `Free ${formatBytes(st.tmp_free_bytes || 0)}${tmpMinText}`);
+                    const tmpDirStr = st.tmp_dir || '--';
+                    setTextIfChanged(tmpLoc, tmpDirStr);
+                    if (tmpLoc.title !== tmpDirStr) tmpLoc.title = tmpDirStr;
+                }
+
+                // 2. CACHE tier (disk / hybrid)
+                const cacheDiv = document.getElementById('storage-div-cache');
+                const cacheTierEl = document.getElementById('storage-tier-cache');
+                if (cacheDiv && cacheTierEl) {
+                    if (st.cache_enabled) {
+                        cacheDiv.style.display = '';
+                        cacheTierEl.style.display = '';
+                        const cacheLabel = document.getElementById('storage-cache-label');
+                        const cachePct = document.getElementById('storage-cache-pct');
+                        const cacheMain = document.getElementById('storage-cache-main');
+                        const cacheBar = document.getElementById('storage-cache-bar');
+                        const cacheSub = document.getElementById('storage-cache-sub');
+                        const cacheLoc = document.getElementById('storage-cache-loc');
+                        setClassIfChanged(cacheLabel, st.cache_healthy === false ? 'storage-tier-label unhealthy' : 'storage-tier-label cache');
+                        const cacheCapText = st.cache_max_bytes > 0 ? formatBytes(st.cache_max_bytes) : 'Unlimited';
+                        setTextIfChanged(cacheMain, `${formatBytes(st.cache_used_bytes || 0)} / ${cacheCapText}`);
+                        updateTierBarAndPct(cacheBar, cachePct, 'cache', st.cache_used_bytes || 0, st.cache_max_bytes || 0);
+                        const cacheFilesText = st.cache_objects > 0 ? ` • ${st.cache_objects} files` : '';
+                        setTextIfChanged(cacheSub, `Free ${formatBytes(st.cache_free_bytes || 0)}${cacheFilesText}`);
+                        const cacheDirStr = st.cache_dir || '--';
+                        setTextIfChanged(cacheLoc, cacheDirStr);
+                        const cacheTitle = st.cache_min_free_bytes > 0
+                            ? `${cacheDirStr} (Min Free: ${formatBytes(st.cache_min_free_bytes)})`
+                            : cacheDirStr;
+                        if (cacheLoc.title !== cacheTitle) cacheLoc.title = cacheTitle;
+                    } else {
+                        cacheDiv.style.display = 'none';
+                        cacheTierEl.style.display = 'none';
+                    }
+                }
+
+                // 3. S3 tier (s3 / hybrid)
+                const s3Div = document.getElementById('storage-div-s3');
+                const s3TierEl = document.getElementById('storage-tier-s3');
+                if (s3Div && s3TierEl) {
+                    if (st.s3_enabled) {
+                        s3Div.style.display = '';
+                        s3TierEl.style.display = '';
+                        const s3Label = document.getElementById('storage-s3-label');
+                        const s3Pct = document.getElementById('storage-s3-pct');
+                        const s3Main = document.getElementById('storage-s3-main');
+                        const s3Bar = document.getElementById('storage-s3-bar');
+                        const s3Sub = document.getElementById('storage-s3-sub');
+                        const s3Loc = document.getElementById('storage-s3-loc');
+                        setClassIfChanged(s3Label, st.s3_healthy === false ? 'storage-tier-label unhealthy' : 'storage-tier-label s3');
+                        const s3CapText = st.s3_max_bytes > 0 ? formatBytes(st.s3_max_bytes) : 'Unlimited';
+                        setTextIfChanged(s3Main, `${formatBytes(st.s3_used_bytes || 0)} / ${s3CapText}`);
+                        updateTierBarAndPct(s3Bar, s3Pct, 's3', st.s3_used_bytes || 0, st.s3_max_bytes || 0);
+                        const ttlShort = formatTTLShort(st.cache_max_idle_age_seconds);
+                        const ttlSuffix = ttlShort ? ` • ${ttlShort}` : '';
+                        setTextIfChanged(s3Sub, `${st.s3_objects || 0} files${ttlSuffix}`);
+                        const bucketLabel = st.s3_bucket ? `bucket: ${st.s3_bucket}` : 'S3 Bucket';
+                        setTextIfChanged(s3Loc, bucketLabel);
+                        const s3Title = [st.s3_endpoint, st.s3_bucket].filter(Boolean).join(' / ') || bucketLabel;
+                        if (s3Loc.title !== s3Title) s3Loc.title = s3Title;
+                    } else {
+                        s3Div.style.display = 'none';
+                        s3TierEl.style.display = 'none';
+                    }
+                }
 
                 // Update VOD / LIVE Split View & Provider Capacity Pill
                 const provPill = document.getElementById('provider-capacity-pill');

@@ -223,6 +223,31 @@ type dashboardProbeBuffer struct {
 	NextURLs       []string `json:"next_urls,omitempty"`
 }
 
+type dashboardStorageInfo struct {
+	EffectiveBackend   string `json:"effective_backend"`
+	TmpDir             string `json:"tmp_dir"`
+	TmpUsedBytes       int64  `json:"tmp_used_bytes"`
+	TmpFileMaxBytes    int64  `json:"tmp_file_max_bytes"`
+	TmpFreeBytes       uint64 `json:"tmp_free_bytes"`
+	TmpMinFreeBytes    int64  `json:"tmp_min_free_bytes"`
+	CacheEnabled       bool   `json:"cache_enabled"`
+	CacheDir           string `json:"cache_dir"`
+	CacheUsedBytes     int64  `json:"cache_used_bytes"`
+	CacheObjects       int    `json:"cache_objects"`
+	CacheMaxBytes      int64  `json:"cache_max_bytes"`
+	CacheFreeBytes     uint64 `json:"cache_free_bytes"`
+	CacheMinFreeBytes  int64  `json:"cache_min_free_bytes"`
+	CacheHealthy       bool   `json:"cache_healthy"`
+	S3Enabled          bool   `json:"s3_enabled"`
+	S3Bucket           string `json:"s3_bucket,omitempty"`
+	S3Endpoint         string `json:"s3_endpoint,omitempty"`
+	S3UsedBytes        int64  `json:"s3_used_bytes"`
+	S3Objects          int    `json:"s3_objects"`
+	S3MaxBytes         int64  `json:"s3_max_bytes"`
+	S3Healthy          bool   `json:"s3_healthy"`
+	CacheMaxIdleAgeSec int64  `json:"cache_max_idle_age_seconds"`
+}
+
 type dashboardSnapshot struct {
 	StorageBackend    string                 `json:"storage_backend"`
 	TotalCacheSize    int64                  `json:"total_cache_size_bytes"`
@@ -230,6 +255,7 @@ type dashboardSnapshot struct {
 	MaxObservedSpeed  int64                  `json:"max_observed_speed"`
 	DiskFreeBytes     uint64                 `json:"disk_free_bytes"`
 	MinDiskFreeBytes  int64                  `json:"min_disk_free_bytes"`
+	Storage           dashboardStorageInfo   `json:"storage"`
 	ActiveFiles       []dashboardFile        `json:"active_downloads"`
 	ActiveSessions    []ClientSession        `json:"active_connections"`
 	ActiveVODClients  int                    `json:"active_vod_clients"`
@@ -252,6 +278,7 @@ func (s dashboardSnapshot) toBaseMap() map[string]interface{} {
 		"total_cache_size_bytes": s.TotalCacheSize,
 		"max_cache_size_bytes":   s.MaxCacheSize,
 		"disk_free_bytes":        s.DiskFreeBytes,
+		"storage":                s.Storage,
 		"active_downloads":       s.ActiveFiles,
 		"active_connections":     s.ActiveSessions,
 		"active_vod_clients":     s.ActiveVODClients,
@@ -293,8 +320,18 @@ func collectDashboardSnapshot() dashboardSnapshot {
 	var probeBuffers []dashboardProbeBuffer
 	activeVODUpstream := 0
 	activeVODProbes := 0
+	var tmpUsedBytes int64
 	for _, fileState := range files {
 		fileState.Lock.Lock()
+		if fileState.ChunkManager != nil {
+			tmpUsedBytes += fileState.ChunkManager.GetInFlightBytes()
+		} else if fileState.DiskMaterialized {
+			if fileState.DiskRangeSet != nil {
+				tmpUsedBytes += fileState.DiskRangeSet.TotalBytes()
+			} else if fileState.RangeSet != nil {
+				tmpUsedBytes += fileState.RangeSet.TotalBytes()
+			}
+		}
 		if fileState.IsProbe {
 			ramBytes := int64(0)
 			if fileState.LiveBuffer != nil {
@@ -491,6 +528,58 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		healthSnap = hm.Snapshot()
 	}
 
+	var diskObjects, s3Objects int
+	var diskIdxBytes, s3UsedBytes int64
+	if idx := getGlobalCacheIndex(); idx != nil {
+		diskObjects, diskIdxBytes, s3Objects, s3UsedBytes, _ = idx.StatsByTier()
+	}
+
+	effBackend := GlobalConfig.EffectiveStorageBackend()
+	topo := GetStorageTopology()
+	tmpDir := GlobalConfig.GetTmpDir()
+	cacheDir := GlobalConfig.GetCacheDir()
+	if topo != nil {
+		if topo.TmpDir != "" {
+			tmpDir = topo.TmpDir
+		}
+		if topo.CacheDir != "" {
+			cacheDir = topo.CacheDir
+		}
+	}
+	cacheEnabled := effBackend == "disk" || effBackend == "hybrid"
+	s3Enabled := effBackend == "s3" || effBackend == "hybrid"
+
+	cacheUsedBytes := GlobalRegistry.GetTotalSize()
+	if cacheUsedBytes == 0 && diskIdxBytes > 0 {
+		cacheUsedBytes = diskIdxBytes
+	}
+	s3Cfg := GlobalConfig.GetS3Config()
+
+	storageInfo := dashboardStorageInfo{
+		EffectiveBackend:   effBackend,
+		TmpDir:             tmpDir,
+		TmpUsedBytes:       tmpUsedBytes,
+		TmpFileMaxBytes:    GlobalConfig.GetTmpFileMaxBytes(),
+		TmpFreeBytes:       atomic.LoadUint64(&GlobalTmpDiskFreeBytes),
+		TmpMinFreeBytes:    EffectiveTmpMinDiskFreeBytes(GlobalConfig, topo),
+		CacheEnabled:       cacheEnabled,
+		CacheDir:           cacheDir,
+		CacheUsedBytes:     cacheUsedBytes,
+		CacheObjects:       diskObjects,
+		CacheMaxBytes:      GlobalConfig.GetCacheMaxBytes(),
+		CacheFreeBytes:     atomic.LoadUint64(&GlobalDiskFreeBytes),
+		CacheMinFreeBytes:  EffectiveCacheMinDiskFreeBytes(GlobalConfig, topo),
+		CacheHealthy:       healthSnap.NASHealthy,
+		S3Enabled:          s3Enabled,
+		S3Bucket:           s3Cfg.Bucket,
+		S3Endpoint:         s3Cfg.Endpoint,
+		S3UsedBytes:        s3UsedBytes,
+		S3Objects:          s3Objects,
+		S3MaxBytes:         s3Cfg.MaxBytes,
+		S3Healthy:          healthSnap.S3Healthy,
+		CacheMaxIdleAgeSec: int64(GlobalConfig.GetCacheMaxIdleAge().Seconds()),
+	}
+
 	snap := dashboardSnapshot{
 		StorageBackend:    GlobalConfig.GetStorageBackend(),
 		TotalCacheSize:    GlobalRegistry.GetTotalSize(),
@@ -498,6 +587,7 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		MaxObservedSpeed:  GlobalRegistry.GetMaxObservedSpeed(),
 		DiskFreeBytes:     atomic.LoadUint64(&GlobalDiskFreeBytes),
 		MinDiskFreeBytes:  GlobalConfig.GetCacheMinDiskFreeBytes(),
+		Storage:           storageInfo,
 		ActiveFiles:       activeFiles,
 		ActiveSessions:    activeSessions,
 		ActiveVODClients:  activeVODClients,

@@ -70,6 +70,7 @@ streamcache is configured using environment variables. Default fallback values a
 | `S3_USE_PATH_STYLE` | `true` | Use path-style S3 addressing (`endpoint/bucket/key`). |
 | `S3_DISABLE_SSL` | `false` | Use HTTP instead of HTTPS when `S3_ENDPOINT` omits a scheme. |
 | `S3_CHUNK_SIZE` | `64MB` | Target multipart chunk size for S3 staging uploads (`>= 5MB` in production). |
+| `S3_MAX_BYTES` | `0` (disabled) | Maximum total size of cached objects in the S3 bucket (`STORAGE_BACKEND=s3` or `hybrid`). Set to `0`, `none`, or `off` to disable and rely solely on `CACHE_MAX_IDLE_AGE`. Supports size units including `GB`, `TB`, `GiB`, `TiB`, and decimals (e.g. `500GB`, `2TB`, `3.5TB`). When exceeded, evicts least-recently-used S3 objects on startup, after S3 commits, and every `CACHE_EVICT_INTERVAL` without removing warm L1 disk copies in `hybrid` mode. |
 | `S3_UPLOAD_CONCURRENCY` | `4` | Concurrent chunk `PutObject` uploads per active stream (`1–16`). |
 | `S3_RECOMPOSE_CONCURRENCY` | `6` | Parallel server-side `UploadPartCopy` workers during S3 recomposition (`1–16`). |
 | `MIN_READ_THRESHOLD_BYTES` | `5MB` | Minimum player read threshold before promoting a probe buffer into a full persistent hydration. |

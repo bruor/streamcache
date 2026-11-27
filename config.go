@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -518,6 +519,7 @@ type S3Config struct {
 	UsePathStyle          bool
 	DisableSSL            bool
 	ChunkSize             int64
+	MaxBytes              int64
 	UploadConcurrency     int
 	RecomposeConcurrency  int
 	RequestTimeout        time.Duration
@@ -623,6 +625,29 @@ func (c *Config) SetS3Config(s3Cfg S3Config) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.S3Config = s3Cfg
+	}
+}
+
+func (c *Config) GetS3MaxBytes() int64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.S3Config.MaxBytes <= 0 {
+		return 0
+	}
+	return c.S3Config.MaxBytes
+}
+
+func (c *Config) SetS3MaxBytes(val int64) {
+	if c != nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if val < 0 {
+			val = 0
+		}
+		c.S3Config.MaxBytes = val
 	}
 }
 
@@ -846,6 +871,7 @@ func parseConfigFromEnv() *Config {
 			UsePathStyle:          getEnvBool("S3_USE_PATH_STYLE", true),
 			DisableSSL:            getEnvBool("S3_DISABLE_SSL", false),
 			ChunkSize:             getEnvSize("S3_CHUNK_SIZE", 64*1024*1024),
+			MaxBytes:              getEnvSize("S3_MAX_BYTES", 0),
 			UploadConcurrency:     clampConcurrency(getEnvInt("S3_UPLOAD_CONCURRENCY", 4), 4),
 			RecomposeConcurrency:  clampConcurrency(getEnvInt("S3_RECOMPOSE_CONCURRENCY", 6), 6),
 			RequestTimeout:        getEnvDuration("S3_REQUEST_TIMEOUT", 120*time.Second),
@@ -937,6 +963,18 @@ func detectLegacyConfigWarnings() []string {
 	return warnings
 }
 
+func formatS3MaxBytesLog(maxBytes int64) string {
+	if maxBytes <= 0 {
+		return "disabled"
+	}
+	const tb = float64(1024 * 1024 * 1024 * 1024)
+	const gb = float64(1024 * 1024 * 1024)
+	if float64(maxBytes) >= tb {
+		return fmt.Sprintf("%.2fTB", float64(maxBytes)/tb)
+	}
+	return fmt.Sprintf("%.2fGB", float64(maxBytes)/gb)
+}
+
 func LoadConfig() {
 	for _, w := range detectLegacyConfigWarnings() {
 		log.Printf("[Config] WARNING: %s", w)
@@ -944,7 +982,7 @@ func LoadConfig() {
 	cfg := parseConfigFromEnv()
 	GlobalConfig = cfg
 	s3Cfg := cfg.GetS3Config()
-	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, TmpDir=%s, StateDir=%s, StorageBackend=%s (Effective=%s), NASSequentialStage=%s, HybridDemoteHigh=%d%%, HybridDemoteLow=%d%%, HybridEagerS3Backup=%v, DispatcharrURL=%s, MaxCache=%dGB, CacheMaxItemPct=%d%%, CacheMinDiskFree=%dGB, TmpFileMax=%dMB, TmpMinDiskFree=%dMB, CacheMaxIdleAge=%s, CacheEvictInterval=%s, S3UploadConcurrency=%d, S3RecomposeConcurrency=%d, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
+	log.Printf("[Config] Loaded configuration: Port=%s, CacheDir=%s, TmpDir=%s, StateDir=%s, StorageBackend=%s (Effective=%s), NASSequentialStage=%s, HybridDemoteHigh=%d%%, HybridDemoteLow=%d%%, HybridEagerS3Backup=%v, DispatcharrURL=%s, MaxCache=%dGB, CacheMaxItemPct=%d%%, CacheMinDiskFree=%dGB, TmpFileMax=%dMB, TmpMinDiskFree=%dMB, CacheMaxIdleAge=%s, CacheEvictInterval=%s, S3MaxBytes=%s, S3UploadConcurrency=%d, S3RecomposeConcurrency=%d, UpstreamReadTimeout=%s, MaxUpstreamRetries=%d, MaxUpstreamWorkers=%d, ClientHydrationWait=%s, ProbeFailureCooldown=%s, ProbeTransientCooldown=%s, SchedulerMinTime=%s, UpstreamUserAgent=%q, UpstreamUserAgentMode=%s, MinReadThreshold=%dMB, MaxProbeBuffers=%d",
 		cfg.Port,
 		cfg.CacheDir,
 		cfg.TmpDir,
@@ -963,6 +1001,7 @@ func LoadConfig() {
 		cfg.GetTmpMinDiskFreeBytes()/(1024*1024),
 		cfg.GetCacheMaxIdleAge(),
 		cfg.GetCacheEvictInterval(),
+		formatS3MaxBytesLog(s3Cfg.MaxBytes),
 		s3Cfg.UploadConcurrency,
 		s3Cfg.RecomposeConcurrency,
 		cfg.UpstreamReadTimeout,
@@ -1020,32 +1059,52 @@ func parseSizeString(valStr string) (int64, error) {
 	}
 
 	var multiplier int64 = 1
-	var numStr string
+	numStr := valStr
 
-	if strings.HasSuffix(valStr, "tb") || strings.HasSuffix(valStr, "t") {
-		multiplier = 1024 * 1024 * 1024 * 1024
-		numStr = strings.TrimSuffix(strings.TrimSuffix(valStr, "tb"), "t")
-	} else if strings.HasSuffix(valStr, "gb") || strings.HasSuffix(valStr, "g") {
-		multiplier = 1024 * 1024 * 1024
-		numStr = strings.TrimSuffix(strings.TrimSuffix(valStr, "gb"), "g")
-	} else if strings.HasSuffix(valStr, "mb") || strings.HasSuffix(valStr, "m") {
-		multiplier = 1024 * 1024
-		numStr = strings.TrimSuffix(strings.TrimSuffix(valStr, "mb"), "m")
-	} else if strings.HasSuffix(valStr, "kb") || strings.HasSuffix(valStr, "k") {
-		multiplier = 1024
-		numStr = strings.TrimSuffix(strings.TrimSuffix(valStr, "kb"), "k")
-	} else if strings.HasSuffix(valStr, "b") {
-		multiplier = 1
-		numStr = strings.TrimSuffix(valStr, "b")
-	} else {
-		multiplier = 1
-		numStr = valStr
+	suffixes := []struct {
+		suffix string
+		mult   int64
+	}{
+		{"tib", 1024 * 1024 * 1024 * 1024},
+		{"tb", 1024 * 1024 * 1024 * 1024},
+		{"t", 1024 * 1024 * 1024 * 1024},
+		{"gib", 1024 * 1024 * 1024},
+		{"gb", 1024 * 1024 * 1024},
+		{"g", 1024 * 1024 * 1024},
+		{"mib", 1024 * 1024},
+		{"mb", 1024 * 1024},
+		{"m", 1024 * 1024},
+		{"kib", 1024},
+		{"kb", 1024},
+		{"k", 1024},
+		{"b", 1},
+	}
+	for _, s := range suffixes {
+		if strings.HasSuffix(valStr, s.suffix) {
+			multiplier = s.mult
+			numStr = strings.TrimSuffix(valStr, s.suffix)
+			break
+		}
 	}
 
 	numStr = strings.TrimSpace(numStr)
+	if strings.Contains(numStr, ".") {
+		fval, err := strconv.ParseFloat(numStr, 64)
+		if err != nil {
+			return 0, err
+		}
+		if fval < 0 {
+			return 0, fmt.Errorf("negative size value %q", valStr)
+		}
+		return int64(fval * float64(multiplier)), nil
+	}
+
 	val, err := strconv.ParseInt(numStr, 10, 64)
 	if err != nil {
 		return 0, err
+	}
+	if val < 0 {
+		return 0, fmt.Errorf("negative size value %q", valStr)
 	}
 
 	return val * multiplier, nil

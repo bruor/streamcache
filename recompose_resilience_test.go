@@ -822,3 +822,54 @@ func TestFindLargestGapMidpointAlignsToChunkBoundary(t *testing.T) {
 		t.Fatalf("Expected raw midpoint %d without ChunkManager, got %d (ok=%v)", (20*1024+totalSize)/2, rawMid, rawOK)
 	}
 }
+
+func TestDashboardSnapshotIncludesStorageTiers(t *testing.T) {
+	saveAndRestoreResilienceGlobals(t)
+
+	tempDir := t.TempDir()
+	cacheDir := filepath.Join(tempDir, "cache")
+	tmpDir := filepath.Join(tempDir, "tmp")
+	stateDir := filepath.Join(tempDir, "state")
+	_ = os.MkdirAll(cacheDir, 0755)
+	_ = os.MkdirAll(tmpDir, 0755)
+	_ = os.MkdirAll(stateDir, 0755)
+
+	GlobalConfig = &Config{
+		StorageBackend:   "hybrid",
+		CacheDir:         cacheDir,
+		TmpDir:           tmpDir,
+		StateDir:         stateDir,
+		CacheMaxBytes:    10 * 1024 * 1024,
+		TmpFileMaxBytes:  4 * 1024 * 1024,
+		CacheMaxIdleAge:  24 * time.Hour,
+		S3Config: S3Config{
+			Bucket:   "dash-tier-bucket",
+			Endpoint: "https://s3.example.com",
+			MaxBytes: 50 * 1024 * 1024,
+		},
+	}
+	InitRegistry()
+	idx := NewCacheIndex(filepath.Join(stateDir, "s3_index.json"))
+	idx.RecordCommitForTier("s3_item.mkv", FileMeta{TotalSize: 12345, URL: "http://origin/s3.mkv"}, IndexTierS3)
+	idx.RecordCommitForTier("disk_item.mkv", FileMeta{TotalSize: 6789, URL: "http://origin/disk.mkv"}, IndexTierDisk)
+	GlobalCacheIndex = idx
+	GlobalS3Index = idx
+
+	snap := collectDashboardSnapshot()
+	st := snap.Storage
+	if !st.CacheEnabled || !st.S3Enabled {
+		t.Fatalf("Expected hybrid snapshot to enable both Cache and S3 tiers, got %+v", st)
+	}
+	if st.TmpDir != tmpDir || st.CacheDir != cacheDir {
+		t.Errorf("Unexpected tier dirs: tmp=%q (want %q), cache=%q (want %q)", st.TmpDir, tmpDir, st.CacheDir, cacheDir)
+	}
+	if st.TmpFileMaxBytes != 4*1024*1024 || st.CacheMaxBytes != 10*1024*1024 || st.S3MaxBytes != 50*1024*1024 {
+		t.Errorf("Unexpected tier limits: %+v", st)
+	}
+	if st.S3Bucket != "dash-tier-bucket" || st.S3UsedBytes != 12345 || st.S3Objects != 1 {
+		t.Errorf("Unexpected S3 usage/bucket fields: %+v", st)
+	}
+	if st.CacheObjects != 1 || st.CacheMaxIdleAgeSec != int64((24*time.Hour).Seconds()) {
+		t.Errorf("Unexpected cache objects/TTL fields: %+v", st)
+	}
+}

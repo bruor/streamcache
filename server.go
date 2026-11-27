@@ -482,6 +482,9 @@ func handleDebugState(w http.ResponseWriter, r *http.Request) {
 		diskCount, diskBytes, s3Count, s3Bytes, _ := idx.StatsByTier()
 		data["s3_cached_objects"] = s3Count
 		data["s3_cached_bytes"] = s3Bytes
+		if GlobalConfig != nil {
+			data["s3_max_bytes"] = GlobalConfig.GetS3MaxBytes()
+		}
 		data["disk_cached_objects"] = diskCount
 		data["disk_cached_bytes"] = diskBytes
 		data["cache_max_idle_age_seconds"] = int64(GlobalConfig.GetCacheMaxIdleAge().Seconds())

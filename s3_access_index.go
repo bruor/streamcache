@@ -57,6 +57,7 @@ type CacheIndex struct {
 	stopOnce          sync.Once
 	loopCancel        context.CancelFunc
 	recomposeTrigger  chan struct{}
+	sizeEvictTrigger  chan struct{}
 	recomposeInFlight map[string]bool
 	wg                sync.WaitGroup
 }
@@ -85,6 +86,7 @@ func NewCacheIndex(indexPath string) *CacheIndex {
 		nowFn:             time.Now,
 		stopCh:            make(chan struct{}),
 		recomposeTrigger:  make(chan struct{}, 1),
+		sizeEvictTrigger:  make(chan struct{}, 1),
 		recomposeInFlight: make(map[string]bool),
 	}
 }
@@ -249,6 +251,20 @@ func (idx *CacheIndex) RecordCommitForTier(key string, meta FileMeta, tier strin
 	idx.mu.Unlock()
 
 	_ = idx.Flush()
+	if tier == IndexTierS3 || tier == IndexTierBoth {
+		idx.TriggerS3SizeCheck()
+	}
+}
+
+// TriggerS3SizeCheck signals the background eviction loop to enforce S3_MAX_BYTES without extra S3 List calls.
+func (idx *CacheIndex) TriggerS3SizeCheck() {
+	if idx == nil || idx.sizeEvictTrigger == nil {
+		return
+	}
+	select {
+	case idx.sizeEvictTrigger <- struct{}{}:
+	default:
+	}
 }
 
 // RecordPendingRecompose records an asset whose chunks are 100% uploaded to S3 but not yet
@@ -973,6 +989,120 @@ func (idx *CacheIndex) SweepExpired(ctx context.Context, storage StorageBackend,
 	return evicted, freedBytes
 }
 
+// SweepS3OverCapacity evicts least-recently-used S3 objects whenever total S3 usage exceeds maxBytes,
+// preserving warm L1 disk files in hybrid mode and skipping in-use or pending-recompose keys.
+func (idx *CacheIndex) SweepS3OverCapacity(ctx context.Context, storage StorageBackend, registry *CacheRegistry, maxBytes int64, skipReconcile bool) (int, int64) {
+	if idx == nil || storage == nil || maxBytes <= 0 || !IsS3Healthy() {
+		return 0, 0
+	}
+	s3b := extractS3Backend(storage)
+	if s3b == nil {
+		return 0, 0
+	}
+
+	if !skipReconcile {
+		if err := idx.Reconcile(ctx, storage); err != nil {
+			log.Printf("[S3SizeEvictor] Skipping sweep: reconcile failed: %v", err)
+			return 0, 0
+		}
+	}
+
+	idx.mu.Lock()
+	var totalS3Bytes int64
+	var candidates []CacheIndexEntry
+	storageType := storage.Type()
+	for _, e := range idx.entries {
+		if e == nil || e.PendingRecompose {
+			continue
+		}
+		isS3 := e.Tier == IndexTierS3 || e.Tier == IndexTierBoth || (e.Tier == "" && storageType == "s3")
+		if !isS3 {
+			continue
+		}
+		totalS3Bytes += e.Size
+		candidates = append(candidates, *e)
+	}
+	idx.mu.Unlock()
+
+	if totalS3Bytes <= maxBytes || len(candidates) == 0 {
+		return 0, 0
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].LastAccessed != candidates[j].LastAccessed {
+			return candidates[i].LastAccessed < candidates[j].LastAccessed
+		}
+		if candidates[i].CreatedAt != candidates[j].CreatedAt {
+			return candidates[i].CreatedAt < candidates[j].CreatedAt
+		}
+		return candidates[i].Key < candidates[j].Key
+	})
+
+	evicted := 0
+	var freedBytes int64
+
+	for _, cand := range candidates {
+		if totalS3Bytes <= maxBytes || ctx.Err() != nil || !IsS3Healthy() {
+			break
+		}
+		if registry != nil && registry.IsKeyInUse(cand.Key) {
+			continue
+		}
+
+		idx.mu.Lock()
+		cur, stillTracked := idx.entries[cand.Key]
+		stillEligible := stillTracked && cur != nil && !cur.PendingRecompose &&
+			(cur.Tier == IndexTierS3 || cur.Tier == IndexTierBoth || (cur.Tier == "" && storageType == "s3")) &&
+			cur.LastAccessed == cand.LastAccessed
+		curTier := ""
+		if cur != nil {
+			curTier = cur.Tier
+		}
+		idx.mu.Unlock()
+		if !stillEligible {
+			continue
+		}
+
+		if err := s3b.Delete(ctx, cand.Key); err != nil {
+			RecordS3Failure(err)
+			log.Printf("[S3SizeEvictor] Failed to delete %s (%s) from S3: %v", cand.Key, curTier, err)
+			if !IsS3Healthy() {
+				break
+			}
+			continue
+		}
+		RecordS3Success()
+
+		idx.mu.Lock()
+		if cur, stillExists := idx.entries[cand.Key]; stillExists && cur != nil {
+			if cur.Tier == IndexTierBoth {
+				cur.Tier = IndexTierDisk
+				cur.PendingRecompose = false
+			} else {
+				delete(idx.entries, cand.Key)
+			}
+			idx.dirty = true
+		}
+		idx.mu.Unlock()
+
+		totalS3Bytes -= cand.Size
+		evicted++
+		freedBytes += cand.Size
+		log.Printf("[S3SizeEvictor] Evicted LRU S3 object: %s (TierWas: %s, Size: %.2f MB, RemainingS3: %.2f GB / Limit: %.2f GB)",
+			cand.Key, curTier, float64(cand.Size)/(1024*1024),
+			float64(totalS3Bytes)/(1024*1024*1024), float64(maxBytes)/(1024*1024*1024))
+	}
+
+	if evicted > 0 {
+		_ = idx.Flush()
+		log.Printf("[S3SizeEvictor] Sweep complete. Evicted %d S3 objects, freed %.2f MB (RemainingS3: %.2f GB / Limit: %.2f GB)",
+			evicted, float64(freedBytes)/(1024*1024),
+			float64(totalS3Bytes)/(1024*1024*1024), float64(maxBytes)/(1024*1024*1024))
+	}
+
+	return evicted, freedBytes
+}
+
 // ProcessPendingRecomposes retries sealing any PendingRecompose entries whose chunks remain in S3.
 // If bypassBackoff is true (e.g. on S3 recovery or startup), eligible entries are retried immediately.
 func (idx *CacheIndex) ProcessPendingRecomposes(ctx context.Context, storage StorageBackend, registry *CacheRegistry, bypassBackoff bool) int {
@@ -1149,10 +1279,19 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 		ctx, cancel := context.WithTimeout(loopCtx, 2*time.Minute)
 		defer cancel()
 
+		reconciled := false
 		if maxIdle > 0 {
 			idx.SweepExpired(ctx, storage, registry, maxIdle)
+			reconciled = true
 		} else if err := idx.Reconcile(ctx, storage); err != nil && loopCtx.Err() == nil {
 			log.Printf("[S3Index] Initial reconcile failed: %v", err)
+		} else {
+			reconciled = true
+		}
+		if cfg != nil {
+			if s3MaxBytes := cfg.GetS3MaxBytes(); s3MaxBytes > 0 {
+				idx.SweepS3OverCapacity(ctx, storage, registry, s3MaxBytes, reconciled)
+			}
 		}
 		sweepStale(ctx)
 		idx.TriggerPendingRecompose()
@@ -1207,7 +1346,7 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 		}
 	}()
 
-	// Periodic idle-age sweep
+	// Periodic idle-age sweep + S3_MAX_BYTES LRU capacity enforcement
 	idx.wg.Add(1)
 	go func() {
 		defer idx.wg.Done()
@@ -1217,14 +1356,32 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 			select {
 			case <-idx.stopCh:
 				return
+			case <-idx.sizeEvictTrigger:
+				var curS3MaxBytes int64
+				if cfg != nil {
+					curS3MaxBytes = cfg.GetS3MaxBytes()
+				}
+				if curS3MaxBytes > 0 {
+					_, _, _, s3Bytes, _ := idx.StatsByTier()
+					if s3Bytes > curS3MaxBytes {
+						ctx, cancel := context.WithTimeout(loopCtx, 5*time.Minute)
+						idx.SweepS3OverCapacity(ctx, storage, registry, curS3MaxBytes, true)
+						cancel()
+					}
+				}
 			case <-evictTicker.C:
 				curMaxIdle := 720 * time.Hour
+				var curS3MaxBytes int64
 				if cfg != nil {
 					curMaxIdle = cfg.GetCacheMaxIdleAge()
+					curS3MaxBytes = cfg.GetS3MaxBytes()
 				}
 				ctx, cancel := context.WithTimeout(loopCtx, 5*time.Minute)
 				if curMaxIdle > 0 {
 					idx.SweepExpired(ctx, storage, registry, curMaxIdle)
+				}
+				if curS3MaxBytes > 0 {
+					idx.SweepS3OverCapacity(ctx, storage, registry, curS3MaxBytes, curMaxIdle > 0)
 				}
 				sweepStale(ctx)
 				cancel()
