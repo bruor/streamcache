@@ -376,6 +376,24 @@
             display: none;
         }
 
+        .ui-tooltip {
+            position: fixed;
+            display: none;
+            z-index: 9999;
+            pointer-events: none;
+            max-width: min(440px, calc(100vw - 16px));
+            background: rgba(14, 12, 26, 0.96);
+            border: 1px solid rgba(0, 240, 255, 0.45);
+            border-radius: 8px;
+            padding: 8px 10px;
+            font-family: var(--font-mono);
+            font-size: 0.72rem;
+            line-height: 1.45;
+            color: var(--text-main);
+            white-space: pre-line;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
+        }
+
         .cancel-hydration-btn {
             background-color: rgba(255, 69, 58, 0.15);
             color: #ff453a;
@@ -1547,7 +1565,7 @@
 <body>
 
     <header>
-        <h1><span id="connection-status-dot" class="logo-dot disconnected" title="SSE Connecting..."></span> Streamcache</h1>
+        <h1><span id="connection-status-dot" class="logo-dot disconnected" data-tooltip="SSE Connecting..."></span> Streamcache</h1>
         <div class="system-status">
             <div class="status-pill capacity-widget-pill" id="provider-capacity-pill" style="display: none;">
                 <div class="capacity-split-section">
@@ -1606,7 +1624,7 @@
                         <span class="storage-tier-pct" id="storage-hit-mult">--</span>
                     </div>
                     <div class="storage-tier-main" id="storage-hit-main">0 / 0 B</div>
-                    <div class="storage-bar-track"><div class="storage-bar-seg origin" id="storage-hit-bar-origin"></div><div class="storage-bar-seg disk" id="storage-hit-bar-disk"></div><div class="storage-bar-seg s3" id="storage-hit-bar-s3"></div><div class="storage-bar-breakeven" title="1x Break-Even (50%)"></div></div>
+                    <div class="storage-bar-track"><div class="storage-bar-seg origin" id="storage-hit-bar-origin"></div><div class="storage-bar-seg disk" id="storage-hit-bar-disk"></div><div class="storage-bar-seg s3" id="storage-hit-bar-s3"></div><div class="storage-bar-breakeven"></div></div>
                     <div class="storage-tier-sub" id="storage-hit-sub">Orig 0% • Disk 0% • S3 0%</div>
                     <div class="storage-tier-loc" id="storage-hit-loc">Cap 0 B • TTL 0 B</div>
                 </div>
@@ -1736,10 +1754,85 @@
         </main>
     </div>
 
+    <div id="ui-tooltip" class="ui-tooltip"></div>
+
     <script>
         const escapeHtmlStr = (str) => String(str || '').replace(/[&<>"']/g, ch => ({
             '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
         }[ch]));
+
+        const uiTooltipEl = document.getElementById('ui-tooltip');
+        let activeTooltipEl = null;
+
+        function positionTooltip(targetEl) {
+            if (!uiTooltipEl || !targetEl) return;
+            const rect = targetEl.getBoundingClientRect();
+            const tipRect = uiTooltipEl.getBoundingClientRect();
+            let top = rect.bottom + 8;
+            if (top + tipRect.height > window.innerHeight - 8) {
+                top = Math.max(8, rect.top - tipRect.height - 8);
+            }
+            let left = rect.left + (rect.width - tipRect.width) / 2;
+            left = Math.max(8, Math.min(window.innerWidth - tipRect.width - 8, left));
+            uiTooltipEl.style.top = `${Math.round(top)}px`;
+            uiTooltipEl.style.left = `${Math.round(left)}px`;
+        }
+
+        function showTooltip(targetEl) {
+            if (!uiTooltipEl || !targetEl) return;
+            const text = targetEl.dataset.tooltip;
+            if (!text) return;
+            activeTooltipEl = targetEl;
+            uiTooltipEl.textContent = text;
+            uiTooltipEl.style.display = 'block';
+            positionTooltip(targetEl);
+        }
+
+        function hideTooltip() {
+            activeTooltipEl = null;
+            if (uiTooltipEl) {
+                uiTooltipEl.style.display = 'none';
+            }
+        }
+
+        function setTooltip(el, text) {
+            if (!el) return;
+            if (el.hasAttribute('title')) el.removeAttribute('title');
+            if (!text) {
+                delete el.dataset.tooltip;
+                if (el === activeTooltipEl) hideTooltip();
+                return;
+            }
+            if (el.dataset.tooltip !== text) {
+                el.dataset.tooltip = text;
+                if (el === activeTooltipEl && uiTooltipEl) {
+                    uiTooltipEl.textContent = text;
+                    positionTooltip(el);
+                }
+            }
+        }
+
+        document.addEventListener('mouseover', (e) => {
+            const tipEl = e.target && e.target.closest ? e.target.closest('[data-tooltip]') : null;
+            if (tipEl) {
+                if (tipEl !== activeTooltipEl) showTooltip(tipEl);
+            } else if (activeTooltipEl) {
+                hideTooltip();
+            }
+        });
+
+        document.addEventListener('mouseout', (e) => {
+            if (!activeTooltipEl) return;
+            const nextEl = e.relatedTarget && e.relatedTarget.closest ? e.relatedTarget.closest('[data-tooltip]') : null;
+            if (nextEl !== activeTooltipEl) {
+                if (nextEl) showTooltip(nextEl);
+                else hideTooltip();
+            }
+        });
+
+        window.addEventListener('scroll', hideTooltip, { passive: true });
+        window.addEventListener('blur', hideTooltip);
+        document.addEventListener('pointerdown', hideTooltip);
 
         const consoleEl = document.getElementById('console');
         const scrollBtn = document.getElementById('console-scroll-btn');
@@ -2696,7 +2789,7 @@
             closeSSE();
             if (connectionDot) {
                 connectionDot.className = "logo-dot disconnected";
-                connectionDot.title = "SSE Connecting...";
+                setTooltip(connectionDot, "SSE Connecting...");
             }
             appendLog("\nConnecting to SSE Event Stream...");
             const es = new EventSource('/dashboard/sse');
@@ -2706,7 +2799,7 @@
                 if (es !== activeEventSource) return;
                 if (connectionDot) {
                     connectionDot.className = "logo-dot connected";
-                    connectionDot.title = "SSE Connected";
+                    setTooltip(connectionDot, "SSE Connected");
                 }
                 appendLog("\n[SSE] Connected to event stream.");
                 checkServerVersion();
@@ -2716,7 +2809,7 @@
                 if (es !== activeEventSource) return;
                 if (connectionDot) {
                     connectionDot.className = "logo-dot disconnected";
-                    connectionDot.title = "SSE Reconnecting...";
+                    setTooltip(connectionDot, "SSE Reconnecting...");
                 }
                 es.close();
                 activeEventSource = null;
@@ -2827,8 +2920,8 @@
                     else if (level === 'warn') cls = 'storage-tier-pct warn';
                     else if (level === 'good') cls = 'storage-tier-pct good';
                     setClassIfChanged(badgeEl, cls);
-                    if (titleText !== undefined && badgeEl.title !== titleText) {
-                        badgeEl.title = titleText;
+                    if (titleText !== undefined) {
+                        setTooltip(badgeEl, titleText);
                     }
                 }
 
@@ -2905,8 +2998,14 @@
                     const ratioLevel = dl > 0
                         ? (ratio >= 1 ? 'good' : (sv > 0 ? 'warn' : ''))
                         : (sv > 0 ? 'good' : '');
-                    const summaryTitle = `Served (Out): ${formatCleanBytes(sv)} | Downloaded (In): ${formatCleanBytes(dl)} | Ratio: ${ratioLabel} | Origin: ${formatCleanBytes(servedOrigin)} | Disk: ${formatCleanBytes(servedDisk)} | S3: ${formatCleanBytes(servedS3)} | Disk→S3: ${demoted} (${formatCleanBytes(demotedBytes)}) | Cap: ${evCap} (${formatCleanBytes(evCapBytes)}) | TTL: ${evTTL} (${formatCleanBytes(evTTLBytes)})`;
-                    setFreeBadge(hitMultEl, ratioLabel, ratioLevel, summaryTitle);
+                    const summaryTitle = [
+                        `CACHE RATIO: ${ratioLabel}`,
+                        `Out: ${formatCleanBytes(sv)} • In: ${formatCleanBytes(dl)}`,
+                        `Origin: ${formatCleanBytes(servedOrigin)} • Disk: ${formatCleanBytes(servedDisk)} • S3: ${formatCleanBytes(servedS3)}`,
+                        `Disk→S3: ${demoted} (${formatCleanBytes(demotedBytes)}) • Cap: ${evCap} (${formatCleanBytes(evCapBytes)}) • TTL: ${evTTL} (${formatCleanBytes(evTTLBytes)})`,
+                    ].join('\n');
+                    setFreeBadge(hitMultEl, ratioLabel, ratioLevel);
+                    setTooltip(document.getElementById('storage-tier-hit'), summaryTitle);
 
                     const totalFillPct = dl > 0 ? Math.max(0, Math.min(100, ratio * 50)) : (sv > 0 ? 100 : 0);
                     let originW = 0;
@@ -2954,7 +3053,6 @@
                         setTextIfChanged(hitSubEl, `Orig ${sv > 0 ? 100 : 0}%`);
                         setTextIfChanged(hitLocEl, `Cap ${formatCleanBytes(evCapBytes)} • TTL ${formatCleanBytes(evTTLBytes)}`);
                     }
-                    if (hitLocEl.title !== summaryTitle) hitLocEl.title = summaryTitle;
                 }
 
                 // 1. DISK tier (disk / hybrid)
@@ -3018,21 +3116,23 @@
                                 cacheCapEl.style.display = 'none';
                             }
                         }
-                        let cacheTrackTitle = `Disk Pool: ${formatCleanBytes(cacheTotalSpan)} | Used: ${formatCleanBytes(cacheUsed)} | Allocated Cap: ${cacheMax > 0 ? formatCleanBytes(cacheMax) : 'Unlimited'} | Unallocated: ${formatCleanBytes(cacheUnallocatedBytes)} | Reserved: ${formatCleanBytes(cacheMin)}`;
-                        if (diskBound) cacheTrackTitle += ' | Cap exceeds usable disk';
-                        if (cacheTrack && cacheTrack.title !== cacheTrackTitle) cacheTrack.title = cacheTrackTitle;
                         const cacheHeadroom = cacheMax > 0 ? Math.min(cacheAvail, Math.max(0, cacheMax - cacheUsed)) : cacheAvail;
-                        let cacheBadgeTitle = `Disk Free: ${formatCleanBytes(cacheFree)} − ${formatCleanBytes(cacheMin)} res = ${formatCleanBytes(cacheAvail)} avail`;
-                        if (diskBound) {
-                            cacheBadgeTitle += ` • Disk reserve tighter than ${formatCleanBytes(cacheMax)} cap`;
-                        }
-                        setFreeBadge(cachePct, `${formatCleanBytes(cacheHeadroom, cacheFrac)} avail`, cacheDanger ? 'danger' : (cacheWarn ? 'warn' : ''), cacheBadgeTitle);
+                        const cacheDirStr = st.cache_dir || '--';
+                        setFreeBadge(cachePct, `${formatCleanBytes(cacheHeadroom, cacheFrac)} avail`, cacheDanger ? 'danger' : (cacheWarn ? 'warn' : ''));
                         const cacheParts = [formatFileCount(st.cache_objects)];
                         if (ttlShort) cacheParts.push(ttlShort);
                         setTextIfChanged(cacheSub, cacheParts.join(' • '));
-                        const cacheDirStr = st.cache_dir || '--';
                         setTextIfChanged(cacheLoc, cacheDirStr);
-                        if (cacheLoc.title !== cacheDirStr) cacheLoc.title = cacheDirStr;
+                        const cacheTooltipLines = [
+                            `DISK (${cacheDirStr})`,
+                            `Used: ${formatCleanBytes(cacheUsed)} • Cap: ${cacheMax > 0 ? formatCleanBytes(cacheMax) : 'Unlimited'} • Avail: ${formatCleanBytes(cacheHeadroom)}`,
+                            `Disk Free: ${formatCleanBytes(cacheFree)} − ${formatCleanBytes(cacheMin)} res = ${formatCleanBytes(cacheAvail)} avail`,
+                            `Unallocated: ${formatCleanBytes(cacheUnallocatedBytes)} • Total Pool: ${formatCleanBytes(cacheTotalSpan)}`,
+                        ];
+                        if (diskBound) {
+                            cacheTooltipLines.push(`Warning: Disk reserve tighter than ${formatCleanBytes(cacheMax)} cap`);
+                        }
+                        setTooltip(cacheTierEl, cacheTooltipLines.join('\n'));
                     } else {
                         cacheDiv.style.display = 'none';
                         cacheTierEl.style.display = 'none';
@@ -3062,15 +3162,21 @@
                         if (s3Max > 0) {
                             const s3Remaining = Math.max(0, s3Max - s3Used);
                             const s3Level = (st.s3_healthy === false || s3PctVal >= 95) ? 'danger' : (s3PctVal >= 80 ? 'warn' : '');
-                            setFreeBadge(s3Pct, `${formatCleanBytes(s3Remaining, s3Frac)} avail`, s3Level, `Quota: ${formatCleanBytes(s3Used)} / ${formatCleanBytes(s3Max)}`);
+                            setFreeBadge(s3Pct, `${formatCleanBytes(s3Remaining, s3Frac)} avail`, s3Level);
                         } else {
-                            setFreeBadge(s3Pct, '∞ avail', st.s3_healthy === false ? 'danger' : '', 'No S3_MAX_BYTES cap configured');
+                            setFreeBadge(s3Pct, '∞ avail', st.s3_healthy === false ? 'danger' : '');
                         }
                         setTextIfChanged(s3Sub, `${formatFileCount(st.s3_objects)} • ${ttlShort || 'No TTL'}`);
                         const bucketLabel = st.s3_bucket ? `bucket: ${st.s3_bucket}` : 'S3 Bucket';
                         setTextIfChanged(s3Loc, bucketLabel);
-                        const s3Title = [st.s3_endpoint, st.s3_bucket].filter(Boolean).join(' / ') || bucketLabel;
-                        if (s3Loc.title !== s3Title) s3Loc.title = s3Title;
+                        const s3TooltipLines = [
+                            `S3 (${st.s3_bucket || 'bucket'})`,
+                            s3Max > 0
+                                ? `Used: ${formatCleanBytes(s3Used)} / ${formatCleanBytes(s3Max)} (${formatCleanBytes(Math.max(0, s3Max - s3Used))} avail)`
+                                : `Used: ${formatCleanBytes(s3Used)} (No S3_MAX_BYTES cap)`,
+                        ];
+                        if (st.s3_endpoint) s3TooltipLines.push(`Endpoint: ${st.s3_endpoint}`);
+                        setTooltip(s3TierEl, s3TooltipLines.join('\n'));
                     } else {
                         s3Div.style.display = 'none';
                         s3TierEl.style.display = 'none';
@@ -3078,6 +3184,7 @@
                 }
 
                 // 3. TMP tier (always visible)
+                const tmpTierEl = document.getElementById('storage-tier-tmp');
                 const tmpLabel = document.getElementById('storage-tmp-label');
                 const tmpPct = document.getElementById('storage-tmp-pct');
                 const tmpMain = document.getElementById('storage-tmp-main');
@@ -3120,16 +3227,19 @@
                     setLayeredBarWidthAndClass(tmpBar, 'tmp', tmpFillWidthPct, tmpPressurePct, 75, 90, tmpLow);
                     if (tmpAllocBar) tmpAllocBar.style.width = `${Math.max(0, Math.min(100, tmpAllocWidthPct)).toFixed(1)}%`;
                     setReserveBar(tmpReserveBar, tmpResWidthPct, tmpLow);
-                    const tmpTrackTitle = `Disk Pool: ${formatCleanBytes(tmpTotalDisk)} | Used: ${formatCleanBytes(tmpUsed)} | Usable Pool: ${formatCleanBytes(tmpNonReserved)} | Reserved: ${formatCleanBytes(tmpMin)}`;
-                    if (tmpTrack && tmpTrack.title !== tmpTrackTitle) tmpTrack.title = tmpTrackTitle;
-                    const tmpTitle = `Disk Free: ${formatCleanBytes(tmpFree)} − ${formatCleanBytes(tmpMin)} res = ${formatCleanBytes(tmpAvail)} avail`;
-                    setFreeBadge(tmpPct, `${formatCleanBytes(tmpAvail, tmpFrac)} avail`, tmpLow ? 'danger' : ((tmpHeadroomTight || tmpScratchPressure) ? 'warn' : ''), tmpTitle);
+                    setFreeBadge(tmpPct, `${formatCleanBytes(tmpAvail, tmpFrac)} avail`, tmpLow ? 'danger' : ((tmpHeadroomTight || tmpScratchPressure) ? 'warn' : ''));
                     const tmpParts = [formatFileCount(tmpObjects)];
                     if (tmpFileMax > 0) tmpParts.push(`${formatCleanBytes(tmpFileMax)}/file`);
                     setTextIfChanged(tmpSub, tmpParts.join(' • '));
                     const tmpDirStr = st.tmp_dir || '--';
                     setTextIfChanged(tmpLoc, tmpDirStr);
-                    if (tmpLoc.title !== tmpDirStr) tmpLoc.title = tmpDirStr;
+                    const tmpTooltipLines = [
+                        `TMP (${tmpDirStr})`,
+                        `Used: ${formatCleanBytes(tmpUsed)} • Usable Pool: ${formatCleanBytes(tmpNonReserved)} • Total Pool: ${formatCleanBytes(tmpTotalDisk)}`,
+                        `Disk Free: ${formatCleanBytes(tmpFree)} − ${formatCleanBytes(tmpMin)} res = ${formatCleanBytes(tmpAvail)} avail`,
+                    ];
+                    if (tmpFileMax > 0) tmpTooltipLines.push(`Per-file limit: ${formatCleanBytes(tmpFileMax)}`);
+                    setTooltip(tmpTierEl, tmpTooltipLines.join('\n'));
                 }
 
                 // Update VOD / LIVE Split View & Provider Capacity Pill
@@ -3269,7 +3379,7 @@
                     }
                     liveUpEl.innerText = liveUpstreamText;
                     liveDownEl.innerText = liveDownstreamText;
-                    provPill.title = tooltipLines.join('\n');
+                    setTooltip(provPill, tooltipLines.join('\n'));
                 }
 
                 updateActiveDownloadsDOM(data.active_downloads || []);
