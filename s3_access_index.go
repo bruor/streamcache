@@ -44,9 +44,12 @@ type CacheIndexEntry struct {
 
 // CacheLifecycleStats tracks persistent cache tier transitions and evictions.
 type CacheLifecycleStats struct {
-	DemotedDiskToS3 int64 `json:"demoted_disk_to_s3"`
-	EvictedCapacity int64 `json:"evicted_capacity"`
-	EvictedTTL      int64 `json:"evicted_ttl"`
+	DemotedDiskToS3      int64 `json:"demoted_disk_to_s3"`
+	DemotedDiskToS3Bytes int64 `json:"demoted_disk_to_s3_bytes"`
+	EvictedCapacity      int64 `json:"evicted_capacity"`
+	EvictedCapacityBytes int64 `json:"evicted_capacity_bytes"`
+	EvictedTTL           int64 `json:"evicted_ttl"`
+	EvictedTTLBytes      int64 `json:"evicted_ttl_bytes"`
 }
 
 // S3IndexEntry preserves backwards-compatible naming for legacy callers/tests.
@@ -692,35 +695,50 @@ func (idx *CacheIndex) TransferTotals() (downloaded int64, served int64) {
 	return downloaded, served
 }
 
-// RecordDemotionDiskToS3 increments the persisted count of Disk -> S3 tier demotions.
-func (idx *CacheIndex) RecordDemotionDiskToS3(count int64) {
-	if idx == nil || count <= 0 {
+// RecordDemotionDiskToS3 increments the persisted count and byte total of Disk -> S3 tier demotions.
+func (idx *CacheIndex) RecordDemotionDiskToS3(count, bytes int64) {
+	if idx == nil || (count <= 0 && bytes <= 0) {
 		return
 	}
 	idx.mu.Lock()
-	idx.lifecycle.DemotedDiskToS3 += count
+	if count > 0 {
+		idx.lifecycle.DemotedDiskToS3 += count
+	}
+	if bytes > 0 {
+		idx.lifecycle.DemotedDiskToS3Bytes += bytes
+	}
 	idx.statsDirty = true
 	idx.mu.Unlock()
 }
 
-// RecordCapacityEviction increments the persisted count of capacity/pressure cache evictions.
-func (idx *CacheIndex) RecordCapacityEviction(count int64) {
-	if idx == nil || count <= 0 {
+// RecordCapacityEviction increments the persisted count and byte total of capacity/pressure cache evictions.
+func (idx *CacheIndex) RecordCapacityEviction(count, bytes int64) {
+	if idx == nil || (count <= 0 && bytes <= 0) {
 		return
 	}
 	idx.mu.Lock()
-	idx.lifecycle.EvictedCapacity += count
+	if count > 0 {
+		idx.lifecycle.EvictedCapacity += count
+	}
+	if bytes > 0 {
+		idx.lifecycle.EvictedCapacityBytes += bytes
+	}
 	idx.statsDirty = true
 	idx.mu.Unlock()
 }
 
-// RecordTTLEviction increments the persisted count of idle-age TTL cache evictions.
-func (idx *CacheIndex) RecordTTLEviction(count int64) {
-	if idx == nil || count <= 0 {
+// RecordTTLEviction increments the persisted count and byte total of idle-age TTL cache evictions.
+func (idx *CacheIndex) RecordTTLEviction(count, bytes int64) {
+	if idx == nil || (count <= 0 && bytes <= 0) {
 		return
 	}
 	idx.mu.Lock()
-	idx.lifecycle.EvictedTTL += count
+	if count > 0 {
+		idx.lifecycle.EvictedTTL += count
+	}
+	if bytes > 0 {
+		idx.lifecycle.EvictedTTLBytes += bytes
+	}
 	idx.statsDirty = true
 	idx.mu.Unlock()
 }
@@ -1161,6 +1179,9 @@ func (idx *CacheIndex) SweepExpired(ctx context.Context, storage StorageBackend,
 		delete(idx.entries, cand.Key)
 		idx.dirty = true
 		idx.lifecycle.EvictedTTL++
+		if cand.Size > 0 {
+			idx.lifecycle.EvictedTTLBytes += cand.Size
+		}
 		idx.statsDirty = true
 		idx.mu.Unlock()
 
@@ -1272,6 +1293,9 @@ func (idx *CacheIndex) SweepS3OverCapacity(ctx context.Context, storage StorageB
 			} else {
 				delete(idx.entries, cand.Key)
 				idx.lifecycle.EvictedCapacity++
+				if cand.Size > 0 {
+					idx.lifecycle.EvictedCapacityBytes += cand.Size
+				}
 				idx.statsDirty = true
 			}
 			idx.dirty = true

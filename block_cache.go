@@ -2258,9 +2258,9 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 		if idx != nil {
 			idx.MarkRemovedFromTier(baseKey, IndexTierDisk)
 			if backedOnS3 {
-				idx.RecordDemotionDiskToS3(1)
+				idx.RecordDemotionDiskToS3(1, file.Size)
 			} else {
-				idx.RecordCapacityEviction(1)
+				idx.RecordCapacityEviction(1, file.Size)
 			}
 		}
 

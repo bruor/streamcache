@@ -375,7 +375,7 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 		if d.index != nil {
 			d.index.MarkAddedToTier(cand.Key, IndexTierS3)
 			d.index.MarkRemovedFromTier(cand.Key, IndexTierDisk)
-			d.index.RecordDemotionDiskToS3(1)
+			d.index.RecordDemotionDiskToS3(1, cand.Size)
 		}
 
 		localTotalBytes -= cand.Size

@@ -254,8 +254,11 @@ type dashboardStorageInfo struct {
 	CacheRatio           float64 `json:"cache_ratio"`
 	CacheHitRatioPct     float64 `json:"cache_hit_ratio_pct"`
 	DemotedDiskToS3      int64   `json:"demoted_disk_to_s3"`
+	DemotedDiskToS3Bytes int64   `json:"demoted_disk_to_s3_bytes"`
 	EvictedCapacity      int64   `json:"evicted_capacity"`
+	EvictedCapacityBytes int64   `json:"evicted_capacity_bytes"`
 	EvictedTTL           int64   `json:"evicted_ttl"`
+	EvictedTTLBytes      int64   `json:"evicted_ttl_bytes"`
 }
 
 type dashboardSnapshot struct {
@@ -617,8 +620,11 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		CacheRatio:           cacheRatio,
 		CacheHitRatioPct:     hitRatioPct,
 		DemotedDiskToS3:      lifecycleStats.DemotedDiskToS3,
+		DemotedDiskToS3Bytes: lifecycleStats.DemotedDiskToS3Bytes,
 		EvictedCapacity:      lifecycleStats.EvictedCapacity,
+		EvictedCapacityBytes: lifecycleStats.EvictedCapacityBytes,
 		EvictedTTL:           lifecycleStats.EvictedTTL,
+		EvictedTTLBytes:      lifecycleStats.EvictedTTLBytes,
 	}
 
 	snap := dashboardSnapshot{

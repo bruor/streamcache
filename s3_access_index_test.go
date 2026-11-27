@@ -937,18 +937,24 @@ func TestLifetimeCacheHitRatioAccountingAndPersistence(t *testing.T) {
 	delete(GlobalRegistry.Files, st.Key)
 	GlobalRegistry.Lock.Unlock()
 
-	// 3. Subsequent Cache HIT serves another 1000 bytes on Disk (total 2000 SV, 1000 DL -> 2.0x / 50%),
-	// then another 2000 on S3 (4000 SV -> 4.0x / 75%).
+	// 3. Subsequent Cache HIT serves 1000 bytes from Disk while on Disk, then item moves
+	// across tiers (Disk -> Both -> S3), then serves 2000 bytes from S3. Both Disk and S3
+	// served bytes must remain accumulated on the same entry across the tier transition.
+	idx.MarkAddedToTier("movie_a.mkv", IndexTierDisk)
 	idx.RecordCacheHitServeBytes("movie_a.mkv", IndexTierDisk, 1000)
 	snap2 := collectDashboardSnapshot().Storage
 	if snap2.CacheRatio < 1.99 || snap2.CacheRatio > 2.01 || snap2.CacheHitRatioPct < 49.9 || snap2.CacheHitRatioPct > 50.1 || snap2.CacheBytesServedDisk != 1000 {
 		t.Fatalf("Expected 2.0x ratio (50%% hit ratio) and Disk=1000, got %+v", snap2)
 	}
 
+	idx.MarkRemovedFromTier("movie_a.mkv", IndexTierDisk)
+	if tier := idx.GetTier("movie_a.mkv"); tier != IndexTierS3 {
+		t.Fatalf("Expected movie_a.mkv to transition from Disk/Both to S3, got %q", tier)
+	}
 	idx.RecordCacheHitServeBytes("movie_a.mkv", IndexTierS3, 2000)
 
 	// 4. Eager Size fallback for legacy pre-existing cached object with BytesDownloaded == 0,
-	// plus lifecycle counters persisted in cache_stats.json without changing s3_index.json schema.
+	// plus lifecycle counters + byte totals persisted in cache_stats.json without changing s3_index.json schema.
 	idx.mu.Lock()
 	idx.entries["legacy_existing.mkv"] = &CacheIndexEntry{
 		Key:          "legacy_existing.mkv",
@@ -960,9 +966,9 @@ func TestLifetimeCacheHitRatioAccountingAndPersistence(t *testing.T) {
 	idx.dirty = true
 	idx.mu.Unlock()
 
-	idx.RecordDemotionDiskToS3(2)
-	idx.RecordCapacityEviction(1)
-	idx.RecordTTLEviction(3)
+	idx.RecordDemotionDiskToS3(2, 5000)
+	idx.RecordCapacityEviction(1, 1500)
+	idx.RecordTTLEviction(3, 9000)
 
 	snap3Pre := collectDashboardSnapshot().Storage
 	// TotalDL = 1000 (movie_a) + 2000 (legacy_existing fallback) = 3000; TotalSV = 4000 -> 1.333x
@@ -973,9 +979,13 @@ func TestLifetimeCacheHitRatioAccountingAndPersistence(t *testing.T) {
 	if snap3Pre.CacheRatio < 1.32 || snap3Pre.CacheRatio > 1.34 {
 		t.Fatalf("Expected CacheRatio ~1.33x, got %.3f", snap3Pre.CacheRatio)
 	}
-	if snap3Pre.DemotedDiskToS3 != 2 || snap3Pre.EvictedCapacity != 1 || snap3Pre.EvictedTTL != 3 {
-		t.Fatalf("Expected lifecycle stats (2, 1, 3), got (%d, %d, %d)",
-			snap3Pre.DemotedDiskToS3, snap3Pre.EvictedCapacity, snap3Pre.EvictedTTL)
+	if snap3Pre.DemotedDiskToS3 != 2 || snap3Pre.DemotedDiskToS3Bytes != 5000 ||
+		snap3Pre.EvictedCapacity != 1 || snap3Pre.EvictedCapacityBytes != 1500 ||
+		snap3Pre.EvictedTTL != 3 || snap3Pre.EvictedTTLBytes != 9000 {
+		t.Fatalf("Expected lifecycle stats (2/5000, 1/1500, 3/9000), got (%d/%d, %d/%d, %d/%d)",
+			snap3Pre.DemotedDiskToS3, snap3Pre.DemotedDiskToS3Bytes,
+			snap3Pre.EvictedCapacity, snap3Pre.EvictedCapacityBytes,
+			snap3Pre.EvictedTTL, snap3Pre.EvictedTTLBytes)
 	}
 
 	if err := idx.Flush(); err != nil {
@@ -1008,8 +1018,12 @@ func TestLifetimeCacheHitRatioAccountingAndPersistence(t *testing.T) {
 		snap4.CacheBytesServedDisk != 1000 || snap4.CacheBytesServedS3 != 2000 {
 		t.Fatalf("Expected persisted stats (dl=3000 sv=4000 disk=1000 s3=2000), got %+v", snap4)
 	}
-	if snap4.DemotedDiskToS3 != 2 || snap4.EvictedCapacity != 1 || snap4.EvictedTTL != 3 {
-		t.Fatalf("Expected persisted lifecycle stats (2, 1, 3), got (%d, %d, %d)",
-			snap4.DemotedDiskToS3, snap4.EvictedCapacity, snap4.EvictedTTL)
+	if snap4.DemotedDiskToS3 != 2 || snap4.DemotedDiskToS3Bytes != 5000 ||
+		snap4.EvictedCapacity != 1 || snap4.EvictedCapacityBytes != 1500 ||
+		snap4.EvictedTTL != 3 || snap4.EvictedTTLBytes != 9000 {
+		t.Fatalf("Expected persisted lifecycle stats (2/5000, 1/1500, 3/9000), got (%d/%d, %d/%d, %d/%d)",
+			snap4.DemotedDiskToS3, snap4.DemotedDiskToS3Bytes,
+			snap4.EvictedCapacity, snap4.EvictedCapacityBytes,
+			snap4.EvictedTTL, snap4.EvictedTTLBytes)
 	}
 }
