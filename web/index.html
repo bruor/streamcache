@@ -1948,6 +1948,7 @@
                         total_size: file.total_size,
                         ranges: file.ranges || [],
                         downloaded_bytes: file.downloaded_bytes || 0,
+                        active_writer: Boolean(file.active_writer),
                         active_clients: file.active_clients,
                         active_workers: file.active_workers ?? 0,
                         max_workers: file.max_workers || 2,
@@ -1973,6 +1974,7 @@
                     fileData.total_size = file.total_size;
                     fileData.ranges = file.ranges || [];
                     fileData.downloaded_bytes = file.downloaded_bytes || 0;
+                    fileData.active_writer = Boolean(file.active_writer);
                     fileData.active_clients = file.active_clients;
                     fileData.active_workers = file.active_workers ?? 0;
                     fileData.max_workers = file.max_workers || 2;
