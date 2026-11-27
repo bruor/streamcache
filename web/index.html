@@ -1631,6 +1631,20 @@
                     <div class="storage-tier-sub" id="storage-hit-sub">Disk 0% • S3 0% • Orig 0%</div>
                     <div class="storage-tier-loc" id="storage-hit-loc">Cap 0 B • TTL 0 B</div>
                 </div>
+                <div class="storage-divider" id="storage-div-tmp"></div>
+                <div class="storage-tier" id="storage-tier-tmp">
+                    <div class="storage-tier-header">
+                        <span class="storage-tier-label tmp" id="storage-tmp-label">
+                            <span class="storage-tier-dot"></span>
+                            <span>TMP</span>
+                        </span>
+                        <span class="storage-tier-pct" id="storage-tmp-pct">-- avail</span>
+                    </div>
+                    <div class="storage-tier-main"><span id="storage-tmp-main">0 B / Unlimited</span><span class="storage-tier-res" id="storage-tmp-res" style="display: none;"></span></div>
+                    <div class="storage-bar-track" id="storage-tmp-track"><div class="storage-bar-alloc tmp" id="storage-tmp-alloc"></div><div class="storage-bar-fill layered tmp" id="storage-tmp-bar"></div><div class="storage-bar-reserve" id="storage-tmp-reserve"></div></div>
+                    <div class="storage-tier-sub" id="storage-tmp-sub">0 files</div>
+                    <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
+                </div>
                 <div class="storage-divider" id="storage-div-cache" style="display: none;"></div>
                 <div class="storage-tier" id="storage-tier-cache" style="display: none;">
                     <div class="storage-tier-header">
@@ -1658,20 +1672,6 @@
                     <div class="storage-bar-track"><div class="storage-bar-fill s3" id="storage-s3-bar"></div></div>
                     <div class="storage-tier-sub" id="storage-s3-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-s3-loc">--</div>
-                </div>
-                <div class="storage-divider" id="storage-div-tmp"></div>
-                <div class="storage-tier" id="storage-tier-tmp">
-                    <div class="storage-tier-header">
-                        <span class="storage-tier-label tmp" id="storage-tmp-label">
-                            <span class="storage-tier-dot"></span>
-                            <span>TMP</span>
-                        </span>
-                        <span class="storage-tier-pct" id="storage-tmp-pct">-- avail</span>
-                    </div>
-                    <div class="storage-tier-main"><span id="storage-tmp-main">0 B / Unlimited</span><span class="storage-tier-res" id="storage-tmp-res" style="display: none;"></span></div>
-                    <div class="storage-bar-track" id="storage-tmp-track"><div class="storage-bar-alloc tmp" id="storage-tmp-alloc"></div><div class="storage-bar-fill layered tmp" id="storage-tmp-bar"></div><div class="storage-bar-reserve" id="storage-tmp-reserve"></div></div>
-                    <div class="storage-tier-sub" id="storage-tmp-sub">0 files</div>
-                    <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
                 </div>
             </div>
         </div>
@@ -3094,7 +3094,7 @@
                         if (cacheResEl) {
                             if (cacheMin > 0) {
                                 cacheResEl.style.display = '';
-                                setTextIfChanged(cacheResEl, `${formatCleanBytes(cacheMin)} res`);
+                                setTextIfChanged(cacheResEl, formatCleanBytes(cacheMin));
                                 setClassIfChanged(cacheResEl, cacheDanger ? 'storage-tier-res danger' : 'storage-tier-res');
                             } else {
                                 cacheResEl.style.display = 'none';
@@ -3236,7 +3236,7 @@
                     if (tmpResEl) {
                         if (tmpMin > 0) {
                             tmpResEl.style.display = '';
-                            setTextIfChanged(tmpResEl, `${formatCleanBytes(tmpMin)} res`);
+                            setTextIfChanged(tmpResEl, formatCleanBytes(tmpMin));
                             setClassIfChanged(tmpResEl, tmpLow ? 'storage-tier-res danger' : 'storage-tier-res');
                         } else {
                             tmpResEl.style.display = 'none';
