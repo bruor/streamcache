@@ -1467,7 +1467,7 @@
                         </span>
                         <span class="storage-tier-pct" id="storage-tmp-pct">-- free</span>
                     </div>
-                    <div class="storage-tier-main" id="storage-tmp-main">0.0 B / Unlimited</div>
+                    <div class="storage-tier-main" id="storage-tmp-main">0 B / Unlimited</div>
                     <div class="storage-bar-track"><div class="storage-bar-fill tmp" id="storage-tmp-bar"></div></div>
                     <div class="storage-tier-sub" id="storage-tmp-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
@@ -1481,7 +1481,7 @@
                         </span>
                         <span class="storage-tier-pct" id="storage-cache-pct">-- free</span>
                     </div>
-                    <div class="storage-tier-main" id="storage-cache-main">0.0 B / Unlimited</div>
+                    <div class="storage-tier-main" id="storage-cache-main">0 B / Unlimited</div>
                     <div class="storage-bar-track"><div class="storage-bar-fill cache" id="storage-cache-bar"></div></div>
                     <div class="storage-tier-sub" id="storage-cache-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-cache-loc">--</div>
@@ -1495,7 +1495,7 @@
                         </span>
                         <span class="storage-tier-pct" id="storage-s3-pct">∞ free</span>
                     </div>
-                    <div class="storage-tier-main" id="storage-s3-main">0.0 B / Unlimited</div>
+                    <div class="storage-tier-main" id="storage-s3-main">0 B / Unlimited</div>
                     <div class="storage-bar-track"><div class="storage-bar-fill s3" id="storage-s3-bar"></div></div>
                     <div class="storage-tier-sub" id="storage-s3-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-s3-loc">--</div>
@@ -2623,12 +2623,12 @@
                 function formatFractionSameUnit(used, limit, unitSuffix = '') {
                     if (limit > 0) {
                         const u = pickUnit(limit);
-                        const num = ((used || 0) / u.div).toFixed(1);
+                        const num = formatDenom(Math.max(0, used || 0), u.div);
                         const den = formatDenom(limit, u.div);
                         return { text: `${num} / ${den} ${u.unit}${unitSuffix}`, unit: u.unit, div: u.div };
                     }
                     const u = pickUnit(used || 0);
-                    return { text: `${((used || 0) / u.div).toFixed(1)} ${u.unit} / Unlimited`, unit: u.unit, div: u.div };
+                    return { text: `${formatDenom(Math.max(0, used || 0), u.div)} ${u.unit} / Unlimited`, unit: u.unit, div: u.div };
                 }
 
                 function formatFileCount(n) {
