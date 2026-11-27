@@ -771,12 +771,16 @@ func (pm *PrehydrationManager) YieldState(state *FileCacheState, reason string) 
 	actualBackoff := backoff * time.Duration(multiplier)
 	state.YieldCooldownUntil = time.Now().Add(actualBackoff)
 	state.WriterActive = false
+	cm := state.ChunkManager
 	state.Lock.Unlock()
 
 	state.SetUpstreamStatus("Yielding")
 
 	if cancel != nil {
 		cancel()
+	}
+	if cm != nil {
+		cm.PauseUploads()
 	}
 
 	pm.mu.Lock()
@@ -815,6 +819,9 @@ func (pm *PrehydrationManager) ResumeState(state *FileCacheState) {
 	pm.mu.Unlock()
 
 	log.Printf("[Prehydration] Resuming yielded file: %s at offset %d", state.Key, state.RangeSet.TotalBytes())
+	if cm := state.GetChunkManager(); cm != nil {
+		cm.ResumeUploads()
+	}
 	header := make(http.Header)
 	header.Set("User-Agent", GlobalConfig.GetUpstreamUserAgent())
 	StartCoordinator(state, header)

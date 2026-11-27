@@ -524,6 +524,38 @@ func (s *FileCacheState) OldestStarvationDuration() (time.Duration, bool) {
 	return time.Since(oldest), true
 }
 
+// MinReaderReadAhead returns the smallest contiguous buffered read-ahead (in bytes)
+// across active readers that have not yet buffered through EOF.
+func (s *FileCacheState) MinReaderReadAhead() (int64, bool) {
+	if s == nil || s.RangeSet == nil {
+		return 0, false
+	}
+	_, _, offsets, hasReaders := s.GetReaderOffsetBounds()
+	if !hasReaders {
+		return 0, false
+	}
+	s.Lock.Lock()
+	totalSize := s.TotalSize
+	s.Lock.Unlock()
+
+	var minAvail int64
+	found := false
+	for _, off := range offsets {
+		if off < 0 {
+			off = 0
+		}
+		avail := s.RangeSet.AvailableFrom(off)
+		if totalSize > 0 && off+avail >= totalSize {
+			continue
+		}
+		if !found || avail < minAvail {
+			minAvail = avail
+			found = true
+		}
+	}
+	return minAvail, found
+}
+
 func resolveS3TargetBackend() (StorageBackend, int64) {
 	s3Target := GlobalStorage
 	if tb, ok := GlobalStorage.(*TieredStorageBackend); ok && tb.S3() != nil {

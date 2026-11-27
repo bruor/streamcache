@@ -105,7 +105,12 @@ func StartCoordinator(state *FileCacheState, initialHeader http.Header) {
 	state.WriterActive = true
 	state.coordGen++
 	myGen := state.coordGen
+	cm := state.ChunkManager
 	state.Lock.Unlock()
+
+	if cm != nil {
+		cm.ResumeUploads()
+	}
 
 	if GlobalLogBroker != nil {
 		go GlobalLogBroker.BroadcastStateUpdate()

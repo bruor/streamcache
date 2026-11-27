@@ -628,6 +628,9 @@ func (r *CacheReader) readAtAttempt(p []byte, off int64) (n int, retry bool, err
 				log.Printf("[Reader] Upstream coordinator inactive for %s while offset %d is required. Resuscitation triggered.", key, off)
 				StartCoordinator(r.state, nil)
 			} else if shouldUpgrade {
+				if wasYielding && cmStarve != nil {
+					cmStarve.ResumeUploads()
+				}
 				r.state.SetUpstreamStatus("Downloading")
 			}
 			r.state.Lock.Lock()

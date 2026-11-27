@@ -117,6 +117,7 @@ type ScratchChunkManager struct {
 	trackDiskFlushes atomic.Bool
 	activeUploads    int32
 	ringBufferMode   atomic.Bool
+	uploadsPaused    atomic.Bool
 	degradedErr      error
 	ringPunchedCount   atomic.Int64
 	ringPunchedBytes   atomic.Int64
@@ -351,6 +352,37 @@ func (m *ScratchChunkManager) SignalBudget() {
 	}
 }
 
+// PauseUploads cancels in-flight chunk uploads without entering ring-buffer mode,
+// preserving completed chunk records and local scratch so uploads can resume later.
+func (m *ScratchChunkManager) PauseUploads() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.uploadsPaused.Store(true)
+	cancel := m.uploadCancel
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// ResumeUploads re-enables chunk uploads after PauseUploads and triggers any ready chunks.
+func (m *ScratchChunkManager) ResumeUploads() {
+	if m == nil || m.IsRingBufferMode() {
+		return
+	}
+	m.mu.Lock()
+	if !m.uploadsPaused.Load() || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return
+	}
+	m.uploadCtx, m.uploadCancel = context.WithCancel(m.ctx)
+	m.uploadsPaused.Store(false)
+	m.mu.Unlock()
+	m.CheckAndTriggerUploads()
+}
+
 // TargetName returns the active ChunkTarget identifier ("s3", "nas", or "").
 func (m *ScratchChunkManager) TargetName() string {
 	if m == nil || m.target == nil {
@@ -436,6 +468,7 @@ func (m *ScratchChunkManager) WaitScratchBudget(ctx context.Context) error {
 
 		if !m.IsRingBufferMode() && m.target != nil && m.state != nil {
 			starveAge, hasStarving := m.state.OldestStarvationDuration()
+			minReadAhead, hasUnfinishedReader := m.state.MinReaderReadAhead()
 			blockAge := time.Since(blockedSince)
 			yieldDelay := m.starveYieldDelay
 			if yieldDelay <= 0 {
@@ -445,8 +478,13 @@ func (m *ScratchChunkManager) WaitScratchBudget(ctx context.Context) error {
 			if degradeDelay <= 0 {
 				degradeDelay = 5 * time.Second
 			}
+			lowReadAhead := int64(64 * 1024 * 1024)
+			if m.maxInFlightBytes > 0 && m.maxInFlightBytes/4 < lowReadAhead {
+				lowReadAhead = m.maxInFlightBytes / 4
+			}
 
-			if hasStarving && !yieldedForContention && blockAge >= yieldDelay && starveAge >= yieldDelay {
+			lowBufferOrDisk := (!diskOK && m.state.HasActiveClients()) || (hasUnfinishedReader && minReadAhead < lowReadAhead) || hasStarving
+			if !yieldedForContention && blockAge >= yieldDelay && lowBufferOrDisk {
 				yieldedForContention = true
 				if GlobalPrehydrationManager != nil {
 					contendedTier := m.target.Name()
@@ -568,7 +606,7 @@ func (m *ScratchChunkManager) activeRangeSet() *RangeSet {
 
 // CheckAndTriggerUploads inspects RangeSet (or DiskRangeSet when pipelined) to see if any new chunks can be queued to the target.
 func (m *ScratchChunkManager) CheckAndTriggerUploads() {
-	if m == nil || m.target == nil || m.IsRingBufferMode() {
+	if m == nil || m.target == nil || m.IsRingBufferMode() || m.uploadsPaused.Load() {
 		return
 	}
 
@@ -576,7 +614,7 @@ func (m *ScratchChunkManager) CheckAndTriggerUploads() {
 	sequential := m.target.IsSequential()
 
 	m.mu.Lock()
-	if m.IsRingBufferMode() || m.recomposed || m.permanentErr != nil {
+	if m.IsRingBufferMode() || m.uploadsPaused.Load() || m.recomposed || m.permanentErr != nil {
 		m.mu.Unlock()
 		return
 	}
@@ -639,7 +677,7 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 	}
 	defer func() { <-m.uploadSem }()
 
-	if m.IsRingBufferMode() {
+	if m.IsRingBufferMode() || m.uploadsPaused.Load() {
 		m.mu.Lock()
 		m.uploading[chunkIndex] = false
 		m.mu.Unlock()
@@ -665,13 +703,15 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 
 	// Retry up to 3 times with exponential backoff
 	targetName := m.target.Name()
+	m.mu.RLock()
 	upCtx := m.uploadCtx
+	m.mu.RUnlock()
 	if upCtx == nil {
 		upCtx = m.ctx
 	}
 	var uploadErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		if m.IsRingBufferMode() || m.ctx.Err() != nil || upCtx.Err() != nil {
+		if m.IsRingBufferMode() || m.uploadsPaused.Load() || m.ctx.Err() != nil || upCtx.Err() != nil {
 			m.mu.Lock()
 			m.uploading[chunkIndex] = false
 			m.mu.Unlock()
@@ -679,7 +719,7 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 		}
 		sectionReader := io.NewSectionReader(f, chunkStart, chunkLen)
 		uploadErr = m.target.PushChunk(upCtx, m.key, chunkIndex, chunkStart, sectionReader, chunkLen)
-		if uploadErr == nil || m.ctx.Err() != nil || upCtx.Err() != nil || m.IsRingBufferMode() {
+		if uploadErr == nil || m.ctx.Err() != nil || upCtx.Err() != nil || m.IsRingBufferMode() || m.uploadsPaused.Load() {
 			break
 		}
 		backoff := time.Duration(1<<(attempt-1)) * 500 * time.Millisecond
@@ -703,7 +743,7 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 		}
 	}
 
-	if m.IsRingBufferMode() || upCtx.Err() != nil {
+	if m.IsRingBufferMode() || m.uploadsPaused.Load() || upCtx.Err() != nil {
 		m.mu.Lock()
 		m.uploading[chunkIndex] = false
 		m.mu.Unlock()
@@ -1351,8 +1391,11 @@ func (m *ScratchChunkManager) Close() {
 	if m == nil {
 		return
 	}
-	if m.uploadCancel != nil {
-		m.uploadCancel()
+	m.mu.Lock()
+	uploadCancel := m.uploadCancel
+	m.mu.Unlock()
+	if uploadCancel != nil {
+		uploadCancel()
 	}
 	m.cancel()
 	select {
