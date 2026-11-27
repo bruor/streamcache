@@ -1636,8 +1636,8 @@
                         <span class="storage-tier-pct" id="storage-hit-mult">--</span>
                     </div>
                     <div class="storage-tier-main" id="storage-hit-main">0 / 0 B</div>
-                    <div class="storage-bar-track"><div class="storage-bar-seg origin" id="storage-hit-bar-origin"></div><div class="storage-bar-seg disk" id="storage-hit-bar-disk"></div><div class="storage-bar-seg s3" id="storage-hit-bar-s3"></div><div class="storage-bar-breakeven"></div></div>
-                    <div class="storage-tier-sub" id="storage-hit-sub">Orig 0% • Disk 0% • S3 0%</div>
+                    <div class="storage-bar-track"><div class="storage-bar-seg disk" id="storage-hit-bar-disk"></div><div class="storage-bar-seg s3" id="storage-hit-bar-s3"></div><div class="storage-bar-seg origin" id="storage-hit-bar-origin"></div><div class="storage-bar-breakeven"></div></div>
+                    <div class="storage-tier-sub" id="storage-hit-sub">Disk 0% • S3 0% • Orig 0%</div>
                     <div class="storage-tier-loc" id="storage-hit-loc">Cap 0 B • TTL 0 B</div>
                 </div>
                 <div class="storage-divider" id="storage-div-cache" style="display: none;"></div>
@@ -2992,7 +2992,6 @@
                     const sv = st.cache_bytes_served || 0;
                     const servedDisk = st.cache_bytes_served_disk || 0;
                     const servedS3 = st.cache_bytes_served_s3 || 0;
-                    const servedOrigin = Math.max(0, sv - servedDisk - servedS3);
                     const ratio = dl > 0 ? (sv / dl) : (st.cache_ratio || 0);
                     const demoted = st.demoted_disk_to_s3 || 0;
                     const demotedBytes = st.demoted_disk_to_s3_bytes || 0;
@@ -3016,56 +3015,56 @@
                     const summaryTitle = [
                         `CACHE RATIO: ${ratioLabel}`,
                         `Out: ${formatCleanBytes(sv)} • In: ${formatCleanBytes(dl)}`,
-                        `Origin: ${formatCleanBytes(servedOrigin)} • Disk: ${formatCleanBytes(servedDisk)} • S3: ${formatCleanBytes(servedS3)}`,
+                        `Disk: ${formatCleanBytes(servedDisk)} • S3: ${formatCleanBytes(servedS3)} • Origin (In): ${formatCleanBytes(dl)}`,
                         `Disk→S3: ${demoted} (${formatCleanBytes(demotedBytes)}) • Cap: ${evCap} (${formatCleanBytes(evCapBytes)}) • TTL: ${evTTL} (${formatCleanBytes(evTTLBytes)})`,
                     ].join('\n');
                     setFreeBadge(hitMultEl, ratioLabel, ratioLevel);
                     setTooltip(document.getElementById('storage-tier-hit'), summaryTitle);
 
-                    const totalFillPct = dl > 0 ? Math.max(0, Math.min(100, ratio * 50)) : (sv > 0 ? 100 : 0);
-                    let originW = 0;
+                    const totalShare = servedDisk + servedS3 + dl;
                     let diskW = 0;
                     let s3W = 0;
-                    if (sv > 0) {
-                        originW = totalFillPct * (servedOrigin / sv);
-                        diskW = totalFillPct * (servedDisk / sv);
-                        s3W = totalFillPct * (servedS3 / sv);
+                    let originW = 0;
+                    if (totalShare > 0) {
+                        diskW = (servedDisk / totalShare) * 100;
+                        s3W = (servedS3 / totalShare) * 100;
+                        originW = (dl / totalShare) * 100;
                     }
-                    if (hitBarOriginEl) hitBarOriginEl.style.width = `${originW.toFixed(1)}%`;
                     if (hitBarDiskEl) hitBarDiskEl.style.width = `${diskW.toFixed(1)}%`;
                     if (hitBarS3El) hitBarS3El.style.width = `${s3W.toFixed(1)}%`;
+                    if (hitBarOriginEl) hitBarOriginEl.style.width = `${originW.toFixed(1)}%`;
 
                     if (isHybrid) {
-                        if (sv > 0) {
-                            const origPct = Math.round((servedOrigin / sv) * 100);
-                            let diskPct = Math.round((servedDisk / sv) * 100);
-                            if (origPct + diskPct > 100) diskPct = 100 - origPct;
-                            const s3Pct = 100 - origPct - diskPct;
-                            setTextIfChanged(hitSubEl, `Orig ${origPct}% • Disk ${diskPct}% • S3 ${s3Pct}%`);
+                        if (totalShare > 0) {
+                            const diskPct = Math.round((servedDisk / totalShare) * 100);
+                            let s3Pct = Math.round((servedS3 / totalShare) * 100);
+                            if (diskPct + s3Pct > 100) s3Pct = 100 - diskPct;
+                            const origPct = 100 - diskPct - s3Pct;
+                            setTextIfChanged(hitSubEl, `Disk ${diskPct}% • S3 ${s3Pct}% • Orig ${origPct}%`);
                         } else {
-                            setTextIfChanged(hitSubEl, 'Orig 0% • Disk 0% • S3 0%');
+                            setTextIfChanged(hitSubEl, 'Disk 0% • S3 0% • Orig 0%');
                         }
                         setTextIfChanged(hitLocEl, `→S3 ${formatCleanBytes(demotedBytes)} • Cap ${formatCleanBytes(evCapBytes)} • TTL ${formatCleanBytes(evTTLBytes)}`);
                     } else if (st.cache_enabled) {
-                        if (sv > 0) {
-                            const diskPct = Math.min(100, Math.round((servedDisk / sv) * 100));
+                        if (totalShare > 0) {
+                            const diskPct = Math.min(100, Math.round((servedDisk / totalShare) * 100));
                             const origPct = 100 - diskPct;
-                            setTextIfChanged(hitSubEl, `Orig ${origPct}% • Disk ${diskPct}%`);
+                            setTextIfChanged(hitSubEl, `Disk ${diskPct}% • Orig ${origPct}%`);
                         } else {
-                            setTextIfChanged(hitSubEl, 'Orig 0% • Disk 0%');
+                            setTextIfChanged(hitSubEl, 'Disk 0% • Orig 0%');
                         }
                         setTextIfChanged(hitLocEl, `Cap ${formatCleanBytes(evCapBytes)} • TTL ${formatCleanBytes(evTTLBytes)}`);
                     } else if (st.s3_enabled) {
-                        if (sv > 0) {
-                            const s3Pct = Math.min(100, Math.round((servedS3 / sv) * 100));
+                        if (totalShare > 0) {
+                            const s3Pct = Math.min(100, Math.round((servedS3 / totalShare) * 100));
                             const origPct = 100 - s3Pct;
-                            setTextIfChanged(hitSubEl, `Orig ${origPct}% • S3 ${s3Pct}%`);
+                            setTextIfChanged(hitSubEl, `S3 ${s3Pct}% • Orig ${origPct}%`);
                         } else {
-                            setTextIfChanged(hitSubEl, 'Orig 0% • S3 0%');
+                            setTextIfChanged(hitSubEl, 'S3 0% • Orig 0%');
                         }
                         setTextIfChanged(hitLocEl, `Cap ${formatCleanBytes(evCapBytes)} • TTL ${formatCleanBytes(evTTLBytes)}`);
                     } else {
-                        setTextIfChanged(hitSubEl, `Orig ${sv > 0 ? 100 : 0}%`);
+                        setTextIfChanged(hitSubEl, `Orig ${totalShare > 0 ? 100 : 0}%`);
                         setTextIfChanged(hitLocEl, `Cap ${formatCleanBytes(evCapBytes)} • TTL ${formatCleanBytes(evTTLBytes)}`);
                     }
                 }
