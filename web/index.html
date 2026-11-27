@@ -387,6 +387,37 @@
             transform: scale(0.96);
         }
 
+        .add-worker-btn {
+            background-color: rgba(0, 240, 255, 0.14);
+            color: var(--accent-cyan);
+            border: 1px solid rgba(0, 240, 255, 0.35);
+            font-family: var(--font-mono);
+            font-size: 0.82rem;
+            font-weight: 700;
+            padding: 3px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+            box-sizing: border-box;
+        }
+
+        .add-worker-btn:hover:not(:disabled) {
+            background-color: rgba(0, 240, 255, 0.28);
+            border-color: rgba(0, 240, 255, 0.65);
+            color: #fff;
+            box-shadow: 0 0 8px rgba(0, 240, 255, 0.35);
+        }
+
+        .add-worker-btn:active:not(:disabled) {
+            transform: scale(0.96);
+        }
+
+        .add-worker-btn:disabled {
+            opacity: 0.42;
+            cursor: not-allowed;
+        }
+
         @keyframes pulse-glow {
             0% { box-shadow: 0 0 0 0 rgba(138, 43, 226, 0.4); }
             70% { box-shadow: 0 0 0 8px rgba(138, 43, 226, 0); }
@@ -869,6 +900,7 @@
 
             .download-badge,
             .download-speed-badge,
+            .add-worker-btn,
             .cancel-hydration-btn {
                 font-size: 0.78rem;
                 max-width: 100%;
@@ -1807,6 +1839,27 @@
                 }
             }
             
+            const addWorkerBtn = document.getElementById(`add-worker-btn-${key}`);
+            if (addWorkerBtn) {
+                const maxWorkers = fileData.max_workers || 2;
+                const activeWorkers = fileData.active_workers ?? 0;
+                const totalSize = fileData.total_size || 0;
+                const rawStatus = fileData.upstream_status || '';
+                const hasStarving = fileData.starving_queue && fileData.starving_queue.length > 0;
+                const nonDownloadable = !fileData.active_writer || fileData.is_yielding ||
+                    rawStatus === 'Committing' || rawStatus === 'Completed' || rawStatus === 'Error' ||
+                    rawStatus === 'Pending Recompose' || rawStatus === 'Probed (Idle)' ||
+                    (totalSize > 0 && downloaded >= totalSize);
+
+                if (maxWorkers <= 1) {
+                    addWorkerBtn.style.display = 'none';
+                } else {
+                    addWorkerBtn.style.display = '';
+                    const shouldDisable = activeWorkers >= maxWorkers || nonDownloadable || hasStarving || addWorkerBtn.dataset.pending === '1';
+                    addWorkerBtn.disabled = shouldDisable;
+                }
+            }
+
             const metaEl = document.getElementById(`meta-${key}`);
             if (metaEl) {
                 let upstreamUA = fileData.upstream_user_agent || "VLC/3.0.20 LibVLC/3.0.20";
@@ -1945,6 +1998,7 @@
                             <div class="download-controls">
                                 <div class="download-badge" id="badge-${file.key}">0.0%</div>
                                 <div class="download-speed-badge" id="speed-badge-${file.key}">0 B/s</div>
+                                <button class="add-worker-btn" id="add-worker-btn-${file.key}" onclick="addHydrationWorker('${file.key}')" title="Spawn an extra worker at the midpoint of the largest remaining gap">+ Worker</button>
                                 <button class="cancel-hydration-btn" onclick="cancelHydration('${file.key}')" title="Cancel this in-progress hydration">Cancel Hydration</button>
                             </div>
                         </div>
@@ -1966,12 +2020,47 @@
             });
         }
 
-        async function cancelHydration(key) {
-            if (!confirm("Are you sure you want to cancel this hydration and stop downloading?")) {
-                return;
+        async function addHydrationWorker(key) {
+            const btn = document.getElementById(`add-worker-btn-${key}`);
+            if (btn) {
+                btn.dataset.pending = '1';
+                btn.disabled = true;
             }
             try {
-                const response = await fetch(`/api/hydration/cancel?key=${encodeURIComponent(key)}`, {
+                const response = await fetch(`/api/hydration/add-worker?key=${encodeURIComponent(key)}`, {
+                    method: 'POST'
+                });
+                if (response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    const midStr = (data && data.midpoint !== undefined) ? ` at ${formatBytes(data.midpoint)}` : '';
+                    appendLog(`\n[Admin] Spawned additional worker for ${key}${midStr}`);
+                } else {
+                    const text = await response.text();
+                    alert(`Cannot add worker: ${text}`);
+                }
+            } catch (e) {
+                console.error("Error adding worker:", e);
+                alert(`Error adding worker: ${e.message}`);
+            } finally {
+                if (btn) {
+                    delete btn.dataset.pending;
+                    updateFileBadgeAndMeta(key);
+                }
+            }
+        }
+
+        async function cancelHydration(key) {
+            const fileData = fileStore[key];
+            const activeClients = (fileData && fileData.active_clients) ? fileData.active_clients : 0;
+            let forceQuery = '';
+            if (activeClients > 0) {
+                if (!confirm(`Warning: ${activeClients} active viewer(s) are currently streaming this file. Cancelling this hydration will interrupt playback and stop downloading. Continue?`)) {
+                    return;
+                }
+                forceQuery = '&force=true';
+            }
+            try {
+                const response = await fetch(`/api/hydration/cancel?key=${encodeURIComponent(key)}${forceQuery}`, {
                     method: 'POST'
                 });
                 if (response.ok) {

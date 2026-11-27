@@ -477,6 +477,16 @@ func (m *ScratchChunkManager) IsChunkUploaded(chunkIndex int) bool {
 	return m.uploaded[chunkIndex]
 }
 
+// AllChunksUploaded returns true when all expected multipart chunks have been pushed to the target.
+func (m *ScratchChunkManager) AllChunksUploaded() bool {
+	if m == nil || !m.isMultipart || m.totalParts <= 0 {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.uploaded) >= m.totalParts
+}
+
 // SetTrackDiskFlushes controls whether CheckAndTriggerUploads gates on DiskRangeSet
 // (bytes flushed to disk by WritebackPipeline) vs RangeSet.
 func (m *ScratchChunkManager) SetTrackDiskFlushes(enabled bool) {
@@ -1078,6 +1088,11 @@ func (m *ScratchChunkManager) AttemptRecompose() {
 				float64(m.totalSize)/(1024*1024), targetName, m.key)
 		} else {
 			log.Printf("[ScratchChunkManager] All %d chunks pushed to %s. Starting final commit for %s...", m.totalParts, targetName, m.key)
+			if targetName == "s3" && m.AllChunksUploaded() {
+				if idx := getGlobalCacheIndex(); idx != nil {
+					idx.RecordPendingRecompose(m.key, meta, m.chunkSize, m.totalParts, false)
+				}
+			}
 		}
 
 		err := m.target.Commit(m.ctx, m.key, m.isMultipart, m.totalParts, m.state.PartPath, meta, m.setCommitProgress)

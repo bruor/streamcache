@@ -21,33 +21,44 @@ const (
 // CacheIndexEntry stores persistent unified metadata and aging timestamps for a cached asset
 // across L1 disk ("disk"), L2 S3 ("s3"), or both ("both").
 type CacheIndexEntry struct {
-	Key           string `json:"key"`
-	URL           string `json:"url,omitempty"`
-	Size          int64  `json:"size"`
-	Tier          string `json:"tier,omitempty"` // "disk", "s3", or "both"
-	ContentType   string `json:"content_type,omitempty"`
-	ETag          string `json:"etag,omitempty"`
-	LastModified  string `json:"last_modified,omitempty"`
-	CreatedAt     int64  `json:"created_at"`
-	LastValidated int64  `json:"last_validated,omitempty"`
-	LastAccessed  int64  `json:"last_accessed"`
+	Key                  string `json:"key"`
+	URL                  string `json:"url,omitempty"`
+	Size                 int64  `json:"size"`
+	Tier                 string `json:"tier,omitempty"` // "disk", "s3", or "both"
+	ContentType          string `json:"content_type,omitempty"`
+	ETag                 string `json:"etag,omitempty"`
+	LastModified         string `json:"last_modified,omitempty"`
+	CreatedAt            int64  `json:"created_at"`
+	LastValidated        int64  `json:"last_validated,omitempty"`
+	LastAccessed         int64  `json:"last_accessed"`
+	PendingRecompose     bool   `json:"pending_recompose,omitempty"`
+	ChunkSize            int64  `json:"chunk_size,omitempty"`
+	TotalParts           int    `json:"total_parts,omitempty"`
+	RecomposeAttempts    int    `json:"recompose_attempts,omitempty"`
+	LastRecomposeAttempt int64  `json:"last_recompose_attempt,omitempty"`
 }
 
 // S3IndexEntry preserves backwards-compatible naming for legacy callers/tests.
 type S3IndexEntry = CacheIndexEntry
 
+const (
+	pendingRecomposeRetention = 7 * 24 * time.Hour
+)
+
 // CacheIndex tracks local aging and validation metadata across persistent tiers and sweeps idle objects.
 type CacheIndex struct {
-	mu         sync.Mutex
-	saveMu     sync.Mutex
-	indexPath  string
-	entries    map[string]*CacheIndexEntry
-	dirty      bool
-	nowFn      func() time.Time
-	stopCh     chan struct{}
-	stopOnce   sync.Once
-	loopCancel context.CancelFunc
-	wg         sync.WaitGroup
+	mu                sync.Mutex
+	saveMu            sync.Mutex
+	indexPath         string
+	entries           map[string]*CacheIndexEntry
+	dirty             bool
+	nowFn             func() time.Time
+	stopCh            chan struct{}
+	stopOnce          sync.Once
+	loopCancel        context.CancelFunc
+	recomposeTrigger  chan struct{}
+	recomposeInFlight map[string]bool
+	wg                sync.WaitGroup
 }
 
 // S3AccessIndex preserves backwards-compatible naming for legacy callers/tests.
@@ -69,10 +80,12 @@ func getGlobalCacheIndex() *CacheIndex {
 // NewCacheIndex constructs a unified CacheIndex persisted at indexPath.
 func NewCacheIndex(indexPath string) *CacheIndex {
 	return &CacheIndex{
-		indexPath: indexPath,
-		entries:   make(map[string]*CacheIndexEntry),
-		nowFn:     time.Now,
-		stopCh:    make(chan struct{}),
+		indexPath:         indexPath,
+		entries:           make(map[string]*CacheIndexEntry),
+		nowFn:             time.Now,
+		stopCh:            make(chan struct{}),
+		recomposeTrigger:  make(chan struct{}, 1),
+		recomposeInFlight: make(map[string]bool),
 	}
 }
 
@@ -225,10 +238,129 @@ func (idx *CacheIndex) RecordCommitForTier(key string, meta FileMeta, tier strin
 	}
 	e.LastAccessed = nowUnix
 	e.Tier = mergeIndexTier(e.Tier, tier)
+	if tier == IndexTierS3 || tier == IndexTierBoth {
+		e.PendingRecompose = false
+		e.ChunkSize = 0
+		e.TotalParts = 0
+		e.RecomposeAttempts = 0
+		e.LastRecomposeAttempt = 0
+	}
 	idx.dirty = true
 	idx.mu.Unlock()
 
 	_ = idx.Flush()
+}
+
+// RecordPendingRecompose records an asset whose chunks are 100% uploaded to S3 but not yet
+// sealed into vod/<key>, persisting it so chunked Cache HITs and background retries survive failures/restarts.
+func (idx *CacheIndex) RecordPendingRecompose(key string, meta FileMeta, chunkSize int64, totalParts int, recordAttempt bool) {
+	if idx == nil || key == "" || chunkSize <= 0 || totalParts <= 0 {
+		return
+	}
+	nowUnix := idx.now().Unix()
+
+	idx.mu.Lock()
+	e, ok := idx.entries[key]
+	if !ok {
+		e = &CacheIndexEntry{
+			Key:       key,
+			CreatedAt: nowUnix,
+		}
+		idx.entries[key] = e
+	}
+	if meta.URL != "" {
+		e.URL = meta.URL
+	}
+	if meta.TotalSize > 0 {
+		e.Size = meta.TotalSize
+	}
+	if meta.ContentType != "" {
+		e.ContentType = meta.ContentType
+	}
+	if meta.ETag != "" {
+		e.ETag = meta.ETag
+	}
+	if meta.LastModified != "" {
+		e.LastModified = meta.LastModified
+	}
+	if meta.LastValidated > 0 {
+		e.LastValidated = meta.LastValidated
+	} else if e.LastValidated == 0 {
+		e.LastValidated = nowUnix
+	}
+	if e.CreatedAt == 0 {
+		e.CreatedAt = nowUnix
+	}
+	if e.LastAccessed == 0 {
+		e.LastAccessed = nowUnix
+	}
+	// Do not promote Tier to "s3" until vod/<key> is actually sealed.
+	e.PendingRecompose = true
+	e.ChunkSize = chunkSize
+	e.TotalParts = totalParts
+	if recordAttempt {
+		e.RecomposeAttempts++
+		e.LastRecomposeAttempt = nowUnix
+	}
+	idx.dirty = true
+	idx.mu.Unlock()
+
+	_ = idx.Flush()
+}
+
+// ClearPendingRecompose removes a pending-recompose state (deleting the entry if it is not backed on disk/S3).
+func (idx *CacheIndex) ClearPendingRecompose(key string) {
+	if idx == nil || key == "" {
+		return
+	}
+	idx.mu.Lock()
+	e, ok := idx.entries[key]
+	changed := false
+	if ok && e.PendingRecompose {
+		e.PendingRecompose = false
+		e.ChunkSize = 0
+		e.TotalParts = 0
+		e.RecomposeAttempts = 0
+		e.LastRecomposeAttempt = 0
+		if e.Tier == "" {
+			delete(idx.entries, key)
+		}
+		idx.dirty = true
+		changed = true
+	}
+	idx.mu.Unlock()
+	if changed {
+		_ = idx.Flush()
+	}
+}
+
+// IsPendingRecompose reports whether key has uploaded S3 chunks awaiting recomposition within retention.
+func (idx *CacheIndex) IsPendingRecompose(key string) bool {
+	if idx == nil || key == "" {
+		return false
+	}
+	now := idx.now()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	e, ok := idx.entries[key]
+	if !ok || e == nil || !e.PendingRecompose {
+		return false
+	}
+	if e.CreatedAt > 0 && now.Sub(time.Unix(e.CreatedAt, 0)) >= pendingRecomposeRetention {
+		return false
+	}
+	return true
+}
+
+// TriggerPendingRecompose wakes the background pending-recompose worker (e.g. after S3 recovery).
+func (idx *CacheIndex) TriggerPendingRecompose() {
+	if idx == nil || idx.recomposeTrigger == nil {
+		return
+	}
+	select {
+	case idx.recomposeTrigger <- struct{}{}:
+	default:
+	}
 }
 
 // RecordAccess refreshes LastAccessed on real playback (preserving existing tier or defaulting to S3).
@@ -256,13 +388,13 @@ func (idx *CacheIndex) RecordAccessForTier(key, targetURL string, size int64, ti
 			CreatedAt: nowUnix,
 		}
 		idx.entries[key] = e
-	} else if tier != "" {
+	} else if !e.PendingRecompose && tier != "" {
 		merged := mergeIndexTier(e.Tier, tier)
 		if merged != e.Tier {
 			e.Tier = merged
 			idx.dirty = true
 		}
-	} else if e.Tier == "" {
+	} else if !e.PendingRecompose && e.Tier == "" {
 		e.Tier = IndexTierS3
 		idx.dirty = true
 	}
@@ -302,7 +434,7 @@ func (idx *CacheIndex) RecordValidation(key string, meta FileMeta, tier string) 
 			LastAccessed: lastAcc,
 		}
 		idx.entries[key] = e
-	} else if tier != "" {
+	} else if !e.PendingRecompose && tier != "" {
 		e.Tier = mergeIndexTier(e.Tier, tier)
 	}
 	if meta.URL != "" {
@@ -517,6 +649,9 @@ func (idx *CacheIndex) StatsByTier() (diskCount int, diskBytes int64, s3Count in
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	for _, e := range idx.entries {
+		if e.PendingRecompose && e.Tier == "" {
+			continue
+		}
 		switch e.Tier {
 		case IndexTierDisk:
 			diskCount++
@@ -692,6 +827,14 @@ func (idx *CacheIndex) Reconcile(ctx context.Context, storage StorageBackend) er
 				e.Tier = obs.tier
 				updated++
 			}
+			if e.PendingRecompose && (obs.tier == IndexTierS3 || obs.tier == IndexTierBoth) {
+				e.PendingRecompose = false
+				e.ChunkSize = 0
+				e.TotalParts = 0
+				e.RecomposeAttempts = 0
+				e.LastRecomposeAttempt = 0
+				updated++
+			}
 			if obs.localMeta != nil {
 				if e.URL == "" && obs.localMeta.URL != "" {
 					e.URL = obs.localMeta.URL
@@ -713,8 +856,11 @@ func (idx *CacheIndex) Reconcile(ctx context.Context, storage StorageBackend) er
 		}
 	}
 
-	for key := range idx.entries {
+	for key, e := range idx.entries {
 		if _, ok := live[key]; !ok {
+			if e != nil && e.PendingRecompose {
+				continue
+			}
 			delete(idx.entries, key)
 			removed++
 		}
@@ -751,6 +897,9 @@ func (idx *CacheIndex) SweepExpired(ctx context.Context, storage StorageBackend,
 	idx.mu.Lock()
 	var candidates []CacheIndexEntry
 	for _, e := range idx.entries {
+		if e.PendingRecompose {
+			continue
+		}
 		idle := now.Sub(time.Unix(e.LastAccessed, 0))
 		if idle >= maxIdleAge {
 			candidates = append(candidates, *e)
@@ -824,7 +973,143 @@ func (idx *CacheIndex) SweepExpired(ctx context.Context, storage StorageBackend,
 	return evicted, freedBytes
 }
 
-// StartBackgroundLoops starts periodic flushing and idle-age S3 sweeping.
+// ProcessPendingRecomposes retries sealing any PendingRecompose entries whose chunks remain in S3.
+// If bypassBackoff is true (e.g. on S3 recovery or startup), eligible entries are retried immediately.
+func (idx *CacheIndex) ProcessPendingRecomposes(ctx context.Context, storage StorageBackend, registry *CacheRegistry, bypassBackoff bool) int {
+	if idx == nil || storage == nil || !IsS3Healthy() {
+		return 0
+	}
+	s3b := extractS3Backend(storage)
+	if s3b == nil {
+		return 0
+	}
+
+	now := idx.now()
+	idx.mu.Lock()
+	var due []CacheIndexEntry
+	for _, e := range idx.entries {
+		if e == nil || !e.PendingRecompose || e.TotalParts <= 0 || e.ChunkSize <= 0 {
+			continue
+		}
+		if idx.recomposeInFlight != nil && idx.recomposeInFlight[e.Key] {
+			continue
+		}
+		if !bypassBackoff && e.LastRecomposeAttempt > 0 {
+			shift := e.RecomposeAttempts - 1
+			if shift < 0 {
+				shift = 0
+			}
+			if shift > 4 {
+				shift = 4
+			}
+			backoff := time.Minute << shift // 1m, 2m, 4m, 8m, 16m
+			if backoff > 15*time.Minute {
+				backoff = 15 * time.Minute
+			}
+			if now.Sub(time.Unix(e.LastRecomposeAttempt, 0)) < backoff {
+				continue
+			}
+		}
+		due = append(due, *e)
+	}
+	idx.mu.Unlock()
+
+	if len(due) == 0 {
+		return 0
+	}
+
+	sealed := 0
+	for _, entry := range due {
+		if ctx.Err() != nil || !IsS3Healthy() {
+			break
+		}
+		if registry != nil {
+			registry.Lock.RLock()
+			fs, exists := registry.Files[entry.Key]
+			registry.Lock.RUnlock()
+			if exists && fs != nil {
+				fs.Lock.Lock()
+				committing := fs.IsCommitting
+				writerActive := fs.WriterActive
+				fs.Lock.Unlock()
+				if committing || writerActive {
+					continue
+				}
+			}
+		}
+
+		idx.mu.Lock()
+		if idx.recomposeInFlight == nil {
+			idx.recomposeInFlight = make(map[string]bool)
+		}
+		if idx.recomposeInFlight[entry.Key] {
+			idx.mu.Unlock()
+			continue
+		}
+		idx.recomposeInFlight[entry.Key] = true
+		idx.mu.Unlock()
+
+		meta := FileMeta{
+			URL:           entry.URL,
+			TotalSize:     entry.Size,
+			ContentType:   entry.ContentType,
+			ETag:          entry.ETag,
+			LastModified:  entry.LastModified,
+			LastValidated: entry.LastValidated,
+			Completed:     true,
+		}
+		if meta.LastValidated == 0 {
+			meta.LastValidated = idx.now().Unix()
+		}
+
+		// 1. Check if vod/<key> was already sealed by a previous attempt that timed out late.
+		if existsMono, err := s3b.HasMonolithic(ctx, entry.Key); err == nil && existsMono {
+			idx.RecordCommitForTier(entry.Key, meta, IndexTierS3)
+			delCtx, delCancel := context.WithTimeout(ctx, 30*time.Second)
+			_ = s3b.DeleteChunks(delCtx, entry.Key)
+			delCancel()
+			sealed++
+			log.Printf("[PendingRecompose] Monolithic vod/%s already existed; cleared pending state and cleaned up staging chunks", entry.Key)
+			idx.mu.Lock()
+			delete(idx.recomposeInFlight, entry.Key)
+			idx.mu.Unlock()
+			continue
+		}
+
+		// 2. Retry server-side Recompose from existing S3 chunks.
+		log.Printf("[PendingRecompose] Retrying S3 recomposition for %s (%d parts, attempt #%d)...", entry.Key, entry.TotalParts, entry.RecomposeAttempts+1)
+		recompErr := s3b.Recompose(ctx, entry.Key, entry.TotalParts, meta)
+
+		idx.mu.Lock()
+		delete(idx.recomposeInFlight, entry.Key)
+		idx.mu.Unlock()
+
+		if recompErr == nil {
+			idx.RecordCommitForTier(entry.Key, meta, IndexTierS3)
+			sealed++
+			log.Printf("[PendingRecompose] Successfully sealed vod/%s on retry", entry.Key)
+			if GlobalLogBroker != nil {
+				go GlobalLogBroker.BroadcastStateUpdate()
+			}
+			continue
+		}
+
+		if isS3NotFoundError(recompErr) {
+			log.Printf("[PendingRecompose] Permanent missing chunk for %s (%v); clearing pending entry and cleaning up remaining chunks", entry.Key, recompErr)
+			idx.ClearPendingRecompose(entry.Key)
+			delCtx, delCancel := context.WithTimeout(ctx, 30*time.Second)
+			_ = s3b.DeleteChunks(delCtx, entry.Key)
+			delCancel()
+			continue
+		}
+
+		log.Printf("[PendingRecompose] Retry failed for %s: %v (will retry with backoff)", entry.Key, recompErr)
+		idx.RecordPendingRecompose(entry.Key, meta, entry.ChunkSize, entry.TotalParts, true)
+	}
+	return sealed
+}
+
+// StartBackgroundLoops starts periodic flushing, idle-age S3 sweeping, and pending-recompose retries.
 func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry *CacheRegistry) {
 	if idx == nil || storage == nil {
 		return
@@ -870,7 +1155,40 @@ func (idx *S3AccessIndex) StartBackgroundLoops(storage StorageBackend, registry 
 			log.Printf("[S3Index] Initial reconcile failed: %v", err)
 		}
 		sweepStale(ctx)
+		idx.TriggerPendingRecompose()
 	}()
+
+	// Periodic & recovery-triggered pending-recompose retry worker
+	if extractS3Backend(storage) != nil {
+		idx.wg.Add(1)
+		go func() {
+			defer idx.wg.Done()
+			retryTicker := time.NewTicker(60 * time.Second)
+			defer retryTicker.Stop()
+			for {
+				select {
+				case <-idx.stopCh:
+					return
+				case <-idx.recomposeTrigger:
+					recompTimeout := 30 * time.Minute
+					if cfg != nil && cfg.GetS3Config().RecomposeTimeout > 0 {
+						recompTimeout = cfg.GetS3Config().RecomposeTimeout
+					}
+					ctx, cancel := context.WithTimeout(loopCtx, recompTimeout)
+					idx.ProcessPendingRecomposes(ctx, storage, registry, true)
+					cancel()
+				case <-retryTicker.C:
+					recompTimeout := 30 * time.Minute
+					if cfg != nil && cfg.GetS3Config().RecomposeTimeout > 0 {
+						recompTimeout = cfg.GetS3Config().RecomposeTimeout
+					}
+					ctx, cancel := context.WithTimeout(loopCtx, recompTimeout)
+					idx.ProcessPendingRecomposes(ctx, storage, registry, false)
+					cancel()
+				}
+			}
+		}()
+	}
 
 	// Periodic metadata flush for playback touches
 	idx.wg.Add(1)

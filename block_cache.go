@@ -87,9 +87,10 @@ type FileCacheState struct {
 	Clients            map[string]chan struct{}
 	Starving           map[string]int64 // Map of clientID -> starving byte offset
 	StarvingSince      map[string]time.Time // Map of clientID -> when starvation began
-	File               *os.File         // Open handle to writing file
-	NotifyChan         chan struct{}    // Channel to wake coordinator on client starvation
-	BytesDownloadedSec int64
+	File                *os.File         // Open handle to writing file
+	NotifyChan          chan struct{}    // Channel to wake coordinator on client starvation
+	ManualAddWorkerChan chan struct{}    // Channel to request an explicit manual worker spawn
+	BytesDownloadedSec  int64
 	TotalBytesDownloaded int64
 	HydrationStartTime   int64
 	DownloadSpeed        int64
@@ -152,6 +153,7 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 		StarvingSince:             make(map[string]time.Time),
 		ClientOffsets:             make(map[string]int64),
 		NotifyChan:                make(chan struct{}, 20),
+		ManualAddWorkerChan:       make(chan struct{}, 1),
 		UpstreamStatus:            "Idle",
 		PendingTailPrefetchOffset: -1,
 		LiveBuffer:                NewLiveBuffer(bufSize),

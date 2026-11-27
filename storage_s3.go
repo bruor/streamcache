@@ -286,6 +286,27 @@ func (b *S3StorageBackend) Ping(ctx context.Context) error {
 	return recordS3Outcome(err)
 }
 
+// HasMonolithic checks whether the sealed monolithic vod/<key> object exists in S3.
+func (b *S3StorageBackend) HasMonolithic(ctx context.Context, key string) (bool, error) {
+	targetKey := b.monolithicKey(key)
+	callCtx, cancel := withBoundedTimeout(ctx, b.controlTimeout())
+	defer cancel()
+	_, err := b.client.HeadObject(callCtx, &s3.HeadObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(targetKey),
+	})
+	if err != nil {
+		if isS3NotFoundError(err) {
+			RecordS3Success()
+			return false, nil
+		}
+		RecordS3Failure(err)
+		return false, err
+	}
+	RecordS3Success()
+	return true, nil
+}
+
 func (b *S3StorageBackend) StatWithTier(ctx context.Context, key string) (*FileMeta, StorageTier, bool, error) {
 	targetKey := b.monolithicKey(key)
 	callCtx, cancel := withBoundedTimeout(ctx, b.controlTimeout())
@@ -297,6 +318,27 @@ func (b *S3StorageBackend) StatWithTier(ctx context.Context, key string) (*FileM
 	if err != nil {
 		if isS3NotFoundError(err) {
 			RecordS3Success()
+			if idx := getGlobalCacheIndex(); idx != nil {
+				if entry, ok := idx.Get(key); ok && entry.PendingRecompose && entry.ChunkSize > 0 && entry.TotalParts > 0 && entry.Size > 0 {
+					hasChunk0, herr := b.HasChunk(ctx, key, 0)
+					if herr != nil {
+						return nil, "", false, herr
+					}
+					if hasChunk0 {
+						meta := FileMeta{
+							URL:           entry.URL,
+							TotalSize:     entry.Size,
+							ContentType:   entry.ContentType,
+							ETag:          entry.ETag,
+							LastModified:  entry.LastModified,
+							LastValidated: entry.LastValidated,
+							Completed:     true,
+						}
+						return &meta, TierS3, true, nil
+					}
+					idx.ClearPendingRecompose(key)
+				}
+			}
 			return nil, "", false, nil
 		}
 		RecordS3Failure(err)
@@ -535,15 +577,29 @@ func (b *S3StorageBackend) Open(ctx context.Context, key string) (StorageReadSee
 	if !exists {
 		return nil, os.ErrNotExist
 	}
-	return b.openKnownSize(ctx, key, meta.TotalSize), nil
+	return b.openForKey(ctx, key, meta.TotalSize), nil
 }
 
-// OpenWithMeta opens an s3ReadSeeker without issuing a HeadObject call when meta.TotalSize is already known.
+// OpenWithMeta opens an S3 reader without issuing a HeadObject call when meta.TotalSize is already known,
+// routing PendingRecompose assets through s3ChunkReadSeeker so Cache HITs serve from chunks/<key>/.
 func (b *S3StorageBackend) OpenWithMeta(ctx context.Context, key string, meta *FileMeta, _ StorageTier) (StorageReadSeeker, error) {
 	if meta != nil && meta.TotalSize > 0 {
-		return b.openKnownSize(ctx, key, meta.TotalSize), nil
+		return b.openForKey(ctx, key, meta.TotalSize), nil
 	}
 	return b.Open(ctx, key)
+}
+
+func (b *S3StorageBackend) openForKey(ctx context.Context, key string, totalSize int64) StorageReadSeeker {
+	if idx := getGlobalCacheIndex(); idx != nil {
+		if entry, ok := idx.Get(key); ok && entry.PendingRecompose && entry.ChunkSize > 0 && entry.TotalParts > 0 {
+			size := totalSize
+			if size <= 0 {
+				size = entry.Size
+			}
+			return b.openChunked(ctx, key, size, entry.ChunkSize)
+		}
+	}
+	return b.openKnownSize(ctx, key, totalSize)
 }
 
 func (b *S3StorageBackend) openKnownSize(ctx context.Context, key string, totalSize int64) StorageReadSeeker {
@@ -561,6 +617,276 @@ func (b *S3StorageBackend) openKnownSize(ctx context.Context, key string, totalS
 		ctx:       readerCtx,
 		cancel:    cancel,
 	}
+}
+
+type s3ChunkReadSeeker struct {
+	backend   *S3StorageBackend
+	key       string
+	totalSize int64
+	chunkSize int64
+	offset    int64
+	ctx       context.Context
+	cancel    context.CancelFunc
+
+	mu        sync.Mutex
+	buf       []byte
+	bufOffset int64
+	mono      *s3ReadSeeker
+}
+
+func (b *S3StorageBackend) openChunked(ctx context.Context, key string, totalSize, chunkSize int64) StorageReadSeeker {
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	readerCtx, cancel := context.WithCancel(baseCtx)
+
+	return &s3ChunkReadSeeker{
+		backend:   b,
+		key:       key,
+		totalSize: totalSize,
+		chunkSize: chunkSize,
+		ctx:       readerCtx,
+		cancel:    cancel,
+	}
+}
+
+func (r *s3ChunkReadSeeker) Size() int64 {
+	return r.totalSize
+}
+
+func (r *s3ChunkReadSeeker) Tier() StorageTier {
+	return TierS3
+}
+
+func (r *s3ChunkReadSeeker) Close() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
+	r.mu.Lock()
+	mono := r.mono
+	r.mono = nil
+	r.buf = nil
+	r.mu.Unlock()
+	if mono != nil {
+		return mono.Close()
+	}
+	return nil
+}
+
+func (r *s3ChunkReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var newOffset int64
+	switch whence {
+	case io.SeekStart:
+		newOffset = offset
+	case io.SeekCurrent:
+		newOffset = r.offset + offset
+	case io.SeekEnd:
+		newOffset = r.totalSize + offset
+	default:
+		return 0, errors.New("invalid whence")
+	}
+
+	if newOffset < 0 {
+		return 0, errors.New("negative offset")
+	}
+	r.offset = newOffset
+	if r.mono != nil {
+		_, _ = r.mono.Seek(newOffset, io.SeekStart)
+	}
+	return r.offset, nil
+}
+
+func (r *s3ChunkReadSeeker) contextErr() error {
+	if r.ctx != nil {
+		return r.ctx.Err()
+	}
+	return nil
+}
+
+func (r *s3ChunkReadSeeker) switchToMonolithicLocked() *s3ReadSeeker {
+	if r.mono == nil {
+		r.mono = &s3ReadSeeker{
+			client:    r.backend.client,
+			bucket:    r.backend.bucket,
+			key:       r.backend.monolithicKey(r.key),
+			totalSize: r.totalSize,
+			offset:    r.offset,
+			ctx:       r.ctx,
+		}
+		r.buf = nil
+	}
+	return r.mono
+}
+
+func (r *s3ChunkReadSeeker) fetchWindowLocked(off, toRead int64) error {
+	if r.mono != nil {
+		return nil
+	}
+	baseCtx := r.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	if err := baseCtx.Err(); err != nil {
+		return err
+	}
+
+	chunkIdx := int(off / r.chunkSize)
+	chunkStart := int64(chunkIdx) * r.chunkSize
+	chunkEnd := chunkStart + r.chunkSize
+	if r.totalSize > 0 && chunkEnd > r.totalSize {
+		chunkEnd = r.totalSize
+	}
+	offsetInChunk := off - chunkStart
+
+	fetchSize := int64(defaultS3ReadAheadSize)
+	if toRead > fetchSize {
+		fetchSize = toRead
+	}
+	if off+fetchSize > chunkEnd {
+		fetchSize = chunkEnd - off
+	}
+	if fetchSize <= 0 {
+		return io.EOF
+	}
+
+	reqCtx, cancel := context.WithTimeout(baseCtx, s3ReadRequestTimeout)
+	defer cancel()
+
+	rc, err := r.backend.OpenChunkRange(reqCtx, r.key, chunkIdx, offsetInChunk, fetchSize)
+	if err != nil {
+		if isS3NotFoundError(err) {
+			r.switchToMonolithicLocked()
+			return nil
+		}
+		return err
+	}
+	defer rc.Close()
+
+	buf, rerr := io.ReadAll(rc)
+	if rerr != nil && rerr != io.EOF {
+		return recordS3Outcome(rerr)
+	}
+	RecordS3Success()
+
+	r.buf = buf
+	r.bufOffset = off
+	return nil
+}
+
+func (r *s3ChunkReadSeeker) Read(p []byte) (int, error) {
+	if err := r.contextErr(); err != nil {
+		return 0, err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := r.contextErr(); err != nil {
+		return 0, err
+	}
+	if r.offset >= r.totalSize {
+		return 0, io.EOF
+	}
+	if r.mono != nil {
+		_, _ = r.mono.Seek(r.offset, io.SeekStart)
+		n, err := r.mono.Read(p)
+		r.offset += int64(n)
+		return n, err
+	}
+
+	toRead := int64(len(p))
+	if r.offset+toRead > r.totalSize {
+		toRead = r.totalSize - r.offset
+	}
+
+	bufEnd := r.bufOffset + int64(len(r.buf))
+	if r.buf == nil || r.offset < r.bufOffset || r.offset >= bufEnd {
+		if err := r.fetchWindowLocked(r.offset, toRead); err != nil {
+			return 0, err
+		}
+		if r.mono != nil {
+			_, _ = r.mono.Seek(r.offset, io.SeekStart)
+			n, err := r.mono.Read(p)
+			r.offset += int64(n)
+			return n, err
+		}
+	}
+
+	relStart := r.offset - r.bufOffset
+	avail := int64(len(r.buf)) - relStart
+	if avail <= 0 {
+		return 0, io.EOF
+	}
+	n := toRead
+	if n > avail {
+		n = avail
+	}
+	copy(p[:n], r.buf[relStart:relStart+n])
+	r.offset += n
+	return int(n), nil
+}
+
+func (r *s3ChunkReadSeeker) ReadAt(p []byte, off int64) (int, error) {
+	if err := r.contextErr(); err != nil {
+		return 0, err
+	}
+	if off < 0 {
+		return 0, errors.New("negative offset")
+	}
+	if off >= r.totalSize {
+		return 0, io.EOF
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := r.contextErr(); err != nil {
+		return 0, err
+	}
+
+	totalRead := 0
+	curOff := off
+	want := len(p)
+	if off+int64(want) > r.totalSize {
+		want = int(r.totalSize - off)
+	}
+
+	for totalRead < want {
+		if r.mono != nil {
+			n, err := r.mono.ReadAt(p[totalRead:want], curOff)
+			totalRead += n
+			return totalRead, err
+		}
+
+		rem := int64(want - totalRead)
+		bufEnd := r.bufOffset + int64(len(r.buf))
+		if r.buf == nil || curOff < r.bufOffset || curOff >= bufEnd {
+			if err := r.fetchWindowLocked(curOff, rem); err != nil {
+				return totalRead, err
+			}
+			if r.mono != nil {
+				continue
+			}
+		}
+
+		relStart := curOff - r.bufOffset
+		avail := int64(len(r.buf)) - relStart
+		if avail <= 0 {
+			return totalRead, io.ErrUnexpectedEOF
+		}
+		n := rem
+		if n > avail {
+			n = avail
+		}
+		copy(p[totalRead:totalRead+int(n)], r.buf[relStart:relStart+n])
+		totalRead += int(n)
+		curOff += n
+	}
+	return totalRead, nil
 }
 
 func (b *S3StorageBackend) OpenRange(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
@@ -1232,6 +1558,9 @@ func (b *S3StorageBackend) SweepStaleChunks(ctx context.Context, maxAge time.Dur
 			if idx := strings.LastIndex(rel, "/chunk_"); idx > 0 {
 				assetKey := rel[:idx]
 				if GlobalRegistry != nil && GlobalRegistry.IsKeyInUse(assetKey) {
+					continue
+				}
+				if cacheIdx := getGlobalCacheIndex(); cacheIdx != nil && cacheIdx.IsPendingRecompose(assetKey) {
 					continue
 				}
 			}

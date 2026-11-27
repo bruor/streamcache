@@ -90,6 +90,7 @@ func StartServer() {
 	mux.HandleFunc("/dashboard/sse", handleSSE)
 	mux.HandleFunc("/api/version", handleAPIVersion)
 	mux.HandleFunc("/api/hydration/cancel", handleCancelHydration)
+	mux.HandleFunc("/api/hydration/add-worker", handleAddWorker)
 	mux.HandleFunc("/api/sessions", handleAPISessions)
 
 	// Live Diagnostics Suite
@@ -615,6 +616,23 @@ func getCacheKeyAndExt(targetURL string) (string, string) {
 	return key, ext
 }
 
+func lookupActiveRegistryFile(key string) (*FileCacheState, bool) {
+	if GlobalRegistry == nil || key == "" {
+		return nil, false
+	}
+	GlobalRegistry.Lock.RLock()
+	defer GlobalRegistry.Lock.RUnlock()
+	if fileState, exists := GlobalRegistry.Files[key]; exists && fileState != nil {
+		return fileState, true
+	}
+	for k, f := range GlobalRegistry.Files {
+		if f != nil && (k == key || strings.HasPrefix(k, key+".") || strings.TrimSuffix(k, filepath.Ext(k)) == key) {
+			return f, true
+		}
+	}
+	return nil, false
+}
+
 func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -622,12 +640,22 @@ func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := r.URL.Query().Get("key")
-	if key == "" {
+	forceParam := r.URL.Query().Get("force")
+	force := strings.EqualFold(forceParam, "true") || forceParam == "1"
+	if key == "" || !force {
 		var body struct {
-			Key string `json:"key"`
+			Key   string `json:"key"`
+			Force bool   `json:"force"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
-			key = body.Key
+		if r.Body != nil {
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				if key == "" {
+					key = body.Key
+				}
+				if body.Force {
+					force = true
+				}
+			}
 		}
 	}
 
@@ -636,20 +664,8 @@ func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	GlobalRegistry.Lock.RLock()
-	fileState, exists := GlobalRegistry.Files[key]
+	fileState, exists := lookupActiveRegistryFile(key)
 	if !exists {
-		for k, f := range GlobalRegistry.Files {
-			if k == key || strings.HasPrefix(k, key+".") || strings.TrimSuffix(k, filepath.Ext(k)) == key {
-				fileState = f
-				exists = true
-				break
-			}
-		}
-	}
-	GlobalRegistry.Lock.RUnlock()
-
-	if !exists || fileState == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -660,7 +676,22 @@ func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[Server] Received admin cancel request for hydration: %s", key)
+	fileState.Lock.Lock()
+	activeClients := len(fileState.Clients)
+	fileState.Lock.Unlock()
+	if activeClients > 0 && !force {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        false,
+			"message":        fmt.Sprintf("Hydration has %d active viewer(s); pass force=true to cancel", activeClients),
+			"key":            key,
+			"active_clients": activeClients,
+		})
+		return
+	}
+
+	log.Printf("[Server] Received admin cancel request for hydration: %s (force=%v, active_clients=%d)", key, force, activeClients)
 	CancelCoordinator(fileState)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -669,6 +700,102 @@ func handleCancelHydration(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"message": "Hydration cancelled successfully",
 		"key":     key,
+	})
+}
+
+func handleAddWorker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	if key == "" && r.Body != nil {
+		var body struct {
+			Key string `json:"key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			key = body.Key
+		}
+	}
+	if key == "" {
+		http.Error(w, "Missing 'key' parameter", http.StatusBadRequest)
+		return
+	}
+
+	maxWorkers := 2
+	if GlobalConfig != nil {
+		maxWorkers = GlobalConfig.GetMaxUpstreamWorkers()
+	}
+	if maxWorkers <= 1 {
+		http.Error(w, "MAX_UPSTREAM_WORKERS must be > 1 to add an additional worker", http.StatusConflict)
+		return
+	}
+
+	fileState, exists := lookupActiveRegistryFile(key)
+	if !exists {
+		http.Error(w, "Hydration not active", http.StatusNotFound)
+		return
+	}
+
+	fileState.Lock.Lock()
+	writerActive := fileState.WriterActive
+	isCommitting := fileState.IsCommitting
+	isYielding := fileState.IsYielding
+	isProbe := fileState.IsProbe
+	hasStarving := hasUncoveredStarvingLocked(fileState)
+	isComplete := fileState.RangeSet != nil && fileState.RangeSet.IsComplete(fileState.TotalSize)
+	fileState.Lock.Unlock()
+
+	if !writerActive || isCommitting || isYielding || isProbe || isComplete {
+		http.Error(w, "Hydration is not in an active downloadable state", http.StatusConflict)
+		return
+	}
+	if hasStarving {
+		http.Error(w, "Cannot manually add worker while a player skip event is active", http.StatusConflict)
+		return
+	}
+
+	fileState.WorkersLock.Lock()
+	activeWorkers := len(fileState.ActiveWorkers)
+	fileState.WorkersLock.Unlock()
+	if activeWorkers >= maxWorkers {
+		http.Error(w, fmt.Sprintf("Maximum upstream workers already active (%d/%d)", activeWorkers, maxWorkers), http.StatusConflict)
+		return
+	}
+
+	mid, _, _, ok := findLargestGapMidpoint(fileState)
+	if !ok {
+		http.Error(w, "No remaining gap large enough for an additional worker", http.StatusConflict)
+		return
+	}
+
+	fileState.Lock.Lock()
+	if fileState.ManualAddWorkerChan == nil {
+		fileState.ManualAddWorkerChan = make(chan struct{}, 1)
+	}
+	addCh := fileState.ManualAddWorkerChan
+	notifyCh := fileState.NotifyChan
+	fileState.Lock.Unlock()
+
+	select {
+	case addCh <- struct{}{}:
+	default:
+	}
+	if notifyCh != nil {
+		select {
+		case notifyCh <- struct{}{}:
+		default:
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"message":  "Requested additional upstream worker",
+		"key":      key,
+		"midpoint": mid,
 	})
 }
 

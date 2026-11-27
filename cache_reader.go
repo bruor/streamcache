@@ -324,7 +324,8 @@ func (r *CacheReader) Close() error {
 	tier := r.state.targetTierLocked()
 	cm := r.state.ChunkManager
 	alreadyCommitted := (cm != nil && cm.IsRecomposed()) || (tier == TierDisk && r.state.Path != "" && FileExists(r.state.Path))
-	shouldFinalize := tier != TierTmp && remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommitted
+	pendingRecomposeExit := tier == TierS3 && remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommitted && r.state.UpstreamStatus == "Pending Recompose" && !IsS3Healthy()
+	shouldFinalize := tier != TierTmp && remainingClients == 0 && isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !alreadyCommitted && !pendingRecomposeExit
 	shouldCleanUpTmp := tier == TierTmp && remainingClients == 0 && !isProbe && !r.state.IsCommitting
 	shouldCleanUpIncomplete := tier != TierTmp && remainingClients == 0 && !isCompleted && !r.state.WriterActive && !r.state.IsCommitting && !isPrehydrating && (!HasHealthyPersistentTier(GlobalConfig, GlobalStorage) || (GlobalConfig != nil && GlobalConfig.GetEvictYieldedParts()))
 
@@ -367,7 +368,7 @@ func (r *CacheReader) Close() error {
 			cmToClose = r.state.ChunkManager
 			r.state.ChunkManager = nil
 		}
-	} else if remainingClients == 0 && !r.state.WriterActive && !shouldFinalize && shouldCleanUpIncomplete {
+	} else if pendingRecomposeExit || (remainingClients == 0 && !r.state.WriterActive && !shouldFinalize && shouldCleanUpIncomplete) {
 		fileToClose = r.state.File
 		r.state.File = nil
 		pipelineToClose = r.state.Pipeline
@@ -457,6 +458,13 @@ func (r *CacheReader) Close() error {
 			}
 			GlobalRegistry.Lock.Unlock()
 			log.Printf("[Reader] Removed incomplete cache file on last client exit: %s", r.state.Key)
+		} else if pendingRecomposeExit {
+			GlobalRegistry.Lock.Lock()
+			if existingState, exists := GlobalRegistry.Files[r.state.Key]; exists && existingState == r.state {
+				delete(GlobalRegistry.Files, r.state.Key)
+			}
+			GlobalRegistry.Lock.Unlock()
+			log.Printf("[Reader] Released active pending-recompose state on last client exit (chunks retained in S3): %s", r.state.Key)
 		} else if remainingClients == 0 && !isCompleted && !isPrehydrating && tier != TierTmp {
 			// Downshift incomplete hydration to prehydration mode
 			if GlobalPrehydrationManager != nil {
@@ -504,6 +512,13 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (r *CacheReader) readAtAttempt(p []byte, off int64) (n int, retry bool, err error) {
+	r.state.Lock.Lock()
+	_, registered := r.state.Clients[r.clientID]
+	r.state.Lock.Unlock()
+	if !registered {
+		return 0, false, errors.New("client unregistered")
+	}
+
 	r.state.SetClientOffset(r.clientID, off)
 
 	// Wait until at least some bytes are available from `off`
@@ -678,10 +693,12 @@ func (r *CacheReader) readAtAttempt(p []byte, off int64) (n int, retry bool, err
 	if tier == TierS3 {
 		// A. Recomposed Monolithic Object: If all parts have been stitched and sealed, read via s3ReadSeeker
 		isRecomposed := false
-		if cm != nil && cm.IsRecomposed() {
-			isRecomposed = true
+		if cm != nil {
+			isRecomposed = cm.IsRecomposed()
 		} else if !FileExists(r.state.PartPath) && r.state.RangeSet.IsComplete(r.state.TotalSize) {
-			isRecomposed = true
+			if idx := getGlobalCacheIndex(); idx == nil || !idx.IsPendingRecompose(r.state.Key) {
+				isRecomposed = true
+			}
 		}
 
 		if isRecomposed {

@@ -567,10 +567,14 @@ func (m *StorageHealthMonitor) notifyRecovery(tier string) {
 	if d := getGlobalHybridDemoter(); d != nil {
 		d.TriggerWatermarkDemotion()
 	}
+	if tier == "s3" {
+		if idx := getGlobalCacheIndex(); idx != nil {
+			idx.TriggerPendingRecompose()
+		}
+	}
 	if GlobalLogBroker != nil {
 		go GlobalLogBroker.BroadcastStateUpdate()
 	}
-	_ = tier
 }
 
 func (m *StorageHealthMonitor) onOutageTripped() {

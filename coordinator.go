@@ -125,6 +125,15 @@ func CancelCoordinator(state *FileCacheState) {
 	state.IsProbe = false
 	state.coordGen++
 	clientsCount := len(state.Clients)
+	for id, ch := range state.Clients {
+		close(ch)
+		delete(state.Clients, id)
+	}
+	state.Starving = make(map[string]int64)
+	state.StarvingSince = make(map[string]time.Time)
+	if state.ClientOffsets != nil {
+		state.ClientOffsets = make(map[string]int64)
+	}
 	fileToClose := state.File
 	state.File = nil
 	pipelineToClose := state.Pipeline
@@ -390,7 +399,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 		}
 	}
 
-	spawnWorker := func(startOffset int64) {
+	spawnWorkerAt := func(startOffset int64, allowPrehydrateMulti bool) {
 		state.WorkersLock.Lock()
 		defer state.WorkersLock.Unlock()
 
@@ -405,7 +414,7 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 		}
 		state.Lock.Unlock()
 
-		if isPrehydrating && !hasStarving && len(state.ActiveWorkers) >= 1 {
+		if !allowPrehydrateMulti && isPrehydrating && !hasStarving && len(state.ActiveWorkers) >= 1 {
 			return
 		}
 
@@ -454,6 +463,10 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 			defer workersWg.Done()
 			runDownloadWorker(wCtx, w, state, initialHeader, file, pipeline, removeWorker, parentCancel)
 		}()
+	}
+
+	spawnWorker := func(startOffset int64) {
+		spawnWorkerAt(startOffset, false)
 	}
 
 	spawnTailPrefetchWorker := func(startOffset int64) {
@@ -592,6 +605,11 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 
 		select {
 		case <-state.NotifyChan:
+		case <-state.ManualAddWorkerChan:
+			select {
+			case state.ManualAddWorkerChan <- struct{}{}:
+			default:
+			}
 		case <-time.After(500 * time.Millisecond):
 		case <-parentCtx.Done():
 			return
@@ -908,7 +926,112 @@ func runCoordinator(state *FileCacheState, initialHeader http.Header, myGen uint
 				}
 			}
 		}
+
+		// Handle explicit manual +Worker request when under MaxUpstreamWorkers and no skip is pending.
+		manualRequested := false
+		if state.ManualAddWorkerChan != nil {
+			select {
+			case <-state.ManualAddWorkerChan:
+				manualRequested = true
+			default:
+			}
+		}
+		if manualRequested && len(starvingOffsets) == 0 && !state.RangeSet.IsComplete(state.TotalSize) {
+			maxWorkers := GlobalConfig.GetMaxUpstreamWorkers()
+			if maxWorkers > 1 {
+				state.WorkersLock.Lock()
+				curWorkers := len(state.ActiveWorkers)
+				state.WorkersLock.Unlock()
+				if curWorkers < maxWorkers {
+					if mid, gs, ge, ok := findLargestGapMidpoint(state); ok {
+						log.Printf("[Coord] Manual +Worker spawning at midpoint %d of largest remaining gap [%d, %d) (Active: %d/%d)",
+							mid, gs, ge, curWorkers+1, maxWorkers)
+						spawnWorkerAt(mid, true)
+					}
+				}
+			}
+		}
 	}
+}
+
+func hasUncoveredStarvingLocked(state *FileCacheState) bool {
+	if state == nil || state.RangeSet == nil {
+		return false
+	}
+	for _, sb := range state.Starving {
+		if !state.RangeSet.Contains(sb) {
+			return true
+		}
+	}
+	return false
+}
+
+// findLargestGapMidpoint returns the midpoint of the largest un-downloaded gap starting at
+// ringFloorOffset, splitting gaps around active workers' current offsets so a manually added
+// worker never lands on top of an already-advancing worker.
+func findLargestGapMidpoint(state *FileCacheState) (mid int64, gapStart int64, gapEnd int64, ok bool) {
+	if state == nil || state.TotalSize <= 0 || state.RangeSet == nil {
+		return 0, 0, 0, false
+	}
+	floor := state.GetRingFloorOffset()
+	if floor < 0 {
+		floor = 0
+	}
+	if floor >= state.TotalSize {
+		return 0, 0, 0, false
+	}
+
+	type span struct{ start, end int64 }
+	var gaps []span
+	cursor := floor
+	for cursor < state.TotalSize {
+		gs, ge, found := state.RangeSet.FindNextGap(cursor, state.TotalSize)
+		if !found || ge <= gs {
+			break
+		}
+		gaps = append(gaps, span{start: gs, end: ge})
+		cursor = ge
+	}
+	if len(gaps) == 0 {
+		return 0, 0, 0, false
+	}
+
+	state.WorkersLock.Lock()
+	cursors := make([]int64, 0, len(state.ActiveWorkers))
+	for _, w := range state.ActiveWorkers {
+		if w != nil {
+			cursors = append(cursors, atomic.LoadInt64(&w.currentOffset))
+		}
+	}
+	state.WorkersLock.Unlock()
+	sort.Slice(cursors, func(i, j int) bool { return cursors[i] < cursors[j] })
+
+	var bestStart, bestEnd, bestLen int64
+	for _, g := range gaps {
+		s := g.start
+		for _, c := range cursors {
+			if c > s && c < g.end {
+				if c-s > bestLen {
+					bestLen = c - s
+					bestStart, bestEnd = s, c
+				}
+				s = c
+			}
+		}
+		if g.end-s > bestLen {
+			bestLen = g.end - s
+			bestStart, bestEnd = s, g.end
+		}
+	}
+
+	minSplit := int64(2)
+	if state.TotalSize >= 4*1024*1024 {
+		minSplit = 1024 * 1024
+	}
+	if bestLen < minSplit {
+		return 0, 0, 0, false
+	}
+	return bestStart + bestLen/2, bestStart, bestEnd, true
 }
 
 func runDownloadWorker(
@@ -1841,15 +1964,40 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 		}
 		if commitErr != nil {
 			log.Printf("%s S3 commit/recomposition FAILED for %s: %v", logPrefix, state.Key, commitErr)
-			if cm != nil {
-				cm.Close()
-				if IsS3Healthy() {
-					cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
-					_ = cm.Cleanup(cleanCtx)
-					cleanCancel()
+			canPreserveChunks := cm != nil && cm.IsMultipart() && cm.AllChunksUploaded()
+			if canPreserveChunks {
+				if idx := getGlobalCacheIndex(); idx != nil {
+					idx.RecordPendingRecompose(state.Key, meta, cm.ChunkSize(), cm.TotalParts(), true)
 				}
+				state.Lock.Lock()
+				hasClients := len(state.Clients) > 0
+				state.UpstreamStatus = "Pending Recompose"
+				if hasClients {
+					state.IsCommitting = false
+					state.WriterActive = false
+				}
+				state.Lock.Unlock()
+				if GlobalLogBroker != nil {
+					go GlobalLogBroker.BroadcastStateUpdate()
+				}
+				if hasClients {
+					log.Printf("%s Preserving S3 chunks and active reader access for %s while recompose awaits retry", logPrefix, state.Key)
+					runtime.GC()
+					debug.FreeOSMemory()
+					return
+				}
+				cm.Close()
+			} else {
+				if cm != nil {
+					cm.Close()
+					if IsS3Healthy() {
+						cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 30*time.Second)
+						_ = cm.Cleanup(cleanCtx)
+						cleanCancel()
+					}
+				}
+				state.SetUpstreamStatus("Error")
 			}
-			state.SetUpstreamStatus("Error")
 		} else {
 			state.SetUpstreamStatus("Completed")
 			log.Printf("%s Cached file finalized and committed to S3: %s", logPrefix, state.Key)
