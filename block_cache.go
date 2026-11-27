@@ -90,8 +90,11 @@ type FileCacheState struct {
 	File                *os.File         // Open handle to writing file
 	NotifyChan          chan struct{}    // Channel to wake coordinator on client starvation
 	ManualAddWorkerChan chan struct{}    // Channel to request an explicit manual worker spawn
-	BytesDownloadedSec  int64
+	BytesDownloadedSec   int64
 	TotalBytesDownloaded int64
+	TotalBytesServed     int64
+	syncedBytesDownloaded int64
+	syncedBytesServed     int64
 	HydrationStartTime   int64
 	DownloadSpeed        int64
 	AvgDownloadSpeed     int64
@@ -319,6 +322,64 @@ func (s *FileCacheState) LowerRingFloorOffset(floor int64) {
 			return
 		}
 	}
+}
+
+// FlushTransferToIndex atomically flushes any unsynced downloaded/served bytes for s.Key
+// into idx once s.Key is present in idx, preventing double-counting and pre-commit loss.
+func (s *FileCacheState) FlushTransferToIndex(idx *CacheIndex) {
+	if s == nil || idx == nil || s.Key == "" {
+		return
+	}
+	if _, ok := idx.Get(s.Key); !ok {
+		return
+	}
+
+	var deltaDL, deltaSV int64
+	for {
+		curDL := atomic.LoadInt64(&s.TotalBytesDownloaded)
+		syncedDL := atomic.LoadInt64(&s.syncedBytesDownloaded)
+		if curDL <= syncedDL {
+			deltaDL = 0
+			break
+		}
+		if atomic.CompareAndSwapInt64(&s.syncedBytesDownloaded, syncedDL, curDL) {
+			deltaDL = curDL - syncedDL
+			break
+		}
+	}
+	for {
+		curSV := atomic.LoadInt64(&s.TotalBytesServed)
+		syncedSV := atomic.LoadInt64(&s.syncedBytesServed)
+		if curSV <= syncedSV {
+			deltaSV = 0
+			break
+		}
+		if atomic.CompareAndSwapInt64(&s.syncedBytesServed, syncedSV, curSV) {
+			deltaSV = curSV - syncedSV
+			break
+		}
+	}
+
+	if deltaDL > 0 || deltaSV > 0 {
+		idx.RecordTransferBytes(s.Key, deltaDL, deltaSV)
+		_ = idx.Flush()
+	}
+}
+
+// UnsyncedTransferBytes returns downloaded and served bytes recorded on s that have not yet been flushed to CacheIndex.
+func (s *FileCacheState) UnsyncedTransferBytes() (downloaded, served int64) {
+	if s == nil {
+		return 0, 0
+	}
+	downloaded = atomic.LoadInt64(&s.TotalBytesDownloaded) - atomic.LoadInt64(&s.syncedBytesDownloaded)
+	if downloaded < 0 {
+		downloaded = 0
+	}
+	served = atomic.LoadInt64(&s.TotalBytesServed) - atomic.LoadInt64(&s.syncedBytesServed)
+	if served < 0 {
+		served = 0
+	}
+	return downloaded, served
 }
 
 // SetTargetTier safely updates the active storage tier for this state.

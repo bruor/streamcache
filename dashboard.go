@@ -244,9 +244,12 @@ type dashboardStorageInfo struct {
 	S3Endpoint         string `json:"s3_endpoint,omitempty"`
 	S3UsedBytes        int64  `json:"s3_used_bytes"`
 	S3Objects          int    `json:"s3_objects"`
-	S3MaxBytes         int64  `json:"s3_max_bytes"`
-	S3Healthy          bool   `json:"s3_healthy"`
-	CacheMaxIdleAgeSec int64  `json:"cache_max_idle_age_seconds"`
+	S3MaxBytes           int64   `json:"s3_max_bytes"`
+	S3Healthy            bool    `json:"s3_healthy"`
+	CacheMaxIdleAgeSec   int64   `json:"cache_max_idle_age_seconds"`
+	CacheBytesDownloaded int64   `json:"cache_bytes_downloaded"`
+	CacheBytesServed     int64   `json:"cache_bytes_served"`
+	CacheHitRatioPct     float64 `json:"cache_hit_ratio_pct"`
 }
 
 type dashboardSnapshot struct {
@@ -323,7 +326,11 @@ func collectDashboardSnapshot() dashboardSnapshot {
 	activeVODProbes := 0
 	var tmpUsedBytes int64
 	var tmpObjects int
+	var unsyncedDL, unsyncedSV int64
 	for _, fileState := range files {
+		fileDL, fileSV := fileState.UnsyncedTransferBytes()
+		unsyncedDL += fileDL
+		unsyncedSV += fileSV
 		fileState.Lock.Lock()
 		if fileState.ChunkManager != nil {
 			tmpUsedBytes += fileState.ChunkManager.GetInFlightBytes()
@@ -534,8 +541,16 @@ func collectDashboardSnapshot() dashboardSnapshot {
 
 	var diskObjects, s3Objects int
 	var diskIdxBytes, s3UsedBytes int64
+	var totalDL, totalSV int64
 	if idx := getGlobalCacheIndex(); idx != nil {
 		diskObjects, diskIdxBytes, s3Objects, s3UsedBytes, _ = idx.StatsByTier()
+		totalDL, totalSV = idx.TransferTotals()
+	}
+	totalDL += unsyncedDL
+	totalSV += unsyncedSV
+	var hitRatioPct float64
+	if totalSV > 0 && totalSV > totalDL {
+		hitRatioPct = float64(totalSV-totalDL) / float64(totalSV) * 100.0
 	}
 
 	effBackend := GlobalConfig.EffectiveStorageBackend()
@@ -580,9 +595,12 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		S3Endpoint:         s3Cfg.Endpoint,
 		S3UsedBytes:        s3UsedBytes,
 		S3Objects:          s3Objects,
-		S3MaxBytes:         s3Cfg.MaxBytes,
-		S3Healthy:          healthSnap.S3Healthy,
-		CacheMaxIdleAgeSec: int64(GlobalConfig.GetCacheMaxIdleAge().Seconds()),
+		S3MaxBytes:           s3Cfg.MaxBytes,
+		S3Healthy:            healthSnap.S3Healthy,
+		CacheMaxIdleAgeSec:   int64(GlobalConfig.GetCacheMaxIdleAge().Seconds()),
+		CacheBytesDownloaded: totalDL,
+		CacheBytesServed:     totalSV,
+		CacheHitRatioPct:     hitRatioPct,
 	}
 
 	snap := dashboardSnapshot{

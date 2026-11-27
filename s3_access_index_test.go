@@ -881,3 +881,87 @@ func TestS3MaxBytesPostCommitAutoEviction(t *testing.T) {
 		t.Fatalf("Expected newer second.mkv to remain in S3")
 	}
 }
+
+func TestLifetimeCacheHitRatioAccountingAndPersistence(t *testing.T) {
+	origCfg := GlobalConfig
+	origReg := GlobalRegistry
+	origIdx := GlobalCacheIndex
+	origS3Idx := GlobalS3Index
+	origHealth := getGlobalStorageHealth()
+	defer func() {
+		GlobalConfig = origCfg
+		GlobalRegistry = origReg
+		GlobalCacheIndex = origIdx
+		GlobalS3Index = origS3Idx
+		setGlobalStorageHealth(origHealth)
+	}()
+
+	tempDir := t.TempDir()
+	GlobalConfig = &Config{
+		StorageBackend:  "s3",
+		TmpDir:          filepath.Join(tempDir, "tmp"),
+		StateDir:        filepath.Join(tempDir, "state"),
+		CacheMaxIdleAge: 24 * time.Hour,
+		S3Config:        S3Config{Bucket: "ratio-bucket"},
+	}
+	InitRegistry()
+	indexPath := filepath.Join(tempDir, "state", "s3_index.json")
+	idx := NewCacheIndex(indexPath)
+	GlobalCacheIndex = idx
+	GlobalS3Index = idx
+
+	// 1. Active in-flight state before commit contributes unsynced bytes (1000 DL, 1000 SV -> 0% ratio).
+	st := NewFileCacheState("movie_a.mkv", "http://origin/a.mkv", "", filepath.Join(GlobalConfig.TmpDir, "a.part"), "", "video/mp4", "", "", 1000)
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[st.Key] = st
+	GlobalRegistry.Lock.Unlock()
+
+	atomic.AddInt64(&st.TotalBytesDownloaded, 1000)
+	atomic.AddInt64(&st.TotalBytesServed, 1000)
+
+	snap0 := collectDashboardSnapshot().Storage
+	if snap0.CacheBytesDownloaded != 1000 || snap0.CacheBytesServed != 1000 || snap0.CacheHitRatioPct != 0 {
+		t.Fatalf("Expected 1:1 download/serve -> 0%% ratio, got %+v", snap0)
+	}
+
+	// 2. Commit and flush transfer bytes to CacheIndex without double counting while state stays in registry.
+	idx.RecordCommitForTier("movie_a.mkv", FileMeta{TotalSize: 1000, URL: "http://origin/a.mkv"}, IndexTierS3)
+	st.FlushTransferToIndex(idx)
+
+	snap1 := collectDashboardSnapshot().Storage
+	if snap1.CacheBytesDownloaded != 1000 || snap1.CacheBytesServed != 1000 {
+		t.Fatalf("Expected zero double counting after FlushTransferToIndex, got %+v", snap1)
+	}
+
+	GlobalRegistry.Lock.Lock()
+	delete(GlobalRegistry.Files, st.Key)
+	GlobalRegistry.Lock.Unlock()
+
+	// 3. Subsequent Cache HIT serves another 1000 bytes (total 2000 SV, 1000 DL -> 50% ratio), then another 2000 (4000 SV -> 75%).
+	idx.RecordTransferBytes("movie_a.mkv", 0, 1000)
+	snap2 := collectDashboardSnapshot().Storage
+	if snap2.CacheHitRatioPct < 49.9 || snap2.CacheHitRatioPct > 50.1 {
+		t.Fatalf("Expected 50%% hit ratio at 2:1, got %.2f%% (%+v)", snap2.CacheHitRatioPct, snap2)
+	}
+
+	idx.RecordTransferBytes("movie_a.mkv", 0, 2000)
+	if err := idx.Flush(); err != nil {
+		t.Fatalf("Flush error: %v", err)
+	}
+
+	// 4. Reload index from disk to confirm lifetime stats survive restarts.
+	reloaded := NewCacheIndex(indexPath)
+	if err := reloaded.Load(); err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	GlobalCacheIndex = reloaded
+	GlobalS3Index = reloaded
+
+	snap3 := collectDashboardSnapshot().Storage
+	if snap3.CacheBytesDownloaded != 1000 || snap3.CacheBytesServed != 4000 {
+		t.Fatalf("Expected persisted downloaded=1000 served=4000, got %+v", snap3)
+	}
+	if snap3.CacheHitRatioPct < 74.9 || snap3.CacheHitRatioPct > 75.1 {
+		t.Fatalf("Expected 75%% hit ratio at 4:1 after reload, got %.2f%%", snap3.CacheHitRatioPct)
+	}
+}

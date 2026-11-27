@@ -477,6 +477,10 @@ func (r *CacheReader) Close() error {
 		debug.FreeOSMemory()
 	}
 
+	if idx := getGlobalCacheIndex(); idx != nil && r.state != nil {
+		r.state.FlushTransferToIndex(idx)
+	}
+
 	return nil
 }
 
@@ -498,6 +502,9 @@ func (r *CacheReader) ReadAt(p []byte, off int64) (int, error) {
 		n, retry, err := r.readAtAttempt(p, off)
 		if !retry {
 			if n > 0 {
+				if r.state != nil {
+					atomic.AddInt64(&r.state.TotalBytesServed, int64(n))
+				}
 				r.state.SetClientOffset(r.clientID, off+int64(n))
 				if cm := r.state.GetChunkManager(); cm != nil && cm.IsRingBufferMode() {
 					cm.SignalBudget()

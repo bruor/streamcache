@@ -2005,6 +2005,7 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 			if canPreserveChunks {
 				if idx := getGlobalCacheIndex(); idx != nil {
 					idx.RecordPendingRecompose(state.Key, meta, cm.ChunkSize(), cm.TotalParts(), true)
+					state.FlushTransferToIndex(idx)
 				}
 				state.Lock.Lock()
 				hasClients := len(state.Clients) > 0
@@ -2040,6 +2041,7 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 			log.Printf("%s Cached file finalized and committed to S3: %s", logPrefix, state.Key)
 			if idx := getGlobalCacheIndex(); idx != nil {
 				idx.RecordCommitForTier(state.Key, meta, IndexTierS3)
+				state.FlushTransferToIndex(idx)
 			}
 		}
 
@@ -2108,7 +2110,7 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 		}
 
 		if commitErr == nil {
-			recordLocalCommitToIndexAndDemoter(state.Key, meta)
+			recordLocalCommitToIndexAndDemoter(state, meta)
 		}
 
 		runtime.GC()
@@ -2143,7 +2145,7 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 				GlobalRegistry.Lock.Unlock()
 			}
 
-			recordLocalCommitToIndexAndDemoter(state.Key, meta)
+			recordLocalCommitToIndexAndDemoter(state, meta)
 
 			if GlobalLogBroker != nil {
 				go GlobalLogBroker.BroadcastStateUpdate()
@@ -2175,7 +2177,7 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 			}
 			GlobalRegistry.Lock.Unlock()
 		}
-		recordLocalCommitToIndexAndDemoter(state.Key, meta)
+		recordLocalCommitToIndexAndDemoter(state, meta)
 		if GlobalLogBroker != nil {
 			go GlobalLogBroker.BroadcastStateUpdate()
 		}
@@ -2189,12 +2191,16 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 	debug.FreeOSMemory()
 }
 
-func recordLocalCommitToIndexAndDemoter(key string, meta FileMeta) {
+func recordLocalCommitToIndexAndDemoter(state *FileCacheState, meta FileMeta) {
+	if state == nil {
+		return
+	}
 	if idx := getGlobalCacheIndex(); idx != nil {
-		idx.RecordCommitForTier(key, meta, IndexTierDisk)
+		idx.RecordCommitForTier(state.Key, meta, IndexTierDisk)
+		state.FlushTransferToIndex(idx)
 	}
 	if demoter := getGlobalHybridDemoter(); demoter != nil {
-		demoter.EnqueueEagerBackup(key)
+		demoter.EnqueueEagerBackup(state.Key)
 		demoter.TriggerWatermarkDemotion()
 	}
 }

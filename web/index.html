@@ -974,6 +974,12 @@
             gap: 5px;
         }
 
+        .storage-tier.hit {
+            min-width: 145px;
+            max-width: 190px;
+        }
+
+        .storage-tier-label.hit { color: #38bdf8; }
         .storage-tier-label.tmp { color: var(--accent-secondary); }
         .storage-tier-label.cache { color: var(--accent-green); }
         .storage-tier-label.s3 { color: #c084fc; }
@@ -985,6 +991,11 @@
             border-radius: 50%;
             display: inline-block;
             flex-shrink: 0;
+        }
+
+        .storage-tier-label.hit .storage-tier-dot {
+            background-color: #38bdf8;
+            box-shadow: 0 0 6px #38bdf8;
         }
 
         .storage-tier-label.tmp .storage-tier-dot {
@@ -1042,6 +1053,9 @@
         }
 
         .storage-bar-track {
+            position: relative;
+            display: flex;
+            align-items: stretch;
             width: 100%;
             height: 4px;
             border-radius: 999px;
@@ -1053,9 +1067,38 @@
             height: 100%;
             width: 0%;
             border-radius: 999px;
+            flex-shrink: 0;
             transition: width 0.25s ease, background-color 0.25s ease;
         }
 
+        .storage-bar-reserve {
+            height: 100%;
+            width: 0%;
+            margin-left: auto;
+            flex-shrink: 0;
+            background: repeating-linear-gradient(
+                -45deg,
+                rgba(255, 159, 28, 0.32),
+                rgba(255, 159, 28, 0.32) 3px,
+                rgba(255, 255, 255, 0.06) 3px,
+                rgba(255, 255, 255, 0.06) 6px
+            );
+            border-left: 1px solid rgba(255, 159, 28, 0.55);
+            transition: width 0.25s ease, background 0.25s ease;
+        }
+
+        .storage-bar-reserve.danger {
+            background: repeating-linear-gradient(
+                -45deg,
+                rgba(255, 85, 85, 0.42),
+                rgba(255, 85, 85, 0.42) 3px,
+                rgba(255, 255, 255, 0.08) 3px,
+                rgba(255, 255, 255, 0.08) 6px
+            );
+            border-left-color: rgba(255, 85, 85, 0.75);
+        }
+
+        .storage-bar-fill.hit { background: #38bdf8; }
         .storage-bar-fill.tmp { background: var(--accent-secondary); }
         .storage-bar-fill.cache { background: var(--accent-green); }
         .storage-bar-fill.s3 { background: #c084fc; }
@@ -1459,16 +1502,30 @@
                 </div>
             </div>
             <div class="status-pill storage-widget-pill" id="storage-widget-pill">
+                <div class="storage-tier hit" id="storage-tier-hit">
+                    <div class="storage-tier-header">
+                        <span class="storage-tier-label hit" id="storage-hit-label">
+                            <span class="storage-tier-dot"></span>
+                            <span>HIT RATIO</span>
+                        </span>
+                        <span class="storage-tier-pct" id="storage-hit-mult">--</span>
+                    </div>
+                    <div class="storage-tier-main" id="storage-hit-main">--</div>
+                    <div class="storage-bar-track"><div class="storage-bar-fill hit" id="storage-hit-bar"></div></div>
+                    <div class="storage-tier-sub" id="storage-hit-sub">No client traffic</div>
+                    <div class="storage-tier-loc" id="storage-hit-loc">In 0 B • Out 0 B</div>
+                </div>
+                <div class="storage-divider" id="storage-div-tmp"></div>
                 <div class="storage-tier" id="storage-tier-tmp">
                     <div class="storage-tier-header">
                         <span class="storage-tier-label tmp" id="storage-tmp-label">
                             <span class="storage-tier-dot"></span>
                             <span>TMP</span>
                         </span>
-                        <span class="storage-tier-pct" id="storage-tmp-pct">-- free</span>
+                        <span class="storage-tier-pct" id="storage-tmp-pct">-- avail</span>
                     </div>
                     <div class="storage-tier-main" id="storage-tmp-main">0 B / Unlimited</div>
-                    <div class="storage-bar-track"><div class="storage-bar-fill tmp" id="storage-tmp-bar"></div></div>
+                    <div class="storage-bar-track"><div class="storage-bar-fill tmp" id="storage-tmp-bar"></div><div class="storage-bar-reserve" id="storage-tmp-reserve"></div></div>
                     <div class="storage-tier-sub" id="storage-tmp-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
                 </div>
@@ -1479,10 +1536,10 @@
                             <span class="storage-tier-dot"></span>
                             <span>CACHE</span>
                         </span>
-                        <span class="storage-tier-pct" id="storage-cache-pct">-- free</span>
+                        <span class="storage-tier-pct" id="storage-cache-pct">-- avail</span>
                     </div>
                     <div class="storage-tier-main" id="storage-cache-main">0 B / Unlimited</div>
-                    <div class="storage-bar-track"><div class="storage-bar-fill cache" id="storage-cache-bar"></div></div>
+                    <div class="storage-bar-track"><div class="storage-bar-fill cache" id="storage-cache-bar"></div><div class="storage-bar-reserve" id="storage-cache-reserve"></div></div>
                     <div class="storage-tier-sub" id="storage-cache-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-cache-loc">--</div>
                 </div>
@@ -1493,7 +1550,7 @@
                             <span class="storage-tier-dot"></span>
                             <span>S3</span>
                         </span>
-                        <span class="storage-tier-pct" id="storage-s3-pct">∞ free</span>
+                        <span class="storage-tier-pct" id="storage-s3-pct">∞ avail</span>
                     </div>
                     <div class="storage-tier-main" id="storage-s3-main">0 B / Unlimited</div>
                     <div class="storage-bar-track"><div class="storage-bar-fill s3" id="storage-s3-bar"></div></div>
@@ -2610,10 +2667,10 @@
                     return { unit: units[i], div: Math.pow(1024, i) };
                 }
 
-                function formatFixed1(bytes, unitOverride) {
-                    const u = unitOverride || pickUnit(bytes);
-                    const val = (bytes || 0) / u.div;
-                    return `${val.toFixed(1)} ${u.unit}`;
+                function formatCleanBytes(bytes, unitOverride) {
+                    const u = unitOverride || pickUnit(bytes || 0);
+                    const val = formatDenom(Math.max(0, bytes || 0), u.div);
+                    return `${val} ${u.unit}`;
                 }
 
                 function formatDenom(bytes, div) {
@@ -2636,29 +2693,33 @@
                     return `${count} ${count === 1 ? 'file' : 'files'}`;
                 }
 
-                function setTierBarOnly(barEl, baseClass, used, limit) {
+                function setBarWidthAndClass(barEl, baseClass, pct, warnPct = 80, dangerPct = 95) {
                     if (!barEl) return;
-                    if (limit > 0) {
-                        const rawPct = ((used || 0) / limit) * 100;
-                        const clampedPct = Math.max(0, Math.min(100, rawPct));
-                        barEl.style.width = `${clampedPct.toFixed(1)}%`;
-                        let barCls = `storage-bar-fill ${baseClass}`;
-                        if (rawPct >= 95) barCls = 'storage-bar-fill danger';
-                        else if (rawPct >= 80) barCls = 'storage-bar-fill warn';
-                        setClassIfChanged(barEl, barCls);
-                    } else {
-                        barEl.style.width = '0%';
-                        setClassIfChanged(barEl, `storage-bar-fill ${baseClass}`);
-                    }
+                    const clamped = Math.max(0, Math.min(100, pct || 0));
+                    barEl.style.width = `${clamped.toFixed(1)}%`;
+                    let cls = `storage-bar-fill ${baseClass}`;
+                    if (pct >= dangerPct) cls = 'storage-bar-fill danger';
+                    else if (pct >= warnPct) cls = 'storage-bar-fill warn';
+                    setClassIfChanged(barEl, cls);
                 }
 
-                function setFreeBadge(badgeEl, text, level) {
+                function setReserveBar(reserveEl, pct, isDanger) {
+                    if (!reserveEl) return;
+                    const clamped = Math.max(0, Math.min(90, pct || 0));
+                    reserveEl.style.width = clamped > 0 ? `${clamped.toFixed(1)}%` : '0%';
+                    setClassIfChanged(reserveEl, isDanger ? 'storage-bar-reserve danger' : 'storage-bar-reserve');
+                }
+
+                function setFreeBadge(badgeEl, text, level, titleText) {
                     if (!badgeEl) return;
                     setTextIfChanged(badgeEl, text);
                     let cls = 'storage-tier-pct';
                     if (level === 'danger') cls = 'storage-tier-pct danger';
                     else if (level === 'warn') cls = 'storage-tier-pct warn';
                     setClassIfChanged(badgeEl, cls);
+                    if (titleText !== undefined && badgeEl.title !== titleText) {
+                        badgeEl.title = titleText;
+                    }
                 }
 
                 const backend = (data.storage_backend || 'disk').toLowerCase();
@@ -2685,28 +2746,92 @@
                     s3_max_bytes: data.s3_max_bytes || 0,
                     s3_healthy: data.s3_healthy !== false,
                     cache_max_idle_age_seconds: data.cache_max_idle_age_seconds || 0,
+                    cache_bytes_downloaded: 0,
+                    cache_bytes_served: 0,
+                    cache_hit_ratio_pct: 0,
                 };
                 const ttlShort = formatTTLShort(st.cache_max_idle_age_seconds);
+
+                // 0. HIT RATIO section (lifetime upstream downloaded vs client served)
+                const hitMultEl = document.getElementById('storage-hit-mult');
+                const hitMainEl = document.getElementById('storage-hit-main');
+                const hitBarEl = document.getElementById('storage-hit-bar');
+                const hitSubEl = document.getElementById('storage-hit-sub');
+                const hitLocEl = document.getElementById('storage-hit-loc');
+                if (hitMainEl && hitSubEl && hitLocEl) {
+                    const dl = st.cache_bytes_downloaded || 0;
+                    const sv = st.cache_bytes_served || 0;
+                    const ratioPct = st.cache_hit_ratio_pct || 0;
+                    if (sv > 0) {
+                        const pctStr = `${Number(ratioPct.toFixed(1))}%`;
+                        setTextIfChanged(hitMainEl, pctStr);
+                        let barCls = 'storage-bar-fill warn';
+                        if (ratioPct >= 50) barCls = 'storage-bar-fill cache';
+                        else if (ratioPct >= 20) barCls = 'storage-bar-fill tmp';
+                        if (hitBarEl) {
+                            hitBarEl.style.width = `${Math.max(0, Math.min(100, ratioPct)).toFixed(1)}%`;
+                            setClassIfChanged(hitBarEl, barCls);
+                        }
+                        if (dl > 0) {
+                            const mult = sv / dl;
+                            setFreeBadge(hitMultEl, `${Number(mult.toFixed(1))}x`, mult >= 1 ? '' : 'warn', 'Client Bytes Served / Upstream Bytes Downloaded');
+                        } else {
+                            setFreeBadge(hitMultEl, '∞x', '', 'Pre-warmed (served without upstream download)');
+                        }
+                        if (sv > dl) {
+                            setTextIfChanged(hitSubEl, `Saved ${formatCleanBytes(sv - dl)}`);
+                        } else {
+                            setTextIfChanged(hitSubEl, 'Pre-warmed');
+                        }
+                    } else {
+                        setTextIfChanged(hitMainEl, '--');
+                        if (hitBarEl) {
+                            hitBarEl.style.width = '0%';
+                            setClassIfChanged(hitBarEl, 'storage-bar-fill hit');
+                        }
+                        setFreeBadge(hitMultEl, '--', '', 'Waiting for client traffic');
+                        setTextIfChanged(hitSubEl, 'No client traffic');
+                    }
+                    const locText = `In ${formatCleanBytes(dl)} • Out ${formatCleanBytes(sv)}`;
+                    setTextIfChanged(hitLocEl, locText);
+                    const savedBytes = Math.max(0, sv - dl);
+                    const hitTitle = `Downloaded: ${formatCleanBytes(dl)} | Served: ${formatCleanBytes(sv)} | Saved: ${formatCleanBytes(savedBytes)} (${Number(ratioPct.toFixed(1))}%)`;
+                    if (hitLocEl.title !== hitTitle) hitLocEl.title = hitTitle;
+                }
 
                 // 1. TMP tier (always visible)
                 const tmpLabel = document.getElementById('storage-tmp-label');
                 const tmpPct = document.getElementById('storage-tmp-pct');
                 const tmpMain = document.getElementById('storage-tmp-main');
                 const tmpBar = document.getElementById('storage-tmp-bar');
+                const tmpReserveBar = document.getElementById('storage-tmp-reserve');
                 const tmpSub = document.getElementById('storage-tmp-sub');
                 const tmpLoc = document.getElementById('storage-tmp-loc');
                 if (tmpMain && tmpSub && tmpLoc) {
+                    const tmpUsed = st.tmp_used_bytes || 0;
                     const tmpFree = st.tmp_free_bytes || 0;
                     const tmpMin = st.tmp_min_free_bytes || 0;
-                    const tmpLow = tmpMin > 0 && tmpFree < tmpMin;
-                    const tmpWarn = !tmpLow && tmpMin > 0 && tmpFree < tmpMin * 2;
+                    const tmpFileMax = st.tmp_file_max_bytes || 0;
+                    const tmpObjects = st.tmp_objects || 0;
+                    const tmpAvail = Math.max(0, tmpFree - tmpMin);
+                    const tmpPool = tmpUsed + tmpAvail;
+                    const tmpLow = tmpMin > 0 && tmpFree <= tmpMin;
+                    const tmpHeadroomTight = !tmpLow && tmpMin > 0 && tmpAvail < tmpMin;
+                    const tmpScratchPressure = !tmpLow && tmpFileMax > 0 && tmpObjects > 0 && tmpUsed >= tmpFileMax * tmpObjects * 0.85;
                     setClassIfChanged(tmpLabel, tmpLow ? 'storage-tier-label unhealthy' : 'storage-tier-label tmp');
-                    const tmpFrac = formatFractionSameUnit(st.tmp_used_bytes || 0, st.tmp_file_max_bytes || 0, '/file');
+                    const tmpFrac = formatFractionSameUnit(tmpUsed, tmpPool);
                     setTextIfChanged(tmpMain, tmpFrac.text);
-                    setTierBarOnly(tmpBar, 'tmp', st.tmp_used_bytes || 0, st.tmp_file_max_bytes || 0);
-                    setFreeBadge(tmpPct, `${formatFixed1(tmpFree)} free`, tmpLow ? 'danger' : (tmpWarn ? 'warn' : ''));
-                    const tmpConstraints = tmpMin > 0 ? `Min ${formatFixed1(tmpMin)}` : 'No min';
-                    setTextIfChanged(tmpSub, `${formatFileCount(st.tmp_objects)} • ${tmpConstraints}`);
+                    const tmpTotalDisk = tmpUsed + tmpFree;
+                    const tmpFillPct = tmpTotalDisk > 0 ? (tmpUsed / tmpTotalDisk) * 100 : 0;
+                    const tmpResPct = tmpMin > 0 && tmpTotalDisk > 0 ? Math.max(4, Math.min(45, (tmpMin / tmpTotalDisk) * 100)) : 0;
+                    setBarWidthAndClass(tmpBar, 'tmp', tmpFillPct, 75, 90);
+                    setReserveBar(tmpReserveBar, tmpResPct, tmpLow);
+                    const tmpTitle = `Disk Free: ${formatCleanBytes(tmpFree)} − ${formatCleanBytes(tmpMin)} res = ${formatCleanBytes(tmpAvail)} avail`;
+                    setFreeBadge(tmpPct, `${formatCleanBytes(tmpAvail, tmpFrac)} avail`, tmpLow ? 'danger' : ((tmpHeadroomTight || tmpScratchPressure) ? 'warn' : ''), tmpTitle);
+                    const tmpParts = [formatFileCount(tmpObjects)];
+                    if (tmpMin > 0) tmpParts.push(`${formatCleanBytes(tmpMin)} res`);
+                    if (tmpFileMax > 0) tmpParts.push(`${formatCleanBytes(tmpFileMax)}/file`);
+                    setTextIfChanged(tmpSub, tmpParts.join(' • '));
                     const tmpDirStr = st.tmp_dir || '--';
                     setTextIfChanged(tmpLoc, tmpDirStr);
                     if (tmpLoc.title !== tmpDirStr) tmpLoc.title = tmpDirStr;
@@ -2723,19 +2848,48 @@
                         const cachePct = document.getElementById('storage-cache-pct');
                         const cacheMain = document.getElementById('storage-cache-main');
                         const cacheBar = document.getElementById('storage-cache-bar');
+                        const cacheReserveBar = document.getElementById('storage-cache-reserve');
                         const cacheSub = document.getElementById('storage-cache-sub');
                         const cacheLoc = document.getElementById('storage-cache-loc');
+                        const cacheUsed = st.cache_used_bytes || 0;
+                        const cacheMax = st.cache_max_bytes || 0;
                         const cacheFree = st.cache_free_bytes || 0;
                         const cacheMin = st.cache_min_free_bytes || 0;
-                        const cacheDanger = st.cache_healthy === false || (cacheMin > 0 && cacheFree < cacheMin);
-                        const cacheWarn = !cacheDanger && cacheMin > 0 && cacheFree < cacheMin * 2;
+                        const cacheAvail = Math.max(0, cacheFree - cacheMin);
+                        const diskPool = cacheUsed + cacheAvail;
+                        const diskBound = cacheMax > 0 && diskPool < cacheMax;
+                        const effectiveCap = cacheMax > 0 ? Math.min(cacheMax, diskPool) : diskPool;
+                        const cacheDanger = st.cache_healthy === false || (cacheMin > 0 && cacheFree <= cacheMin);
+                        const cacheWarn = !cacheDanger && (diskBound || (cacheMin > 0 && cacheAvail < cacheMin));
                         setClassIfChanged(cacheLabel, st.cache_healthy === false ? 'storage-tier-label unhealthy' : 'storage-tier-label cache');
-                        const cacheFrac = formatFractionSameUnit(st.cache_used_bytes || 0, st.cache_max_bytes || 0);
+                        const cacheFrac = formatFractionSameUnit(cacheUsed, cacheMax > 0 ? cacheMax : effectiveCap);
                         setTextIfChanged(cacheMain, cacheFrac.text);
-                        setTierBarOnly(cacheBar, 'cache', st.cache_used_bytes || 0, st.cache_max_bytes || 0);
-                        setFreeBadge(cachePct, `${formatFixed1(cacheFree)} free`, cacheDanger ? 'danger' : (cacheWarn ? 'warn' : ''));
+                        let cacheFillPct = 0;
+                        let cacheResPct = 0;
+                        if (cacheMax > 0) {
+                            cacheFillPct = (cacheUsed / cacheMax) * 100;
+                            if (diskBound) {
+                                cacheResPct = ((cacheMax - effectiveCap) / cacheMax) * 100;
+                            } else if (cacheMin > 0 && (cacheUsed + cacheFree) > 0) {
+                                cacheResPct = Math.max(4, Math.min(25, (cacheMin / (cacheUsed + cacheFree)) * 100));
+                            }
+                        } else if ((cacheUsed + cacheFree) > 0) {
+                            const totalDisk = cacheUsed + cacheFree;
+                            cacheFillPct = (cacheUsed / totalDisk) * 100;
+                            if (cacheMin > 0) {
+                                cacheResPct = Math.max(4, Math.min(45, (cacheMin / totalDisk) * 100));
+                            }
+                        }
+                        setBarWidthAndClass(cacheBar, 'cache', cacheFillPct, 80, 95);
+                        setReserveBar(cacheReserveBar, cacheResPct, cacheDanger);
+                        const cacheHeadroom = cacheMax > 0 ? Math.min(cacheAvail, Math.max(0, cacheMax - cacheUsed)) : cacheAvail;
+                        let cacheBadgeTitle = `Disk Free: ${formatCleanBytes(cacheFree)} − ${formatCleanBytes(cacheMin)} res = ${formatCleanBytes(cacheAvail)} avail`;
+                        if (diskBound) {
+                            cacheBadgeTitle += ` • Disk reserve tighter than ${formatCleanBytes(cacheMax)} cap`;
+                        }
+                        setFreeBadge(cachePct, `${formatCleanBytes(cacheHeadroom, cacheFrac)} avail`, cacheDanger ? 'danger' : (cacheWarn ? 'warn' : ''), cacheBadgeTitle);
                         const cacheParts = [formatFileCount(st.cache_objects)];
-                        if (cacheMin > 0) cacheParts.push(`Min ${formatFixed1(cacheMin)}`);
+                        if (cacheMin > 0) cacheParts.push(`${formatCleanBytes(cacheMin)} res`);
                         if (ttlShort) cacheParts.push(ttlShort);
                         setTextIfChanged(cacheSub, cacheParts.join(' • '));
                         const cacheDirStr = st.cache_dir || '--';
@@ -2765,14 +2919,14 @@
                         setClassIfChanged(s3Label, st.s3_healthy === false ? 'storage-tier-label unhealthy' : 'storage-tier-label s3');
                         const s3Frac = formatFractionSameUnit(s3Used, s3Max);
                         setTextIfChanged(s3Main, s3Frac.text);
-                        setTierBarOnly(s3Bar, 's3', s3Used, s3Max);
+                        const s3PctVal = s3Max > 0 ? (s3Used / s3Max) * 100 : 0;
+                        setBarWidthAndClass(s3Bar, 's3', s3PctVal, 80, 95);
                         if (s3Max > 0) {
                             const s3Remaining = Math.max(0, s3Max - s3Used);
-                            const usedPct = (s3Used / s3Max) * 100;
-                            const s3Level = (st.s3_healthy === false || usedPct >= 95) ? 'danger' : (usedPct >= 80 ? 'warn' : '');
-                            setFreeBadge(s3Pct, `${formatFixed1(s3Remaining, s3Frac)} free`, s3Level);
+                            const s3Level = (st.s3_healthy === false || s3PctVal >= 95) ? 'danger' : (s3PctVal >= 80 ? 'warn' : '');
+                            setFreeBadge(s3Pct, `${formatCleanBytes(s3Remaining, s3Frac)} avail`, s3Level, `Quota: ${formatCleanBytes(s3Used)} / ${formatCleanBytes(s3Max)}`);
                         } else {
-                            setFreeBadge(s3Pct, '∞ free', st.s3_healthy === false ? 'danger' : '');
+                            setFreeBadge(s3Pct, '∞ avail', st.s3_healthy === false ? 'danger' : '', 'No S3_MAX_BYTES cap configured');
                         }
                         setTextIfChanged(s3Sub, `${formatFileCount(st.s3_objects)} • ${ttlShort || 'No TTL'}`);
                         const bucketLabel = st.s3_bucket ? `bucket: ${st.s3_bucket}` : 'S3 Bucket';

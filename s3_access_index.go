@@ -31,6 +31,8 @@ type CacheIndexEntry struct {
 	CreatedAt            int64  `json:"created_at"`
 	LastValidated        int64  `json:"last_validated,omitempty"`
 	LastAccessed         int64  `json:"last_accessed"`
+	BytesDownloaded      int64  `json:"bytes_downloaded,omitempty"`
+	BytesServed          int64  `json:"bytes_served,omitempty"`
 	PendingRecompose     bool   `json:"pending_recompose,omitempty"`
 	ChunkSize            int64  `json:"chunk_size,omitempty"`
 	TotalParts           int    `json:"total_parts,omitempty"`
@@ -545,6 +547,44 @@ func (idx *CacheIndex) MarkRemovedFromTier(key, tier string) {
 	if changed {
 		_ = idx.Flush()
 	}
+}
+
+// RecordTransferBytes adds lifetime upstream downloaded and/or client served bytes
+// to an already-tracked CacheIndexEntry without creating phantom entries.
+func (idx *CacheIndex) RecordTransferBytes(key string, downloadedDelta, servedDelta int64) {
+	if idx == nil || key == "" || (downloadedDelta <= 0 && servedDelta <= 0) {
+		return
+	}
+
+	idx.mu.Lock()
+	if e, ok := idx.entries[key]; ok && e != nil {
+		if downloadedDelta > 0 {
+			e.BytesDownloaded += downloadedDelta
+		}
+		if servedDelta > 0 {
+			e.BytesServed += servedDelta
+		}
+		idx.dirty = true
+	}
+	idx.mu.Unlock()
+}
+
+// TransferTotals returns the lifetime sum of BytesDownloaded and BytesServed across all tracked entries.
+func (idx *CacheIndex) TransferTotals() (downloaded int64, served int64) {
+	if idx == nil {
+		return 0, 0
+	}
+
+	idx.mu.Lock()
+	for _, e := range idx.entries {
+		if e == nil {
+			continue
+		}
+		downloaded += e.BytesDownloaded
+		served += e.BytesServed
+	}
+	idx.mu.Unlock()
+	return downloaded, served
 }
 
 // Get returns a copy of the CacheIndexEntry for key if present.
