@@ -257,8 +257,11 @@ type dashboardStorageInfo struct {
 	DemotedDiskToS3Bytes int64   `json:"demoted_disk_to_s3_bytes"`
 	EvictedCapacity      int64   `json:"evicted_capacity"`
 	EvictedCapacityBytes int64   `json:"evicted_capacity_bytes"`
-	EvictedTTL           int64   `json:"evicted_ttl"`
-	EvictedTTLBytes      int64   `json:"evicted_ttl_bytes"`
+	EvictedTTL               int64   `json:"evicted_ttl"`
+	EvictedTTLBytes          int64   `json:"evicted_ttl_bytes"`
+	HybridDemoteHighPct      int     `json:"hybrid_demote_high_watermark_pct,omitempty"`
+	HybridDemoteLowPct       int     `json:"hybrid_demote_low_watermark_pct,omitempty"`
+	HybridEagerS3Backup      bool    `json:"hybrid_eager_s3_backup,omitempty"`
 }
 
 type dashboardSnapshot struct {
@@ -589,6 +592,14 @@ func collectDashboardSnapshot() dashboardSnapshot {
 	}
 	s3Cfg := GlobalConfig.GetS3Config()
 
+	var hybridDemoteHighPct, hybridDemoteLowPct int
+	var hybridEagerS3Backup bool
+	if cacheEnabled && s3Enabled && GlobalConfig != nil {
+		hybridDemoteHighPct = GlobalConfig.GetHybridDemoteHighWatermark()
+		hybridDemoteLowPct = GlobalConfig.GetHybridDemoteLowWatermark()
+		hybridEagerS3Backup = GlobalConfig.GetHybridEagerS3Backup()
+	}
+
 	storageInfo := dashboardStorageInfo{
 		EffectiveBackend:   effBackend,
 		TmpDir:             tmpDir,
@@ -623,8 +634,11 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		DemotedDiskToS3Bytes: lifecycleStats.DemotedDiskToS3Bytes,
 		EvictedCapacity:      lifecycleStats.EvictedCapacity,
 		EvictedCapacityBytes: lifecycleStats.EvictedCapacityBytes,
-		EvictedTTL:           lifecycleStats.EvictedTTL,
-		EvictedTTLBytes:      lifecycleStats.EvictedTTLBytes,
+		EvictedTTL:               lifecycleStats.EvictedTTL,
+		EvictedTTLBytes:          lifecycleStats.EvictedTTLBytes,
+		HybridDemoteHighPct:      hybridDemoteHighPct,
+		HybridDemoteLowPct:       hybridDemoteLowPct,
+		HybridEagerS3Backup:      hybridEagerS3Backup,
 	}
 
 	snap := dashboardSnapshot{

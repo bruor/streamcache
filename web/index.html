@@ -1160,6 +1160,18 @@
             background: #ff5555;
         }
 
+        .storage-bar-demote {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 1.5px;
+            background: #c084fc;
+            box-shadow: 0 0 4px rgba(192, 132, 252, 0.75);
+            z-index: 5;
+            pointer-events: none;
+            display: none;
+        }
+
         .storage-bar-seg {
             height: 100%;
             width: 0%;
@@ -1638,7 +1650,7 @@
                         <span class="storage-tier-pct" id="storage-cache-pct">-- avail</span>
                     </div>
                     <div class="storage-tier-main"><span id="storage-cache-main">0 B / Unlimited</span><span class="storage-tier-res" id="storage-cache-res" style="display: none;"></span></div>
-                    <div class="storage-bar-track" id="storage-cache-track"><div class="storage-bar-alloc cache" id="storage-cache-alloc"></div><div class="storage-bar-fill layered cache" id="storage-cache-bar"></div><div class="storage-bar-reserve" id="storage-cache-reserve"></div><div class="storage-bar-cap" id="storage-cache-cap"></div></div>
+                    <div class="storage-bar-track" id="storage-cache-track"><div class="storage-bar-alloc cache" id="storage-cache-alloc"></div><div class="storage-bar-fill layered cache" id="storage-cache-bar"></div><div class="storage-bar-reserve" id="storage-cache-reserve"></div><div class="storage-bar-cap" id="storage-cache-cap"></div><div class="storage-bar-demote" id="storage-cache-demote"></div></div>
                     <div class="storage-tier-sub" id="storage-cache-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-cache-loc">--</div>
                 </div>
@@ -2961,6 +2973,9 @@
                     evicted_capacity_bytes: 0,
                     evicted_ttl: 0,
                     evicted_ttl_bytes: 0,
+                    hybrid_demote_high_watermark_pct: 0,
+                    hybrid_demote_low_watermark_pct: 0,
+                    hybrid_eager_s3_backup: false,
                 };
                 const ttlShort = formatTTLShort(st.cache_max_idle_age_seconds);
 
@@ -3071,6 +3086,7 @@
                         const cacheBar = document.getElementById('storage-cache-bar');
                         const cacheReserveBar = document.getElementById('storage-cache-reserve');
                         const cacheCapEl = document.getElementById('storage-cache-cap');
+                        const cacheDemoteEl = document.getElementById('storage-cache-demote');
                         const cacheSub = document.getElementById('storage-cache-sub');
                         const cacheLoc = document.getElementById('storage-cache-loc');
                         const cacheUsed = st.cache_used_bytes || 0;
@@ -3116,6 +3132,22 @@
                                 cacheCapEl.style.display = 'none';
                             }
                         }
+                        const isHybridDisk = Boolean(st.cache_enabled && st.s3_enabled);
+                        const demoteHighPct = isHybridDisk ? (st.hybrid_demote_high_watermark_pct || 0) : 0;
+                        const demoteLowPct = isHybridDisk ? (st.hybrid_demote_low_watermark_pct || 0) : 0;
+                        let demoteHighBytes = 0;
+                        let demoteLowBytes = 0;
+                        if (cacheDemoteEl) {
+                            if (demoteHighPct > 0 && cacheMax > 0 && cacheTotalSpan > 0) {
+                                demoteHighBytes = cacheMax * (demoteHighPct / 100);
+                                demoteLowBytes = cacheMax * (demoteLowPct / 100);
+                                const demotePosPct = Math.min(100, (demoteHighBytes / cacheTotalSpan) * 100);
+                                cacheDemoteEl.style.display = 'block';
+                                cacheDemoteEl.style.left = demotePosPct >= 99.5 ? 'calc(100% - 1.5px)' : `${demotePosPct.toFixed(1)}%`;
+                            } else {
+                                cacheDemoteEl.style.display = 'none';
+                            }
+                        }
                         const cacheHeadroom = cacheMax > 0 ? Math.min(cacheAvail, Math.max(0, cacheMax - cacheUsed)) : cacheAvail;
                         const cacheDirStr = st.cache_dir || '--';
                         setFreeBadge(cachePct, `${formatCleanBytes(cacheHeadroom, cacheFrac)} avail`, cacheDanger ? 'danger' : (cacheWarn ? 'warn' : ''));
@@ -3129,6 +3161,11 @@
                             `Disk Free: ${formatCleanBytes(cacheFree)} − ${formatCleanBytes(cacheMin)} res = ${formatCleanBytes(cacheAvail)} avail`,
                             `Unallocated: ${formatCleanBytes(cacheUnallocatedBytes)} • Total Pool: ${formatCleanBytes(cacheTotalSpan)}`,
                         ];
+                        if (demoteHighBytes > 0) {
+                            let demoteLine = `S3 Upload Threshold: ${formatCleanBytes(demoteHighBytes)} (${demoteHighPct}%) → target ${formatCleanBytes(demoteLowBytes)} (${demoteLowPct}%)`;
+                            if (st.hybrid_eager_s3_backup) demoteLine += ' • Eager backup ON';
+                            cacheTooltipLines.push(demoteLine);
+                        }
                         if (diskBound) {
                             cacheTooltipLines.push(`Warning: Disk reserve tighter than ${formatCleanBytes(cacheMax)} cap`);
                         }
