@@ -883,18 +883,7 @@ func TestS3MaxBytesPostCommitAutoEviction(t *testing.T) {
 }
 
 func TestLifetimeCacheHitRatioAccountingAndPersistence(t *testing.T) {
-	origCfg := GlobalConfig
-	origReg := GlobalRegistry
-	origIdx := GlobalCacheIndex
-	origS3Idx := GlobalS3Index
-	origHealth := getGlobalStorageHealth()
-	defer func() {
-		GlobalConfig = origCfg
-		GlobalRegistry = origReg
-		GlobalCacheIndex = origIdx
-		GlobalS3Index = origS3Idx
-		setGlobalStorageHealth(origHealth)
-	}()
+	saveAndRestorePhase1Globals(t)
 
 	tempDir := t.TempDir()
 	GlobalConfig = &Config{

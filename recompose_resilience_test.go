@@ -26,21 +26,29 @@ func saveAndRestoreResilienceGlobals(t *testing.T) {
 	oldReg := GlobalRegistry
 	oldIdx := GlobalCacheIndex
 	oldS3Idx := GlobalS3Index
+	oldDemoter := getGlobalHybridDemoter()
 	oldHealth := getGlobalStorageHealth()
 	oldPM := GlobalPrehydrationManager
 	oldBroker := GlobalLogBroker
 	t.Cleanup(func() {
+		if d := getGlobalHybridDemoter(); d != nil && d != oldDemoter {
+			d.Stop()
+		}
 		if GlobalCacheIndex != nil && GlobalCacheIndex != oldIdx {
 			GlobalCacheIndex.Stop()
 		}
 		if curHealth := getGlobalStorageHealth(); curHealth != nil && curHealth != oldHealth {
 			curHealth.Stop()
 		}
+		if GlobalRegistry != nil && GlobalRegistry != oldReg {
+			GlobalRegistry.Stop()
+		}
 		GlobalConfig = oldCfg
 		GlobalStorage = oldStorage
 		GlobalRegistry = oldReg
 		GlobalCacheIndex = oldIdx
 		GlobalS3Index = oldS3Idx
+		setGlobalHybridDemoter(oldDemoter)
 		setGlobalStorageHealth(oldHealth)
 		GlobalPrehydrationManager = oldPM
 		GlobalLogBroker = oldBroker

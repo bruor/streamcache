@@ -1039,6 +1039,7 @@ func TestS3RecompositionAbortOnFailure(t *testing.T) {
 }
 
 func TestS3PrehydrationSkipsAlreadyCachedInS3(t *testing.T) {
+	saveAndRestorePhase1Globals(t)
 	mockS3 := NewMockS3Server("prehydrate-s3-bucket")
 	defer mockS3.Close()
 
@@ -1150,6 +1151,7 @@ func (d *delayedRecomposeStorage) Recompose(ctx context.Context, key string, tot
 }
 
 func TestS3SynchronousFinalizeAndReaderTransition(t *testing.T) {
+	saveAndRestorePhase1Globals(t)
 	mockS3 := NewMockS3Server("sync-commit-bucket")
 	defer mockS3.Close()
 

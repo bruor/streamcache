@@ -197,9 +197,34 @@ func (c *Config) SetNASSequentialStage(val string) {
 	c.NASSequentialStage = val
 }
 
-func normalizeDemoteThreshold(val int) int {
+func defaultHybridDemoteThreshold(cacheMaxItemPct int) int {
+	pct := normalizeCacheMaxItemPct(cacheMaxItemPct)
+	if pct >= 1 && pct <= 99 {
+		inv := 100 - pct
+		if inv < 50 {
+			return 50
+		}
+		return inv
+	}
+	return 100
+}
+
+func detectHybridThresholdWarning(cfg *Config) string {
+	if cfg == nil || cfg.EffectiveStorageBackend() != "hybrid" {
+		return ""
+	}
+	maxItemPct := cfg.GetCacheMaxItemPct()
+	demotePct := cfg.GetHybridDemoteThreshold()
+	if maxItemPct > 0 && demotePct < maxItemPct {
+		return fmt.Sprintf("HYBRID_DEMOTE_THRESHOLD (%d%%) is lower than CACHE_MAX_ITEM_PCT (%d%%); idle files larger than %d%% of CACHE_MAX_BYTES will be immediately demoted to S3 after playback instead of remaining warm on Disk",
+			demotePct, maxItemPct, demotePct)
+	}
+	return ""
+}
+
+func normalizeDemoteThreshold(val, cacheMaxItemPct int) int {
 	if val <= 0 {
-		return 80
+		return defaultHybridDemoteThreshold(cacheMaxItemPct)
 	}
 	if val > 100 {
 		return 100
@@ -209,11 +234,11 @@ func normalizeDemoteThreshold(val int) int {
 
 func (c *Config) GetHybridDemoteThreshold() int {
 	if c == nil {
-		return 80
+		return defaultHybridDemoteThreshold(50)
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return normalizeDemoteThreshold(c.HybridDemoteThreshold)
+	return normalizeDemoteThreshold(c.HybridDemoteThreshold, c.CacheMaxItemPct)
 }
 
 func (c *Config) SetHybridDemoteThreshold(val int) {
@@ -222,7 +247,7 @@ func (c *Config) SetHybridDemoteThreshold(val int) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.HybridDemoteThreshold = normalizeDemoteThreshold(val)
+	c.HybridDemoteThreshold = normalizeDemoteThreshold(val, c.CacheMaxItemPct)
 }
 
 func (c *Config) GetHybridEagerS3Backup() bool {
@@ -794,13 +819,16 @@ func (c *Config) SetMaxProbeBuffers(val int) {
 var GlobalConfig *Config
 
 func parseConfigFromEnv() *Config {
+	cacheMaxItemPct := getEnvPercent("CACHE_MAX_ITEM_PCT", 50)
+	defaultDemoteThreshold := defaultHybridDemoteThreshold(cacheMaxItemPct)
+
 	cfg := &Config{
 		Port:                    getEnv("PORT", ":8080"),
 		CacheDir:                getEnv("CACHE_DIR", "./cache/files"),
 		TmpDir:                  getEnv("TMP_DIR", "./cache/tmp"),
 		StateDir:                getEnv("STATE_DIR", ""),
-		CacheMaxBytes:           getEnvSize("CACHE_MAX_BYTES", 50*1024*1024*1024),           // 50GB
-		CacheMaxItemPct:         getEnvPercent("CACHE_MAX_ITEM_PCT", 50),
+		CacheMaxBytes:           getEnvSize("CACHE_MAX_BYTES", 50*1024*1024*1024), // 50GB
+		CacheMaxItemPct:         cacheMaxItemPct,
 		CacheMinDiskFreeBytes:   getEnvSize("CACHE_MIN_DISK_FREE_BYTES", 10*1024*1024*1024), // 10GB
 		TmpFileMaxBytes:         getEnvSize("TMP_FILE_MAX_BYTES", 512*1024*1024),            // 512MB
 		TmpMinDiskFreeBytes:     getEnvSize("TMP_MIN_DISK_FREE_BYTES", 1*1024*1024*1024),    // 1GB
@@ -818,9 +846,9 @@ func parseConfigFromEnv() *Config {
 		StallTeardownCooldown:   getEnvDuration("STALL_TEARDOWN_COOLDOWN", 5*time.Second),
 		LogVerbose:              getEnvBool("LOG_VERBOSE", false),
 		WritebackBufferSize:     getEnvSize("WRITEBACK_BUFFER_SIZE", 64*1024*1024), // 64MB
-		StorageBackend:            getEnv("STORAGE_BACKEND", "disk"),
-		NASSequentialStage:        getEnv("NAS_SEQUENTIAL_STAGE", "auto"),
-		HybridDemoteThreshold:     getEnvPercentClamped("HYBRID_DEMOTE_THRESHOLD", 80, 1, 100),
+		StorageBackend:          getEnv("STORAGE_BACKEND", "disk"),
+		NASSequentialStage:      getEnv("NAS_SEQUENTIAL_STAGE", "auto"),
+		HybridDemoteThreshold:   getEnvPercentClamped("HYBRID_DEMOTE_THRESHOLD", defaultDemoteThreshold, 1, 100),
 		HybridEagerS3Backup:       getEnvBool("HYBRID_EAGER_S3_BACKUP", false),
 		S3Config: S3Config{
 			Endpoint:              getEnv("S3_ENDPOINT", ""),
@@ -975,6 +1003,9 @@ func LoadConfig() {
 		cfg.GetMinReadThresholdBytes()/(1024*1024),
 		cfg.GetMaxProbeBuffers(),
 	)
+	if w := detectHybridThresholdWarning(cfg); w != "" {
+		log.Printf("[Config] WARNING: %s", w)
+	}
 }
 
 func getEnvPercentClamped(key string, fallback, minVal, maxVal int) int {

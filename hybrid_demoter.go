@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -35,9 +36,10 @@ type HybridDemoter struct {
 	registry *CacheRegistry
 	cfg      *Config
 
-	triggerCh     chan struct{}
-	backupCh      chan string
-	backupPending map[string]struct{}
+	triggerCh            chan struct{}
+	backupCh             chan string
+	backupPending        map[string]struct{}
+	pendingHeadroomBytes int64
 
 	mu       sync.Mutex
 	passMu   sync.Mutex
@@ -92,6 +94,27 @@ func (d *HybridDemoter) TriggerWatermarkDemotion() {
 	case d.triggerCh <- struct{}{}:
 	default:
 	}
+}
+
+// RequestHeadroom records a one-shot L1 free headroom target (in bytes) and triggers
+// asynchronous demotion so subsequent L1-eligible items are not wedged out when
+// HYBRID_DEMOTE_THRESHOLD is high. Concurrent requests retain the max rather than
+// summing so Disk is never over-evicted.
+func (d *HybridDemoter) RequestHeadroom(bytes int64) {
+	if d == nil || bytes <= 0 {
+		return
+	}
+	select {
+	case <-d.ctx.Done():
+		return
+	default:
+	}
+	d.mu.Lock()
+	if bytes > d.pendingHeadroomBytes {
+		d.pendingHeadroomBytes = bytes
+	}
+	d.mu.Unlock()
+	d.TriggerWatermarkDemotion()
 }
 
 // EnqueueEagerBackup queues a freshly committed L1 asset for asynchronous S3 backup when enabled.
@@ -243,6 +266,37 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 
 	thresholdBytes := int64(float64(maxBytes) * float64(thresholdPct) / 100.0)
 
+	d.mu.Lock()
+	reqHeadroom := d.pendingHeadroomBytes
+	d.pendingHeadroomBytes = 0
+	d.mu.Unlock()
+
+	if reqHeadroom > 0 {
+		if maxItemPct := d.cfg.GetCacheMaxItemPct(); maxItemPct > 0 {
+			maxItemBytes := int64(math.Round(float64(maxBytes) * float64(maxItemPct) / 100.0))
+			if reqHeadroom > maxItemBytes {
+				reqHeadroom = maxItemBytes
+			}
+		}
+		if maxNudgeBytes := maxBytes / 2; maxNudgeBytes > 0 && reqHeadroom > maxNudgeBytes {
+			reqHeadroom = maxNudgeBytes
+		}
+		if reqHeadroom > maxBytes {
+			reqHeadroom = maxBytes
+		}
+	}
+
+	targetBytes := thresholdBytes
+	if reqHeadroom > 0 {
+		headroomTarget := maxBytes - reqHeadroom
+		if headroomTarget < 0 {
+			headroomTarget = 0
+		}
+		if headroomTarget < targetBytes {
+			targetBytes = headroomTarget
+		}
+	}
+
 	localObjs, err := d.storage.Local().List(ctx)
 	if err != nil {
 		return 0, 0, err
@@ -252,7 +306,7 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 	for _, obj := range localObjs {
 		localTotalBytes += obj.Size
 	}
-	if localTotalBytes <= thresholdBytes {
+	if localTotalBytes <= targetBytes {
 		return 0, 0, nil
 	}
 
@@ -301,13 +355,24 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 		return candidates[i].Key < candidates[j].Key
 	})
 
+	restorePendingHeadroom := func() {
+		if reqHeadroom > 0 {
+			d.mu.Lock()
+			if reqHeadroom > d.pendingHeadroomBytes {
+				d.pendingHeadroomBytes = reqHeadroom
+			}
+			d.mu.Unlock()
+		}
+	}
+
 	demoted := 0
 	var freed int64
 	for _, cand := range candidates {
-		if localTotalBytes <= thresholdBytes {
+		if localTotalBytes <= targetBytes {
 			break
 		}
 		if err := ctx.Err(); err != nil {
+			restorePendingHeadroom()
 			return demoted, freed, err
 		}
 		if d.registry != nil && d.registry.IsKeyInUse(cand.Key) {
@@ -339,6 +404,7 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 			if uploadErr := d.storage.S3().UploadFromFile(ctx, cand.Key, localPath, *localMeta); uploadErr != nil {
 				RecordS3Failure(uploadErr)
 				log.Printf("[HybridDemoter] S3 upload failed for %s during demotion; preserving local L1 copy: %v", cand.Key, uploadErr)
+				restorePendingHeadroom()
 				return demoted, freed, uploadErr
 			}
 			RecordS3Success()
@@ -379,7 +445,11 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 		if d.index != nil {
 			_ = d.index.Flush()
 		}
-		log.Printf("[HybridDemoter] Demoted %d asset(s) (%d bytes) from L1 to L2 S3 (remaining L1: %d bytes, target <= %d bytes)", demoted, freed, localTotalBytes, thresholdBytes)
+		if reqHeadroom > 0 {
+			log.Printf("[HybridDemoter] Demoted %d asset(s) (%d bytes) from L1 to L2 S3 (remaining L1: %d bytes, target <= %d bytes, headroomReq=%d)", demoted, freed, localTotalBytes, targetBytes, reqHeadroom)
+		} else {
+			log.Printf("[HybridDemoter] Demoted %d asset(s) (%d bytes) from L1 to L2 S3 (remaining L1: %d bytes, target <= %d bytes)", demoted, freed, localTotalBytes, targetBytes)
+		}
 	}
 	return demoted, freed, nil
 }

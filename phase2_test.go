@@ -530,7 +530,8 @@ func TestPhase2HybridAdmissionBypassAndSingleStatHIT(t *testing.T) {
 	}
 
 	// 4. Unallocated headroom overflow: seed extra 80KB warm file (120 + 80 = 200KB used out of 300KB),
-	// then stream 120KB overflow.mp4 -> must bypass to TierS3 WITHOUT evicting warm L1 files!
+	// then stream 120KB overflow.mp4 -> must bypass to TierS3 cleanly without synchronous eviction
+	// (background HybridDemoter may asynchronously demote smallKey to S3 for headroom, preserving both).
 	warmExtra := filepath.Join(cacheDir, "warm_extra.mp4")
 	_ = os.WriteFile(warmExtra, bytes.Repeat([]byte("W"), 80*1024), 0644)
 
@@ -553,8 +554,11 @@ func TestPhase2HybridAdmissionBypassAndSingleStatHIT(t *testing.T) {
 	}) {
 		t.Fatalf("Expected unallocated-headroom overflow.mp4 to bypass to S3 vod/%s", overflowKey)
 	}
-	if !FileExists(warmExtra) || !FileExists(filepath.Join(cacheDir, smallKey)) {
-		t.Errorf("Expected warm L1 files NOT to be forced-evicted in hybrid mode")
+	if !FileExists(warmExtra) {
+		t.Errorf("Expected warm L1 file %s to remain on Disk", warmExtra)
+	}
+	if !FileExists(filepath.Join(cacheDir, smallKey)) && !mockS3.HasObject("hybrid-bucket", "vod/"+smallKey) {
+		t.Errorf("Expected %s to remain warm on Disk or be safely demoted to S3 vod/%s", smallKey, smallKey)
 	}
 	if FileExists(filepath.Join(cacheDir, overflowKey)) {
 		t.Errorf("Expected bypassed overflow.mp4 not to enter CACHE_DIR")

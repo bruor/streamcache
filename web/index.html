@@ -3157,7 +3157,8 @@
                             `Unallocated: ${formatCleanBytes(cacheUnallocatedBytes)} • Total Pool: ${formatCleanBytes(cacheTotalSpan)}`,
                         ];
                         if (demoteBytes > 0) {
-                            let demoteLine = `S3 Demote Threshold: ${formatCleanBytes(demoteBytes)} (${demotePct}%)`;
+                            const demoteLabel = demotePct >= 100 ? '100% — on-demand' : `${demotePct}%`;
+                            let demoteLine = `S3 Demote Threshold: ${formatCleanBytes(demoteBytes)} (${demoteLabel})`;
                             if (st.hybrid_eager_s3_backup) demoteLine += ' • Eager backup ON';
                             cacheTooltipLines.push(demoteLine);
                         }

@@ -237,7 +237,7 @@ func NewFileCacheState(key, targetURL, cacheFilePath, partPath, metaPath, conten
 			admit := true
 			reason := ""
 			if GlobalRegistry != nil {
-				admit, reason = GlobalRegistry.CanAdmitToHybridL1(totalSize)
+				admit, reason = GlobalRegistry.AdmitToHybridL1(totalSize)
 			}
 			if admit {
 				targetTier = TierDisk
@@ -854,6 +854,7 @@ func (s *FileCacheState) MaterializeDiskFile() error {
 
 type CacheRegistry struct {
 	Lock             sync.RWMutex
+	hybridAdmitMu    sync.Mutex
 	Files            map[string]*FileCacheState
 	Connections      map[string]*ClientConnection
 	Sessions         map[string]*ClientSession
@@ -1877,6 +1878,66 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 		}
 	}
 
+	cacheDir := GlobalConfig.GetCacheDir()
+	snap := r.snapshotL1DiskState(cacheDir, nil)
+
+	if maxBytes > 0 {
+		committedL1 := snap.PinnedL1Bytes
+		if !allowEviction {
+			committedL1 += snap.InactiveEvictableBytes
+		}
+		if committedL1+totalSize > maxBytes {
+			return false, fmt.Sprintf("L1 occupancy (%d) + item (%d) exceeds CACHE_MAX_BYTES (%d) (allowEviction=%v, inactive=%d)",
+				committedL1, totalSize, maxBytes, allowEviction, snap.InactiveEvictableBytes)
+		}
+	}
+
+	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
+	if freeSpace, spaceErr := GetDiskFreeSpace(cacheDir); spaceErr == nil {
+		var required uint64
+		if totalSize > 0 {
+			required += uint64(totalSize)
+		}
+		if snap.UnwrittenActiveL1Bytes > 0 {
+			required += uint64(snap.UnwrittenActiveL1Bytes)
+		}
+		if minDiskFree > 0 {
+			required += uint64(minDiskFree)
+		}
+		maxAvailable := freeSpace
+		if allowEviction && snap.InactiveEvictableBytes > 0 {
+			if freeSpace > math.MaxUint64-uint64(snap.InactiveEvictableBytes) {
+				maxAvailable = math.MaxUint64
+			} else {
+				maxAvailable += uint64(snap.InactiveEvictableBytes)
+			}
+		}
+		if maxAvailable < required {
+			return false, fmt.Sprintf("insufficient L1 disk space (available %d < required %d, allowEviction=%v)",
+				maxAvailable, required, allowEviction)
+		}
+	}
+
+	return true, ""
+}
+
+type backedL1Candidate struct {
+	Name         string
+	Path         string
+	Size         int64
+	LastAccessed time.Time
+}
+
+type l1DiskSnapshot struct {
+	PinnedL1Bytes          int64
+	InactiveEvictableBytes int64
+	UnwrittenActiveL1Bytes int64
+	InactiveBackedBytes    int64
+	BackedCandidates       []backedL1Candidate
+}
+
+func (r *CacheRegistry) snapshotL1DiskState(cacheDir string, idx *CacheIndex) l1DiskSnapshot {
+	var snap l1DiskSnapshot
 	activeKeys := make(map[string]bool)
 	var activeFiles []*FileCacheState
 	if r != nil {
@@ -1896,9 +1957,6 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 		r.Lock.RUnlock()
 	}
 
-	cacheDir := GlobalConfig.GetCacheDir()
-	var pinnedL1Bytes int64
-	var inactiveEvictableBytes int64
 	pinnedHandled := make(map[string]bool)
 	stagedBytes := make(map[string]int64)
 
@@ -1921,15 +1979,43 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 				continue
 			}
 			if activeKeys[name] {
-				pinnedL1Bytes += info.Size()
+				snap.PinnedL1Bytes += info.Size()
 				pinnedHandled[name] = true
-			} else {
-				inactiveEvictableBytes += info.Size()
+				continue
+			}
+
+			sz := info.Size()
+			snap.InactiveEvictableBytes += sz
+			if idx != nil {
+				if idxEntry, ok := idx.Get(name); ok && (idxEntry.Tier == IndexTierBoth || idxEntry.Tier == IndexTierS3) {
+					var lastAccessed time.Time
+					if idxEntry.LastAccessed > 0 {
+						lastAccessed = time.Unix(idxEntry.LastAccessed, 0)
+					}
+					fullPath := filepath.Join(cacheDir, name)
+					if lastAccessed.IsZero() {
+						if metaBytes, merr := os.ReadFile(fullPath + ".json"); merr == nil {
+							var meta FileMeta
+							if json.Unmarshal(metaBytes, &meta) == nil && meta.LastValidated > 0 {
+								lastAccessed = time.Unix(meta.LastValidated, 0)
+							}
+						}
+					}
+					if lastAccessed.IsZero() {
+						lastAccessed = info.ModTime()
+					}
+					snap.InactiveBackedBytes += sz
+					snap.BackedCandidates = append(snap.BackedCandidates, backedL1Candidate{
+						Name:         name,
+						Path:         fullPath,
+						Size:         sz,
+						LastAccessed: lastAccessed,
+					})
+				}
 			}
 		}
 	}
 
-	var unwrittenActiveL1Bytes int64
 	for _, f := range activeFiles {
 		f.Lock.Lock()
 		key := f.Key
@@ -1943,60 +2029,192 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 		if isYield || tier != TierDisk || totalSz <= 0 || pinnedHandled[key] {
 			continue
 		}
-		pinnedL1Bytes += totalSz
+		snap.PinnedL1Bytes += totalSz
 		if cm != nil && cm.TargetName() == "nas" {
 			rem := totalSz - stagedBytes[key]
 			if rem > 0 {
-				unwrittenActiveL1Bytes += rem
+				snap.UnwrittenActiveL1Bytes += rem
 			}
 		} else if isMat {
 			downloaded := atomic.LoadInt64(&f.TotalBytesDownloaded)
 			if rem := totalSz - downloaded; rem > 0 {
-				unwrittenActiveL1Bytes += rem
+				snap.UnwrittenActiveL1Bytes += rem
 			}
 		} else {
-			unwrittenActiveL1Bytes += totalSz
+			snap.UnwrittenActiveL1Bytes += totalSz
 		}
 	}
 
+	return snap
+}
+
+// AdmitToHybridL1 decides whether an incoming item can enter persistent CACHE_DIR in hybrid mode.
+// When L1 headroom is tight, inactive local copies already safely backed on S3 (Tier=="both")
+// are instantly unlinked so the incoming item lands on Disk without S3 wait. If pure Disk-only
+// files still block admission of an L1-eligible item, the current stream bypasses cleanly to
+// TierS3 while HybridDemoter is nudged asynchronously to clear one item's worth of headroom.
+func (r *CacheRegistry) AdmitToHybridL1(totalSize int64) (bool, string) {
+	if r == nil {
+		return (*CacheRegistry)(nil).CanAdmitToHybridL1(totalSize)
+	}
+
+	idx := getGlobalCacheIndex()
+	admit, shouldNudge, flushedNeeded, reason := r.tryAdmitHybridL1Locked(totalSize, idx)
+	if flushedNeeded && idx != nil {
+		_ = idx.Flush()
+	}
+	if !admit && shouldNudge {
+		if demoter := getGlobalHybridDemoter(); demoter != nil && (demoter.registry == nil || demoter.registry == r) {
+			demoter.RequestHeadroom(totalSize)
+		}
+	}
+	return admit, reason
+}
+
+func (r *CacheRegistry) tryAdmitHybridL1Locked(totalSize int64, idx *CacheIndex) (admit bool, shouldNudge bool, flushIndex bool, reason string) {
+	r.hybridAdmitMu.Lock()
+	defer r.hybridAdmitMu.Unlock()
+
+	if GlobalConfig == nil {
+		return true, false, false, ""
+	}
+	if !GlobalConfig.UsesCacheDir() {
+		return false, false, false, "cache_dir_disabled"
+	}
+	if !IsNASHealthy() {
+		return false, false, false, "nas_circuit_open"
+	}
+	if totalSize <= 0 {
+		return false, false, false, "unknown_size_bypass"
+	}
+
+	maxBytes := GlobalConfig.GetCacheMaxBytes()
+	maxItemPct := GlobalConfig.GetCacheMaxItemPct()
+	if maxBytes > 0 && maxItemPct > 0 {
+		maxItemBytes := int64(math.Round(float64(maxBytes) * float64(maxItemPct) / 100.0))
+		if totalSize > maxItemBytes {
+			return false, false, false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_ITEM_PCT limit (%d%% of %d = %d bytes)",
+				totalSize, maxItemPct, maxBytes, maxItemBytes)
+		}
+	}
+	if maxBytes > 0 && totalSize > maxBytes {
+		return false, false, false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_BYTES (%d)", totalSize, maxBytes)
+	}
+
+	cacheDir := GlobalConfig.GetCacheDir()
+	snap := r.snapshotL1DiskState(cacheDir, idx)
+
+	var needForMaxBytes int64
 	if maxBytes > 0 {
-		committedL1 := pinnedL1Bytes
-		if !allowEviction {
-			committedL1 += inactiveEvictableBytes
-		}
+		committedL1 := snap.PinnedL1Bytes + snap.InactiveEvictableBytes
 		if committedL1+totalSize > maxBytes {
-			return false, fmt.Sprintf("L1 occupancy (%d) + item (%d) exceeds CACHE_MAX_BYTES (%d) (allowEviction=%v, inactive=%d)",
-				committedL1, totalSize, maxBytes, allowEviction, inactiveEvictableBytes)
+			needForMaxBytes = (committedL1 + totalSize) - maxBytes
 		}
 	}
 
+	var needForDiskFree int64
+	var freeSpace uint64
+	var required uint64
+	hasSpaceInfo := false
 	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
-	if freeSpace, spaceErr := GetDiskFreeSpace(cacheDir); spaceErr == nil {
-		var required uint64
+	if fsSpace, spaceErr := GetDiskFreeSpace(cacheDir); spaceErr == nil {
+		hasSpaceInfo = true
+		freeSpace = fsSpace
 		if totalSize > 0 {
 			required += uint64(totalSize)
 		}
-		if unwrittenActiveL1Bytes > 0 {
-			required += uint64(unwrittenActiveL1Bytes)
+		if snap.UnwrittenActiveL1Bytes > 0 {
+			required += uint64(snap.UnwrittenActiveL1Bytes)
 		}
 		if minDiskFree > 0 {
 			required += uint64(minDiskFree)
 		}
-		maxAvailable := freeSpace
-		if allowEviction && inactiveEvictableBytes > 0 {
-			if freeSpace > math.MaxUint64-uint64(inactiveEvictableBytes) {
-				maxAvailable = math.MaxUint64
-			} else {
-				maxAvailable += uint64(inactiveEvictableBytes)
-			}
-		}
-		if maxAvailable < required {
-			return false, fmt.Sprintf("insufficient L1 disk space (available %d < required %d, allowEviction=%v)",
-				maxAvailable, required, allowEviction)
+		if freeSpace < required {
+			needForDiskFree = int64(required - freeSpace)
 		}
 	}
 
-	return true, ""
+	bytesNeeded := needForMaxBytes
+	if needForDiskFree > bytesNeeded {
+		bytesNeeded = needForDiskFree
+	}
+	if bytesNeeded <= 0 {
+		return true, false, false, ""
+	}
+
+	// Instant synchronous reclaim of inactive local copies already safely backed on S3.
+	var reclaimed int64
+	reclaimedCount := 0
+	if idx != nil && IsS3Healthy() && snap.InactiveBackedBytes >= bytesNeeded && len(snap.BackedCandidates) > 0 {
+		sort.Slice(snap.BackedCandidates, func(i, j int) bool {
+			if !snap.BackedCandidates[i].LastAccessed.Equal(snap.BackedCandidates[j].LastAccessed) {
+				return snap.BackedCandidates[i].LastAccessed.Before(snap.BackedCandidates[j].LastAccessed)
+			}
+			return snap.BackedCandidates[i].Name < snap.BackedCandidates[j].Name
+		})
+		tieredStorage, _ := GlobalStorage.(*TieredStorageBackend)
+		for _, cand := range snap.BackedCandidates {
+			if reclaimed >= bytesNeeded {
+				break
+			}
+			if r.IsKeyInUse(cand.Name) {
+				continue
+			}
+			curEntry, ok := idx.Get(cand.Name)
+			if !ok || (curEntry.Tier != IndexTierBoth && curEntry.Tier != IndexTierS3) {
+				continue
+			}
+			var delErr error
+			if tieredStorage != nil && tieredStorage.Local() != nil {
+				delErr = tieredStorage.DeleteLocal(context.Background(), cand.Name)
+			} else {
+				delErr = os.Remove(cand.Path)
+				_ = os.Remove(cand.Path + ".json")
+			}
+			if delErr != nil && !os.IsNotExist(delErr) {
+				log.Printf("[Admission] Failed instant Tier=both reclaim of %s: %v", cand.Name, delErr)
+				continue
+			}
+			r.UpdateSize(-cand.Size)
+			idx.MarkAddedToTier(cand.Name, IndexTierS3)
+			idx.MarkRemovedFromTier(cand.Name, IndexTierDisk)
+			idx.RecordDemotionDiskToS3(1, cand.Size)
+			reclaimed += cand.Size
+			reclaimedCount++
+		}
+		if reclaimed >= bytesNeeded {
+			diskOK := true
+			if needForDiskFree > 0 {
+				if fsSpace, spaceErr := GetDiskFreeSpace(cacheDir); spaceErr == nil && fsSpace < required {
+					diskOK = false
+					freeSpace = fsSpace
+				}
+			}
+			if diskOK {
+				log.Printf("[Admission] Instantly reclaimed %d Tier=both local file(s) (%d bytes) for incoming %d-byte hybrid L1 item",
+					reclaimedCount, reclaimed, totalSize)
+				return true, false, reclaimedCount > 0, ""
+			}
+		}
+	}
+
+	remainingInactive := snap.InactiveEvictableBytes - reclaimed
+	if remainingInactive < 0 {
+		remainingInactive = 0
+	}
+	committedL1 := snap.PinnedL1Bytes + remainingInactive
+	if maxBytes > 0 && committedL1+totalSize > maxBytes {
+		reason = fmt.Sprintf("L1 occupancy (%d) + item (%d) exceeds CACHE_MAX_BYTES (%d) (allowEviction=false, inactive=%d)",
+			committedL1, totalSize, maxBytes, remainingInactive)
+	} else if hasSpaceInfo {
+		reason = fmt.Sprintf("insufficient L1 disk space (available %d < required %d, allowEviction=false)",
+			freeSpace, required)
+	} else {
+		reason = "L1 capacity unavailable"
+	}
+
+	shouldNudge = maxBytes > 0 && remainingInactive > 0
+	return false, shouldNudge, reclaimedCount > 0, reason
 }
 
 func isAuxiliaryCacheFile(name string) bool {

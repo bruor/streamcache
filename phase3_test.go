@@ -20,17 +20,45 @@ func TestPhase3ConfigHybridWatermarksAndEagerBackup(t *testing.T) {
 	origCfg := GlobalConfig
 	t.Cleanup(func() { GlobalConfig = origCfg })
 
-	// 1. Defaults
+	// 1. Defaults: CACHE_MAX_ITEM_PCT=50 -> HYBRID_DEMOTE_THRESHOLD defaults to 100 - 50 = 50
 	LoadConfig()
 	cfg := GlobalConfig
-	if cfg.GetHybridDemoteThreshold() != 80 {
-		t.Errorf("Expected default HYBRID_DEMOTE_THRESHOLD=80, got %d", cfg.GetHybridDemoteThreshold())
+	if cfg.GetHybridDemoteThreshold() != 50 {
+		t.Errorf("Expected default HYBRID_DEMOTE_THRESHOLD=50 (100 - CACHE_MAX_ITEM_PCT=50), got %d", cfg.GetHybridDemoteThreshold())
 	}
 	if cfg.GetHybridEagerS3Backup() {
 		t.Errorf("Expected default HYBRID_EAGER_S3_BACKUP=false, got true")
 	}
 
-	// 2. Custom valid value
+	// 2. Inverse default tracks max(50, 100 - CACHE_MAX_ITEM_PCT) when 1..99, and 100 (reactive nudge) for 0/100
+	t.Setenv("CACHE_MAX_ITEM_PCT", "20")
+	LoadConfig()
+	if got := GlobalConfig.GetHybridDemoteThreshold(); got != 80 {
+		t.Errorf("Expected default HYBRID_DEMOTE_THRESHOLD=80 for CACHE_MAX_ITEM_PCT=20, got %d", got)
+	}
+	t.Setenv("CACHE_MAX_ITEM_PCT", "10")
+	LoadConfig()
+	if got := GlobalConfig.GetHybridDemoteThreshold(); got != 90 {
+		t.Errorf("Expected default HYBRID_DEMOTE_THRESHOLD=90 for CACHE_MAX_ITEM_PCT=10, got %d", got)
+	}
+	t.Setenv("CACHE_MAX_ITEM_PCT", "80")
+	LoadConfig()
+	if got := GlobalConfig.GetHybridDemoteThreshold(); got != 50 {
+		t.Errorf("Expected floored default HYBRID_DEMOTE_THRESHOLD=50 for CACHE_MAX_ITEM_PCT=80, got %d", got)
+	}
+	t.Setenv("CACHE_MAX_ITEM_PCT", "0")
+	LoadConfig()
+	if got := GlobalConfig.GetHybridDemoteThreshold(); got != 100 {
+		t.Errorf("Expected fallback HYBRID_DEMOTE_THRESHOLD=100 for CACHE_MAX_ITEM_PCT=0, got %d", got)
+	}
+	t.Setenv("CACHE_MAX_ITEM_PCT", "100")
+	LoadConfig()
+	if got := GlobalConfig.GetHybridDemoteThreshold(); got != 100 {
+		t.Errorf("Expected fallback HYBRID_DEMOTE_THRESHOLD=100 for CACHE_MAX_ITEM_PCT=100, got %d", got)
+	}
+
+	// 3. Explicit custom valid values override the inverse default
+	t.Setenv("CACHE_MAX_ITEM_PCT", "20")
 	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "85")
 	t.Setenv("HYBRID_EAGER_S3_BACKUP", "true")
 	LoadConfig()
@@ -42,19 +70,59 @@ func TestPhase3ConfigHybridWatermarksAndEagerBackup(t *testing.T) {
 		t.Errorf("Expected custom HYBRID_EAGER_S3_BACKUP=true, got false")
 	}
 
-	// 3. Clamping > 100 and < 0
-	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "120")
+	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "100")
 	LoadConfig()
-	cfg = GlobalConfig
-	if cfg.GetHybridDemoteThreshold() != 100 {
-		t.Errorf("Expected clamped threshold=100; got %d", cfg.GetHybridDemoteThreshold())
+	if GlobalConfig.GetHybridDemoteThreshold() != 100 {
+		t.Errorf("Expected explicit HYBRID_DEMOTE_THRESHOLD=100, got %d", GlobalConfig.GetHybridDemoteThreshold())
 	}
 
+	// 4. Clamping > 100 and < 0 fallback
+	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "120")
+	LoadConfig()
+	if GlobalConfig.GetHybridDemoteThreshold() != 100 {
+		t.Errorf("Expected clamped threshold=100; got %d", GlobalConfig.GetHybridDemoteThreshold())
+	}
+
+	t.Setenv("CACHE_MAX_ITEM_PCT", "20")
 	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "-5")
 	LoadConfig()
-	cfg = GlobalConfig
-	if cfg.GetHybridDemoteThreshold() != 80 {
-		t.Errorf("Expected negative threshold to fall back to default=80; got %d", cfg.GetHybridDemoteThreshold())
+	if GlobalConfig.GetHybridDemoteThreshold() != 80 {
+		t.Errorf("Expected negative threshold with CACHE_MAX_ITEM_PCT=20 to fall back to 80; got %d", GlobalConfig.GetHybridDemoteThreshold())
+	}
+
+	t.Setenv("CACHE_MAX_ITEM_PCT", "")
+	t.Setenv("HYBRID_DEMOTE_THRESHOLD", "-5")
+	LoadConfig()
+	if GlobalConfig.GetHybridDemoteThreshold() != 50 {
+		t.Errorf("Expected negative threshold with default CACHE_MAX_ITEM_PCT=50 to fall back to 50; got %d", GlobalConfig.GetHybridDemoteThreshold())
+	}
+
+	// 5. Startup warning only when hybrid mode sets HYBRID_DEMOTE_THRESHOLD < CACHE_MAX_ITEM_PCT
+	if w := detectHybridThresholdWarning(&Config{
+		StorageBackend:        "hybrid",
+		CacheDir:              "./cache/files",
+		CacheMaxItemPct:       50,
+		HybridDemoteThreshold: 20,
+		S3Config:              S3Config{Bucket: "test-bucket"},
+	}); w == "" {
+		t.Errorf("Expected warning when hybrid HYBRID_DEMOTE_THRESHOLD (20) < CACHE_MAX_ITEM_PCT (50)")
+	}
+	if w := detectHybridThresholdWarning(&Config{
+		StorageBackend:        "hybrid",
+		CacheDir:              "./cache/files",
+		CacheMaxItemPct:       50,
+		HybridDemoteThreshold: 50,
+		S3Config:              S3Config{Bucket: "test-bucket"},
+	}); w != "" {
+		t.Errorf("Expected no warning when HYBRID_DEMOTE_THRESHOLD == CACHE_MAX_ITEM_PCT, got %q", w)
+	}
+	if w := detectHybridThresholdWarning(&Config{
+		StorageBackend:        "disk",
+		CacheDir:              "./cache/files",
+		CacheMaxItemPct:       50,
+		HybridDemoteThreshold: 20,
+	}); w != "" {
+		t.Errorf("Expected no warning in disk mode, got %q", w)
 	}
 }
 
@@ -727,5 +795,278 @@ func TestPhase3WatermarkDemotionEagerBackupAndPreEvictDemoteFirst(t *testing.T) 
 			t.Errorf("Expected eager.mp4 to be uploaded to S3")
 		}
 		_ = fmt.Sprintf("verified eager S3 backup")
+	})
+}
+
+func TestPhase3HybridInstantTierBothReclaimAndBoundedHeadroomNudge(t *testing.T) {
+	setupHybridEnv := func(t *testing.T, bucket string, maxBytes int64, maxItemPct int, demoteThreshold int, preSeed func(tiered *TieredStorageBackend)) (*MockS3Server, *TieredStorageBackend, *CacheIndex, *HybridDemoter, string, string) {
+		t.Helper()
+		saveAndRestorePhase1Globals(t)
+		clearPhase0ConfigEnv(t)
+
+		mockS3 := NewMockS3Server(bucket)
+		t.Cleanup(mockS3.Close)
+
+		base := t.TempDir()
+		cacheDir := filepath.Join(base, "cache")
+		tmpDir := filepath.Join(base, "tmp")
+		stateDir := filepath.Join(base, "state")
+		for _, dir := range []string{cacheDir, tmpDir, stateDir} {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatalf("MkdirAll %s: %v", dir, err)
+			}
+		}
+
+		GlobalConfig = &Config{
+			StorageBackend:          "hybrid",
+			CacheDir:                cacheDir,
+			TmpDir:                  tmpDir,
+			StateDir:                stateDir,
+			CacheMaxBytes:           maxBytes,
+			CacheMaxItemPct:         maxItemPct,
+			HybridDemoteThreshold:   demoteThreshold,
+			CacheMinDiskFreeBytes:   0,
+			TmpFileMaxBytes:         512 * 1024 * 1024,
+			CacheRevalidateInterval: 1 * time.Hour,
+			S3Config: S3Config{
+				Endpoint:     mockS3.URL(),
+				Bucket:       bucket,
+				Region:       "us-east-1",
+				AccessKey:    "test",
+				SecretKey:    "test",
+				UsePathStyle: true,
+				DisableSSL:   true,
+				ChunkSize:    64 * 1024,
+			},
+		}
+
+		GlobalStorage = nil
+		if err := InitStorage(); err != nil {
+			t.Fatalf("InitStorage hybrid error: %v", err)
+		}
+		tiered := GlobalStorage.(*TieredStorageBackend)
+		if preSeed != nil {
+			preSeed(tiered)
+		}
+		InitRegistry()
+
+		idx := getGlobalCacheIndex()
+		demoter := getGlobalHybridDemoter()
+		if idx == nil || demoter == nil {
+			t.Fatalf("Expected initialized CacheIndex and HybridDemoter")
+		}
+		return mockS3, tiered, idx, demoter, cacheDir, tmpDir
+	}
+
+	seedTieredFiles := func(t *testing.T, tiered *TieredStorageBackend, key string, size int, withS3 bool, accessTime time.Time) {
+		t.Helper()
+		ctx := context.Background()
+		p := tiered.Local().FilePath(key)
+		payload := bytes.Repeat([]byte("A"), size)
+		if err := os.WriteFile(p, payload, 0644); err != nil {
+			t.Fatalf("WriteFile %s: %v", key, err)
+		}
+		meta := FileMeta{
+			URL:           "http://origin/" + key,
+			TotalSize:     int64(size),
+			ContentType:   "video/mp4",
+			LastValidated: accessTime.Unix(),
+			Completed:     true,
+		}
+		metaBytes, _ := json.Marshal(meta)
+		if err := os.WriteFile(p+".json", metaBytes, 0644); err != nil {
+			t.Fatalf("WriteFile meta %s: %v", key, err)
+		}
+		_ = os.Chtimes(p, accessTime, accessTime)
+
+		if withS3 {
+			srcTmp := filepath.Join(t.TempDir(), key+".src")
+			if err := os.WriteFile(srcTmp, payload, 0644); err != nil {
+				t.Fatalf("WriteFile s3 src %s: %v", key, err)
+			}
+			if err := tiered.S3().CommitLocalFile(ctx, key, srcTmp, meta); err != nil {
+				t.Fatalf("CommitLocalFile S3 %s: %v", key, err)
+			}
+			_ = os.Remove(srcTmp)
+		}
+	}
+
+	cleanupState := func(s *FileCacheState) {
+		if cm := s.GetChunkManager(); cm != nil {
+			cm.Close()
+		}
+	}
+
+	t.Run("InstantTierBothReclaim", func(t *testing.T) {
+		now := time.Now()
+		mockS3, tiered, idx, _, cacheDir, tmpDir := setupHybridEnv(t, "instant-reclaim-bucket", 4000, 50, 100, func(tb *TieredStorageBackend) {
+			seedTieredFiles(t, tb, "backed_old.mp4", 2000, true, now.Add(-2*time.Hour))
+			seedTieredFiles(t, tb, "disk_only.mp4", 1800, false, now.Add(-1*time.Hour))
+		})
+
+		if !waitForPhase1Condition(3*time.Second, func() bool {
+			return idx.GetTier("backed_old.mp4") == IndexTierBoth && idx.GetTier("disk_only.mp4") == IndexTierDisk
+		}) {
+			t.Fatalf("Timed out waiting for startup reconcile (backed_old=%q, disk_only=%q)",
+				idx.GetTier("backed_old.mp4"), idx.GetTier("disk_only.mp4"))
+		}
+
+		// Incoming 1500B item would exceed 4000B (3800 + 1500 = 5300), but backed_old.mp4 (2000B) is
+		// already safely on S3 so AdmitToHybridL1 unlinks it synchronously and admits directly to TierDisk.
+		s := NewFileCacheState("incoming_fit.mp4", "http://origin/incoming_fit.mp4",
+			filepath.Join(cacheDir, "incoming_fit.mp4"), filepath.Join(tmpDir, "incoming_fit.part"), "", "video/mp4", "", "", 1500)
+		defer cleanupState(s)
+
+		if s.GetTargetTier() != TierDisk {
+			t.Fatalf("Expected instant reclaim of Tier=both copy to admit 1500B to TierDisk, got %s", s.GetTargetTier())
+		}
+		if FileExists(tiered.Local().FilePath("backed_old.mp4")) {
+			t.Errorf("Expected backed_old.mp4 local copy to be removed synchronously")
+		}
+		if !mockS3.HasObject("instant-reclaim-bucket", tiered.S3().monolithicKey("backed_old.mp4")) {
+			t.Errorf("Expected backed_old.mp4 to remain in S3 after local reclaim")
+		}
+		if got := idx.GetTier("backed_old.mp4"); got != IndexTierS3 {
+			t.Errorf("Expected backed_old.mp4 tier updated to %q, got %q", IndexTierS3, got)
+		}
+		if !FileExists(tiered.Local().FilePath("disk_only.mp4")) {
+			t.Errorf("Expected unbacked disk_only.mp4 to remain untouched on Disk")
+		}
+		if stats := idx.LifecycleStats(); stats.DemotedDiskToS3 < 1 || stats.DemotedDiskToS3Bytes < 2000 {
+			t.Errorf("Expected lifecycle demotion counter >= 1 (>=2000B), got count=%d bytes=%d",
+				stats.DemotedDiskToS3, stats.DemotedDiskToS3Bytes)
+		}
+	})
+
+	t.Run("BoundedReactiveHeadroomNudgeAt100Pct", func(t *testing.T) {
+		now := time.Now()
+		ctx := context.Background()
+		mockS3, tiered, idx, demoter, cacheDir, tmpDir := setupHybridEnv(t, "headroom-nudge-bucket", 4000, 50, 100, func(tb *TieredStorageBackend) {
+			seedTieredFiles(t, tb, "cold_a.mp4", 1900, false, now.Add(-2*time.Hour))
+			seedTieredFiles(t, tb, "warm_b.mp4", 1900, false, now.Add(-10*time.Minute))
+		})
+
+		if !waitForPhase1Condition(3*time.Second, func() bool {
+			return idx.GetTier("cold_a.mp4") == IndexTierDisk && idx.GetTier("warm_b.mp4") == IndexTierDisk
+		}) {
+			t.Fatalf("Timed out waiting for startup reconcile (cold_a=%q, warm_b=%q)",
+				idx.GetTier("cold_a.mp4"), idx.GetTier("warm_b.mp4"))
+		}
+		idx.mu.Lock()
+		if e := idx.entries["cold_a.mp4"]; e != nil {
+			e.LastAccessed = now.Add(-2 * time.Hour).Unix()
+		}
+		if e := idx.entries["warm_b.mp4"]; e != nil {
+			e.LastAccessed = now.Add(-10 * time.Minute).Unix()
+		}
+		idx.mu.Unlock()
+
+		// 1. Oversized item (2500B > 2000B CACHE_MAX_ITEM_PCT limit) must bypass to S3 WITHOUT nudging Disk demotion.
+		sOversize := NewFileCacheState("oversize.mp4", "http://origin/oversize.mp4",
+			filepath.Join(cacheDir, "oversize.mp4"), filepath.Join(tmpDir, "oversize.part"), "", "video/mp4", "", "", 2500)
+		defer cleanupState(sOversize)
+
+		if sOversize.GetTargetTier() != TierS3 {
+			t.Fatalf("Expected oversized 2500B item to route to TierS3, got %s", sOversize.GetTargetTier())
+		}
+		if demoted, _, err := demoter.RunDemotionPass(ctx); err != nil || demoted != 0 {
+			t.Fatalf("Expected zero demotions after oversized bypass at 100%% threshold, got demoted=%d err=%v", demoted, err)
+		}
+		if !FileExists(tiered.Local().FilePath("cold_a.mp4")) || !FileExists(tiered.Local().FilePath("warm_b.mp4")) {
+			t.Fatalf("Expected both local L1 assets untouched after oversized bypass")
+		}
+
+		// 2. Eligible item (1500B <= 2000B limit) cannot fit immediately (3800 + 1500 > 4000), so it routes cleanly
+		//    to TierS3 AND nudges HybridDemoter for 1500B of headroom (target = 4000 - 1500 = 2500B).
+		sEligible1 := NewFileCacheState("eligible_1.mp4", "http://origin/eligible_1.mp4",
+			filepath.Join(cacheDir, "eligible_1.mp4"), filepath.Join(tmpDir, "eligible_1.part"), "", "video/mp4", "", "", 1500)
+		defer cleanupState(sEligible1)
+
+		if sEligible1.GetTargetTier() != TierS3 {
+			t.Fatalf("Expected overflowing eligible 1500B item to bypass to TierS3 without blocking, got %s", sEligible1.GetTargetTier())
+		}
+
+		ok := waitForPhase1Condition(5*time.Second, func() bool {
+			return !FileExists(tiered.Local().FilePath("cold_a.mp4")) && idx.GetTier("cold_a.mp4") == IndexTierS3
+		})
+		if !ok {
+			t.Fatalf("Timed out waiting for nudged HybridDemoter to demote cold_a.mp4; exists=%v tier=%q",
+				FileExists(tiered.Local().FilePath("cold_a.mp4")), idx.GetTier("cold_a.mp4"))
+		}
+		if !mockS3.HasObject("headroom-nudge-bucket", tiered.S3().monolithicKey("cold_a.mp4")) {
+			t.Errorf("Expected cold_a.mp4 to be uploaded to S3")
+		}
+		// Bounded check: warm_b.mp4 (1900B <= target 2500B) must stay warm on Disk.
+		if !FileExists(tiered.Local().FilePath("warm_b.mp4")) {
+			t.Errorf("Expected warm_b.mp4 (1900B <= 2500B target) to stay warm on Disk")
+		}
+
+		// 3. Subsequent eligible 1500B item now fits directly on L1 Disk (1900 + 1500 = 3400 <= 4000).
+		sEligible2 := NewFileCacheState("eligible_2.mp4", "http://origin/eligible_2.mp4",
+			filepath.Join(cacheDir, "eligible_2.mp4"), filepath.Join(tmpDir, "eligible_2.part"), "", "video/mp4", "", "", 1500)
+		defer cleanupState(sEligible2)
+
+		if sEligible2.GetTargetTier() != TierDisk {
+			t.Fatalf("Expected subsequent eligible 1500B item to admit to TierDisk after headroom demotion, got %s", sEligible2.GetTargetTier())
+		}
+	})
+
+	t.Run("ReactiveNudgeCappedAt50PctWhenMaxItemPctDisabled", func(t *testing.T) {
+		now := time.Now()
+		mockS3, tiered, idx, _, cacheDir, tmpDir := setupHybridEnv(t, "nudge-cap-bucket", 4000, 0, 0, func(tb *TieredStorageBackend) {
+			seedTieredFiles(t, tb, "f1.mp4", 900, false, now.Add(-4*time.Hour))
+			seedTieredFiles(t, tb, "f2.mp4", 900, false, now.Add(-3*time.Hour))
+			seedTieredFiles(t, tb, "f3.mp4", 900, false, now.Add(-2*time.Hour))
+			seedTieredFiles(t, tb, "f4.mp4", 900, false, now.Add(-1*time.Hour))
+		})
+
+		if GlobalConfig.GetHybridDemoteThreshold() != 100 {
+			t.Fatalf("Expected HybridDemoteThreshold to default to 100 when CACHE_MAX_ITEM_PCT=0, got %d",
+				GlobalConfig.GetHybridDemoteThreshold())
+		}
+		if !waitForPhase1Condition(3*time.Second, func() bool {
+			return idx.GetTier("f1.mp4") == IndexTierDisk &&
+				idx.GetTier("f2.mp4") == IndexTierDisk &&
+				idx.GetTier("f3.mp4") == IndexTierDisk &&
+				idx.GetTier("f4.mp4") == IndexTierDisk
+		}) {
+			t.Fatalf("Timed out waiting for startup reconcile of f1..f4")
+		}
+		idx.mu.Lock()
+		for i, k := range []string{"f1.mp4", "f2.mp4", "f3.mp4", "f4.mp4"} {
+			if e := idx.entries[k]; e != nil {
+				e.LastAccessed = now.Add(-time.Duration(4-i) * time.Hour).Unix()
+			}
+		}
+		idx.mu.Unlock()
+
+		// Incoming 3800B item (95% of 4000B) overflows L1 (3600 + 3800 > 4000), bypasses to S3,
+		// and nudges HybridDemoter; cap of 50% (2000B) means at most 2000B target (demote f1+f2 -> 1800B left),
+		// preserving f3 and f4 warm on Disk.
+		sBig := NewFileCacheState("big_95pct.mp4", "http://origin/big_95pct.mp4",
+			filepath.Join(cacheDir, "big_95pct.mp4"), filepath.Join(tmpDir, "big_95pct.part"), "", "video/mp4", "", "", 3800)
+		defer cleanupState(sBig)
+
+		if sBig.GetTargetTier() != TierS3 {
+			t.Fatalf("Expected overflowing 3800B item to route to TierS3, got %s", sBig.GetTargetTier())
+		}
+
+		ok := waitForPhase1Condition(5*time.Second, func() bool {
+			return !FileExists(tiered.Local().FilePath("f1.mp4")) &&
+				!FileExists(tiered.Local().FilePath("f2.mp4")) &&
+				idx.GetTier("f1.mp4") == IndexTierS3 &&
+				idx.GetTier("f2.mp4") == IndexTierS3
+		})
+		if !ok {
+			t.Fatalf("Timed out waiting for capped nudge to demote f1 and f2 (f1=%q, f2=%q)",
+				idx.GetTier("f1.mp4"), idx.GetTier("f2.mp4"))
+		}
+		if !mockS3.HasObject("nudge-cap-bucket", tiered.S3().monolithicKey("f1.mp4")) ||
+			!mockS3.HasObject("nudge-cap-bucket", tiered.S3().monolithicKey("f2.mp4")) {
+			t.Errorf("Expected f1.mp4 and f2.mp4 uploaded to S3")
+		}
+		if !FileExists(tiered.Local().FilePath("f3.mp4")) || !FileExists(tiered.Local().FilePath("f4.mp4")) {
+			t.Errorf("Expected f3.mp4 and f4.mp4 (total 1800B <= 2000B 50%% floor) to remain warm on Disk")
+		}
 	})
 }
