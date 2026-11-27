@@ -1091,11 +1091,24 @@
             display: flex;
             align-items: stretch;
             width: 100%;
-            height: 4px;
+            height: 5px;
             border-radius: 999px;
-            background: rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.06);
             overflow: hidden;
         }
+
+        .storage-bar-alloc {
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 0%;
+            z-index: 1;
+            transition: width 0.25s ease;
+        }
+
+        .storage-bar-alloc.cache { background: rgba(57, 255, 20, 0.16); }
+        .storage-bar-alloc.tmp { background: rgba(0, 240, 255, 0.14); }
 
         .storage-bar-fill {
             height: 100%;
@@ -1103,6 +1116,30 @@
             border-radius: 999px;
             flex-shrink: 0;
             transition: width 0.25s ease, background-color 0.25s ease;
+        }
+
+        .storage-bar-fill.layered {
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            z-index: 2;
+            border-radius: 999px 0 0 999px;
+        }
+
+        .storage-bar-cap {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 1.5px;
+            background: rgba(255, 255, 255, 0.8);
+            z-index: 4;
+            pointer-events: none;
+            display: none;
+        }
+
+        .storage-bar-cap.danger {
+            background: #ff5555;
         }
 
         .storage-bar-seg {
@@ -1128,10 +1165,12 @@
         }
 
         .storage-bar-reserve {
-            height: 100%;
+            position: absolute;
+            right: 0;
+            top: 0;
+            bottom: 0;
             width: 0%;
-            margin-left: auto;
-            flex-shrink: 0;
+            z-index: 3;
             background: repeating-linear-gradient(
                 -45deg,
                 rgba(255, 159, 28, 0.32),
@@ -1581,7 +1620,7 @@
                         <span class="storage-tier-pct" id="storage-cache-pct">-- avail</span>
                     </div>
                     <div class="storage-tier-main"><span id="storage-cache-main">0 B / Unlimited</span><span class="storage-tier-res" id="storage-cache-res" style="display: none;"></span></div>
-                    <div class="storage-bar-track"><div class="storage-bar-fill cache" id="storage-cache-bar"></div><div class="storage-bar-reserve" id="storage-cache-reserve"></div></div>
+                    <div class="storage-bar-track" id="storage-cache-track"><div class="storage-bar-alloc cache" id="storage-cache-alloc"></div><div class="storage-bar-fill layered cache" id="storage-cache-bar"></div><div class="storage-bar-reserve" id="storage-cache-reserve"></div><div class="storage-bar-cap" id="storage-cache-cap"></div></div>
                     <div class="storage-tier-sub" id="storage-cache-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-cache-loc">--</div>
                 </div>
@@ -1609,7 +1648,7 @@
                         <span class="storage-tier-pct" id="storage-tmp-pct">-- avail</span>
                     </div>
                     <div class="storage-tier-main"><span id="storage-tmp-main">0 B / Unlimited</span><span class="storage-tier-res" id="storage-tmp-res" style="display: none;"></span></div>
-                    <div class="storage-bar-track"><div class="storage-bar-fill tmp" id="storage-tmp-bar"></div><div class="storage-bar-reserve" id="storage-tmp-reserve"></div></div>
+                    <div class="storage-bar-track" id="storage-tmp-track"><div class="storage-bar-alloc tmp" id="storage-tmp-alloc"></div><div class="storage-bar-fill layered tmp" id="storage-tmp-bar"></div><div class="storage-bar-reserve" id="storage-tmp-reserve"></div></div>
                     <div class="storage-tier-sub" id="storage-tmp-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
                 </div>
@@ -2762,10 +2801,21 @@
                     setClassIfChanged(barEl, cls);
                 }
 
+                function setLayeredBarWidthAndClass(barEl, baseClass, widthPct, pressurePct, warnPct = 80, dangerPct = 95, forceDanger = false) {
+                    if (!barEl) return;
+                    const clamped = Math.max(0, Math.min(100, widthPct || 0));
+                    barEl.style.width = `${clamped.toFixed(1)}%`;
+                    let cls = `storage-bar-fill layered ${baseClass}`;
+                    if (forceDanger || pressurePct >= dangerPct) cls = 'storage-bar-fill layered danger';
+                    else if (pressurePct >= warnPct) cls = 'storage-bar-fill layered warn';
+                    setClassIfChanged(barEl, cls);
+                }
+
                 function setReserveBar(reserveEl, pct, isDanger) {
                     if (!reserveEl) return;
-                    const clamped = Math.max(0, Math.min(90, pct || 0));
+                    const clamped = Math.max(0, Math.min(100, pct || 0));
                     reserveEl.style.width = clamped > 0 ? `${clamped.toFixed(1)}%` : '0%';
+                    reserveEl.style.minWidth = clamped > 0 ? '2px' : '0';
                     setClassIfChanged(reserveEl, isDanger ? 'storage-bar-reserve danger' : 'storage-bar-reserve');
                 }
 
@@ -2918,8 +2968,11 @@
                         const cachePct = document.getElementById('storage-cache-pct');
                         const cacheMain = document.getElementById('storage-cache-main');
                         const cacheResEl = document.getElementById('storage-cache-res');
+                        const cacheTrack = document.getElementById('storage-cache-track');
+                        const cacheAllocBar = document.getElementById('storage-cache-alloc');
                         const cacheBar = document.getElementById('storage-cache-bar');
                         const cacheReserveBar = document.getElementById('storage-cache-reserve');
+                        const cacheCapEl = document.getElementById('storage-cache-cap');
                         const cacheSub = document.getElementById('storage-cache-sub');
                         const cacheLoc = document.getElementById('storage-cache-loc');
                         const cacheUsed = st.cache_used_bytes || 0;
@@ -2944,24 +2997,30 @@
                                 cacheResEl.style.display = 'none';
                             }
                         }
-                        let cacheFillPct = 0;
-                        let cacheResPct = 0;
-                        if (cacheMax > 0) {
-                            cacheFillPct = (cacheUsed / cacheMax) * 100;
-                            if (diskBound) {
-                                cacheResPct = ((cacheMax - effectiveCap) / cacheMax) * 100;
-                            } else if (cacheMin > 0 && (cacheUsed + cacheFree) > 0) {
-                                cacheResPct = Math.max(4, Math.min(25, (cacheMin / (cacheUsed + cacheFree)) * 100));
-                            }
-                        } else if ((cacheUsed + cacheFree) > 0) {
-                            const totalDisk = cacheUsed + cacheFree;
-                            cacheFillPct = (cacheUsed / totalDisk) * 100;
-                            if (cacheMin > 0) {
-                                cacheResPct = Math.max(4, Math.min(45, (cacheMin / totalDisk) * 100));
+                        const cacheTotalSpan = cacheUsed + cacheFree;
+                        const cacheNonReserved = Math.max(0, cacheTotalSpan - cacheMin);
+                        const cacheAllocBytes = cacheMax > 0 ? Math.min(cacheMax, cacheNonReserved) : cacheNonReserved;
+                        const cacheUnallocatedBytes = Math.max(0, cacheNonReserved - cacheAllocBytes);
+                        const cacheFillWidthPct = cacheTotalSpan > 0 ? (cacheUsed / cacheTotalSpan) * 100 : 0;
+                        const cacheAllocWidthPct = cacheTotalSpan > 0 ? (cacheAllocBytes / cacheTotalSpan) * 100 : 0;
+                        const cacheResWidthPct = (cacheTotalSpan > 0 && cacheMin > 0) ? (Math.min(cacheMin, cacheTotalSpan) / cacheTotalSpan) * 100 : 0;
+                        const cachePressurePct = effectiveCap > 0 ? (cacheUsed / effectiveCap) * 100 : (cacheUsed > 0 ? 100 : 0);
+                        setLayeredBarWidthAndClass(cacheBar, 'cache', cacheFillWidthPct, cachePressurePct, 80, 95, cacheDanger);
+                        if (cacheAllocBar) cacheAllocBar.style.width = `${Math.max(0, Math.min(100, cacheAllocWidthPct)).toFixed(1)}%`;
+                        setReserveBar(cacheReserveBar, cacheResWidthPct, cacheDanger || diskBound);
+                        if (cacheCapEl) {
+                            if (cacheMax > 0 && cacheTotalSpan > 0) {
+                                const capPosPct = Math.min(100, (cacheMax / cacheTotalSpan) * 100);
+                                cacheCapEl.style.display = 'block';
+                                cacheCapEl.style.left = capPosPct >= 99.5 ? 'calc(100% - 1.5px)' : `${capPosPct.toFixed(1)}%`;
+                                setClassIfChanged(cacheCapEl, diskBound ? 'storage-bar-cap danger' : 'storage-bar-cap');
+                            } else {
+                                cacheCapEl.style.display = 'none';
                             }
                         }
-                        setBarWidthAndClass(cacheBar, 'cache', cacheFillPct, 80, 95);
-                        setReserveBar(cacheReserveBar, cacheResPct, cacheDanger);
+                        let cacheTrackTitle = `Disk Pool: ${formatCleanBytes(cacheTotalSpan)} | Used: ${formatCleanBytes(cacheUsed)} | Allocated Cap: ${cacheMax > 0 ? formatCleanBytes(cacheMax) : 'Unlimited'} | Unallocated: ${formatCleanBytes(cacheUnallocatedBytes)} | Reserved: ${formatCleanBytes(cacheMin)}`;
+                        if (diskBound) cacheTrackTitle += ' | Cap exceeds usable disk';
+                        if (cacheTrack && cacheTrack.title !== cacheTrackTitle) cacheTrack.title = cacheTrackTitle;
                         const cacheHeadroom = cacheMax > 0 ? Math.min(cacheAvail, Math.max(0, cacheMax - cacheUsed)) : cacheAvail;
                         let cacheBadgeTitle = `Disk Free: ${formatCleanBytes(cacheFree)} − ${formatCleanBytes(cacheMin)} res = ${formatCleanBytes(cacheAvail)} avail`;
                         if (diskBound) {
@@ -3023,6 +3082,8 @@
                 const tmpPct = document.getElementById('storage-tmp-pct');
                 const tmpMain = document.getElementById('storage-tmp-main');
                 const tmpResEl = document.getElementById('storage-tmp-res');
+                const tmpTrack = document.getElementById('storage-tmp-track');
+                const tmpAllocBar = document.getElementById('storage-tmp-alloc');
                 const tmpBar = document.getElementById('storage-tmp-bar');
                 const tmpReserveBar = document.getElementById('storage-tmp-reserve');
                 const tmpSub = document.getElementById('storage-tmp-sub');
@@ -3051,10 +3112,16 @@
                         }
                     }
                     const tmpTotalDisk = tmpUsed + tmpFree;
-                    const tmpFillPct = tmpTotalDisk > 0 ? (tmpUsed / tmpTotalDisk) * 100 : 0;
-                    const tmpResPct = tmpMin > 0 && tmpTotalDisk > 0 ? Math.max(4, Math.min(45, (tmpMin / tmpTotalDisk) * 100)) : 0;
-                    setBarWidthAndClass(tmpBar, 'tmp', tmpFillPct, 75, 90);
-                    setReserveBar(tmpReserveBar, tmpResPct, tmpLow);
+                    const tmpNonReserved = Math.max(0, tmpTotalDisk - tmpMin);
+                    const tmpFillWidthPct = tmpTotalDisk > 0 ? (tmpUsed / tmpTotalDisk) * 100 : 0;
+                    const tmpAllocWidthPct = tmpTotalDisk > 0 ? (tmpNonReserved / tmpTotalDisk) * 100 : 0;
+                    const tmpResWidthPct = (tmpTotalDisk > 0 && tmpMin > 0) ? (Math.min(tmpMin, tmpTotalDisk) / tmpTotalDisk) * 100 : 0;
+                    const tmpPressurePct = tmpPool > 0 ? (tmpUsed / tmpPool) * 100 : (tmpUsed > 0 ? 100 : 0);
+                    setLayeredBarWidthAndClass(tmpBar, 'tmp', tmpFillWidthPct, tmpPressurePct, 75, 90, tmpLow);
+                    if (tmpAllocBar) tmpAllocBar.style.width = `${Math.max(0, Math.min(100, tmpAllocWidthPct)).toFixed(1)}%`;
+                    setReserveBar(tmpReserveBar, tmpResWidthPct, tmpLow);
+                    const tmpTrackTitle = `Disk Pool: ${formatCleanBytes(tmpTotalDisk)} | Used: ${formatCleanBytes(tmpUsed)} | Usable Pool: ${formatCleanBytes(tmpNonReserved)} | Reserved: ${formatCleanBytes(tmpMin)}`;
+                    if (tmpTrack && tmpTrack.title !== tmpTrackTitle) tmpTrack.title = tmpTrackTitle;
                     const tmpTitle = `Disk Free: ${formatCleanBytes(tmpFree)} − ${formatCleanBytes(tmpMin)} res = ${formatCleanBytes(tmpAvail)} avail`;
                     setFreeBadge(tmpPct, `${formatCleanBytes(tmpAvail, tmpFrac)} avail`, tmpLow ? 'danger' : ((tmpHeadroomTight || tmpScratchPressure) ? 'warn' : ''), tmpTitle);
                     const tmpParts = [formatFileCount(tmpObjects)];
