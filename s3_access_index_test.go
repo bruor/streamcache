@@ -937,19 +937,65 @@ func TestLifetimeCacheHitRatioAccountingAndPersistence(t *testing.T) {
 	delete(GlobalRegistry.Files, st.Key)
 	GlobalRegistry.Lock.Unlock()
 
-	// 3. Subsequent Cache HIT serves another 1000 bytes (total 2000 SV, 1000 DL -> 50% ratio), then another 2000 (4000 SV -> 75%).
-	idx.RecordTransferBytes("movie_a.mkv", 0, 1000)
+	// 3. Subsequent Cache HIT serves another 1000 bytes on Disk (total 2000 SV, 1000 DL -> 2.0x / 50%),
+	// then another 2000 on S3 (4000 SV -> 4.0x / 75%).
+	idx.RecordCacheHitServeBytes("movie_a.mkv", IndexTierDisk, 1000)
 	snap2 := collectDashboardSnapshot().Storage
-	if snap2.CacheHitRatioPct < 49.9 || snap2.CacheHitRatioPct > 50.1 {
-		t.Fatalf("Expected 50%% hit ratio at 2:1, got %.2f%% (%+v)", snap2.CacheHitRatioPct, snap2)
+	if snap2.CacheRatio < 1.99 || snap2.CacheRatio > 2.01 || snap2.CacheHitRatioPct < 49.9 || snap2.CacheHitRatioPct > 50.1 || snap2.CacheBytesServedDisk != 1000 {
+		t.Fatalf("Expected 2.0x ratio (50%% hit ratio) and Disk=1000, got %+v", snap2)
 	}
 
-	idx.RecordTransferBytes("movie_a.mkv", 0, 2000)
+	idx.RecordCacheHitServeBytes("movie_a.mkv", IndexTierS3, 2000)
+
+	// 4. Eager Size fallback for legacy pre-existing cached object with BytesDownloaded == 0,
+	// plus lifecycle counters persisted in cache_stats.json without changing s3_index.json schema.
+	idx.mu.Lock()
+	idx.entries["legacy_existing.mkv"] = &CacheIndexEntry{
+		Key:          "legacy_existing.mkv",
+		Size:         2000,
+		Tier:         IndexTierS3,
+		CreatedAt:    time.Now().Add(-48 * time.Hour).Unix(),
+		LastAccessed: time.Now().Add(-48 * time.Hour).Unix(),
+	}
+	idx.dirty = true
+	idx.mu.Unlock()
+
+	idx.RecordDemotionDiskToS3(2)
+	idx.RecordCapacityEviction(1)
+	idx.RecordTTLEviction(3)
+
+	snap3Pre := collectDashboardSnapshot().Storage
+	// TotalDL = 1000 (movie_a) + 2000 (legacy_existing fallback) = 3000; TotalSV = 4000 -> 1.333x
+	if snap3Pre.CacheBytesDownloaded != 3000 || snap3Pre.CacheBytesServed != 4000 ||
+		snap3Pre.CacheBytesServedDisk != 1000 || snap3Pre.CacheBytesServedS3 != 2000 {
+		t.Fatalf("Unexpected eager-fallback/tier-split totals: %+v", snap3Pre)
+	}
+	if snap3Pre.CacheRatio < 1.32 || snap3Pre.CacheRatio > 1.34 {
+		t.Fatalf("Expected CacheRatio ~1.33x, got %.3f", snap3Pre.CacheRatio)
+	}
+	if snap3Pre.DemotedDiskToS3 != 2 || snap3Pre.EvictedCapacity != 1 || snap3Pre.EvictedTTL != 3 {
+		t.Fatalf("Expected lifecycle stats (2, 1, 3), got (%d, %d, %d)",
+			snap3Pre.DemotedDiskToS3, snap3Pre.EvictedCapacity, snap3Pre.EvictedTTL)
+	}
+
 	if err := idx.Flush(); err != nil {
 		t.Fatalf("Flush error: %v", err)
 	}
 
-	// 4. Reload index from disk to confirm lifetime stats survive restarts.
+	// Ensure s3_index.json retains its map[string]*CacheIndexEntry structure.
+	rawIdx, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("ReadFile s3_index.json error: %v", err)
+	}
+	var decodedMap map[string]*CacheIndexEntry
+	if err := json.Unmarshal(rawIdx, &decodedMap); err != nil {
+		t.Fatalf("Expected s3_index.json to unmarshal as map[string]*CacheIndexEntry: %v", err)
+	}
+	if len(decodedMap) != 2 {
+		t.Fatalf("Expected 2 entries in s3_index.json, got %d", len(decodedMap))
+	}
+
+	// 5. Reload index + cache_stats.json from disk to confirm lifetime stats survive restarts.
 	reloaded := NewCacheIndex(indexPath)
 	if err := reloaded.Load(); err != nil {
 		t.Fatalf("Load error: %v", err)
@@ -957,11 +1003,13 @@ func TestLifetimeCacheHitRatioAccountingAndPersistence(t *testing.T) {
 	GlobalCacheIndex = reloaded
 	GlobalS3Index = reloaded
 
-	snap3 := collectDashboardSnapshot().Storage
-	if snap3.CacheBytesDownloaded != 1000 || snap3.CacheBytesServed != 4000 {
-		t.Fatalf("Expected persisted downloaded=1000 served=4000, got %+v", snap3)
+	snap4 := collectDashboardSnapshot().Storage
+	if snap4.CacheBytesDownloaded != 3000 || snap4.CacheBytesServed != 4000 ||
+		snap4.CacheBytesServedDisk != 1000 || snap4.CacheBytesServedS3 != 2000 {
+		t.Fatalf("Expected persisted stats (dl=3000 sv=4000 disk=1000 s3=2000), got %+v", snap4)
 	}
-	if snap3.CacheHitRatioPct < 74.9 || snap3.CacheHitRatioPct > 75.1 {
-		t.Fatalf("Expected 75%% hit ratio at 4:1 after reload, got %.2f%%", snap3.CacheHitRatioPct)
+	if snap4.DemotedDiskToS3 != 2 || snap4.EvictedCapacity != 1 || snap4.EvictedTTL != 3 {
+		t.Fatalf("Expected persisted lifecycle stats (2, 1, 3), got (%d, %d, %d)",
+			snap4.DemotedDiskToS3, snap4.EvictedCapacity, snap4.EvictedTTL)
 	}
 }

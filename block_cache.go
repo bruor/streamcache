@@ -2200,8 +2200,10 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 
 		// In hybrid mode, attempt to preserve un-backed L1 assets by uploading to S3 before deleting locally.
 		// If S3 is unreachable (or circuit already open) during emergency PreEvict, log and STILL remove local file to prevent disk deadlock.
+		backedOnS3 := file.AlreadyOnS3
 		if !file.AlreadyOnS3 && tieredStorage != nil && tieredStorage.S3() != nil && IsS3Healthy() {
 			if _, existsInS3, s3Err := tieredStorage.S3().Stat(ctx, baseKey); s3Err == nil && existsInS3 {
+				backedOnS3 = true
 				if idx != nil {
 					idx.MarkAddedToTier(baseKey, IndexTierS3)
 				}
@@ -2230,11 +2232,14 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 				opCancel()
 				if uploadErr != nil {
 					log.Printf("[Evictor] Warning: S3 demotion failed for %s during emergency PreEvict (%v); evicting local copy anyway to reclaim disk space", baseKey, uploadErr)
-				} else if idx != nil {
-					if _, exists := idx.Get(baseKey); !exists {
-						idx.RecordCommitForTier(baseKey, uploadMeta, IndexTierBoth)
-					} else {
-						idx.MarkAddedToTier(baseKey, IndexTierS3)
+				} else {
+					backedOnS3 = true
+					if idx != nil {
+						if _, exists := idx.Get(baseKey); !exists {
+							idx.RecordCommitForTier(baseKey, uploadMeta, IndexTierBoth)
+						} else {
+							idx.MarkAddedToTier(baseKey, IndexTierS3)
+						}
 					}
 				}
 			}
@@ -2252,6 +2257,11 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 		r.UpdateSize(-file.Size)
 		if idx != nil {
 			idx.MarkRemovedFromTier(baseKey, IndexTierDisk)
+			if backedOnS3 {
+				idx.RecordDemotionDiskToS3(1)
+			} else {
+				idx.RecordCapacityEviction(1)
+			}
 		}
 
 		freedBytes += file.Size
@@ -2261,6 +2271,9 @@ func (r *CacheRegistry) evictInactiveFiles(bytesToFree int64) {
 			file.Name, float64(file.Size)/(1024*1024), file.AccessTime.Format(time.RFC3339))
 	}
 
+	if evictedCount > 0 && idx != nil {
+		_ = idx.Flush()
+	}
 	log.Printf("[Evictor] Eviction complete. Evicted %d objects, freed %.2f MB. New Cache Size: %.2f GB",
 		evictedCount, float64(freedBytes)/(1024*1024), float64(r.getTotalSize())/(1024*1024*1024))
 }

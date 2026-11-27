@@ -33,11 +33,20 @@ type CacheIndexEntry struct {
 	LastAccessed         int64  `json:"last_accessed"`
 	BytesDownloaded      int64  `json:"bytes_downloaded,omitempty"`
 	BytesServed          int64  `json:"bytes_served,omitempty"`
+	BytesServedDisk      int64  `json:"bytes_served_disk,omitempty"`
+	BytesServedS3        int64  `json:"bytes_served_s3,omitempty"`
 	PendingRecompose     bool   `json:"pending_recompose,omitempty"`
 	ChunkSize            int64  `json:"chunk_size,omitempty"`
 	TotalParts           int    `json:"total_parts,omitempty"`
 	RecomposeAttempts    int    `json:"recompose_attempts,omitempty"`
 	LastRecomposeAttempt int64  `json:"last_recompose_attempt,omitempty"`
+}
+
+// CacheLifecycleStats tracks persistent cache tier transitions and evictions.
+type CacheLifecycleStats struct {
+	DemotedDiskToS3 int64 `json:"demoted_disk_to_s3"`
+	EvictedCapacity int64 `json:"evicted_capacity"`
+	EvictedTTL      int64 `json:"evicted_ttl"`
 }
 
 // S3IndexEntry preserves backwards-compatible naming for legacy callers/tests.
@@ -54,6 +63,8 @@ type CacheIndex struct {
 	indexPath         string
 	entries           map[string]*CacheIndexEntry
 	dirty             bool
+	lifecycle         CacheLifecycleStats
+	statsDirty        bool
 	nowFn             func() time.Time
 	stopCh            chan struct{}
 	stopOnce          sync.Once
@@ -118,22 +129,57 @@ func (idx *S3AccessIndex) now() time.Time {
 	return time.Now()
 }
 
-// Load reads an existing s3_index.json file from disk if present.
+func (idx *S3AccessIndex) statsPath() string {
+	if idx == nil || idx.indexPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(idx.indexPath), "cache_stats.json")
+}
+
+func writeFileAtomic(targetPath string, data []byte) error {
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmpPath := fmt.Sprintf("%s.tmp.%d", targetPath, time.Now().UnixNano())
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+// Load reads an existing s3_index.json and optional cache_stats.json file from disk if present.
 func (idx *S3AccessIndex) Load() error {
 	if idx == nil || idx.indexPath == "" {
 		return nil
 	}
 	data, err := os.ReadFile(idx.indexPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
 	var loaded map[string]*S3IndexEntry
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		return err
+	if err == nil {
+		if uerr := json.Unmarshal(data, &loaded); uerr != nil {
+			return uerr
+		}
+	}
+
+	var loadedStats CacheLifecycleStats
+	hasStats := false
+	if sp := idx.statsPath(); sp != "" {
+		if sdata, serr := os.ReadFile(sp); serr == nil {
+			if uerr := json.Unmarshal(sdata, &loadedStats); uerr != nil {
+				return uerr
+			}
+			hasStats = true
+		} else if !os.IsNotExist(serr) {
+			return serr
+		}
 	}
 
 	idx.mu.Lock()
@@ -145,54 +191,78 @@ func (idx *S3AccessIndex) Load() error {
 			idx.entries[k] = e
 		}
 	}
+	if hasStats {
+		idx.lifecycle = loadedStats
+	}
 	idx.mu.Unlock()
 	return nil
 }
 
-// Flush atomically writes the index to disk when dirty.
+// Flush atomically writes the index and lifecycle stats to disk when dirty.
 func (idx *S3AccessIndex) Flush() error {
 	if idx == nil || idx.indexPath == "" {
 		return nil
 	}
 
 	idx.mu.Lock()
-	if !idx.dirty {
+	if !idx.dirty && !idx.statsDirty {
 		idx.mu.Unlock()
 		return nil
 	}
-	data, err := json.MarshalIndent(idx.entries, "", "  ")
-	if err != nil {
-		idx.mu.Unlock()
-		return err
+	var indexData []byte
+	var statsData []byte
+	var err error
+	flushIndex := idx.dirty
+	flushStats := idx.statsDirty
+	if flushIndex {
+		indexData, err = json.MarshalIndent(idx.entries, "", "  ")
+		if err != nil {
+			idx.mu.Unlock()
+			return err
+		}
+		idx.dirty = false
 	}
-	idx.dirty = false
+	if flushStats {
+		statsData, err = json.MarshalIndent(idx.lifecycle, "", "  ")
+		if err != nil {
+			if flushIndex {
+				idx.dirty = true
+			}
+			idx.mu.Unlock()
+			return err
+		}
+		idx.statsDirty = false
+	}
 	idx.mu.Unlock()
 
 	idx.saveMu.Lock()
 	defer idx.saveMu.Unlock()
 
-	dir := filepath.Dir(idx.indexPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		idx.markDirty()
-		return err
+	if flushIndex {
+		if err := writeFileAtomic(idx.indexPath, indexData); err != nil {
+			idx.markDirtyFlags(true, flushStats)
+			return err
+		}
 	}
-
-	tmpPath := fmt.Sprintf("%s.tmp.%d", idx.indexPath, time.Now().UnixNano())
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		idx.markDirty()
-		return err
-	}
-	if err := os.Rename(tmpPath, idx.indexPath); err != nil {
-		_ = os.Remove(tmpPath)
-		idx.markDirty()
-		return err
+	if flushStats {
+		if sp := idx.statsPath(); sp != "" {
+			if err := writeFileAtomic(sp, statsData); err != nil {
+				idx.markDirtyFlags(false, true)
+				return err
+			}
+		}
 	}
 	return nil
 }
 
-func (idx *S3AccessIndex) markDirty() {
+func (idx *S3AccessIndex) markDirtyFlags(dirty, statsDirty bool) {
 	idx.mu.Lock()
-	idx.dirty = true
+	if dirty {
+		idx.dirty = true
+	}
+	if statsDirty {
+		idx.statsDirty = true
+	}
 	idx.mu.Unlock()
 }
 
@@ -569,10 +639,33 @@ func (idx *CacheIndex) RecordTransferBytes(key string, downloadedDelta, servedDe
 	idx.mu.Unlock()
 }
 
-// TransferTotals returns the lifetime sum of BytesDownloaded and BytesServed across all tracked entries.
-func (idx *CacheIndex) TransferTotals() (downloaded int64, served int64) {
+// RecordCacheHitServeBytes adds client served bytes for an existing tracked entry and attributes
+// them to the serving storage tier ("disk" or "s3").
+func (idx *CacheIndex) RecordCacheHitServeBytes(key, tier string, servedDelta int64) {
+	if idx == nil || key == "" || servedDelta <= 0 {
+		return
+	}
+
+	idx.mu.Lock()
+	if e, ok := idx.entries[key]; ok && e != nil {
+		e.BytesServed += servedDelta
+		switch tier {
+		case IndexTierDisk:
+			e.BytesServedDisk += servedDelta
+		case IndexTierS3:
+			e.BytesServedS3 += servedDelta
+		}
+		idx.dirty = true
+	}
+	idx.mu.Unlock()
+}
+
+// TransferStats returns lifetime upstream downloaded bytes (with eager Size fallback for pre-existing
+// cached entries that predate transfer tracking), total client served bytes, and served cache-hit bytes
+// split by tier.
+func (idx *CacheIndex) TransferStats() (downloaded, served, servedDisk, servedS3 int64) {
 	if idx == nil {
-		return 0, 0
+		return 0, 0, 0, 0
 	}
 
 	idx.mu.Lock()
@@ -580,11 +673,67 @@ func (idx *CacheIndex) TransferTotals() (downloaded int64, served int64) {
 		if e == nil {
 			continue
 		}
-		downloaded += e.BytesDownloaded
+		in := e.BytesDownloaded
+		if in == 0 && e.Size > 0 {
+			in = e.Size
+		}
+		downloaded += in
 		served += e.BytesServed
+		servedDisk += e.BytesServedDisk
+		servedS3 += e.BytesServedS3
 	}
 	idx.mu.Unlock()
+	return downloaded, served, servedDisk, servedS3
+}
+
+// TransferTotals returns the lifetime sum of upstream downloaded and client served bytes across all tracked entries.
+func (idx *CacheIndex) TransferTotals() (downloaded int64, served int64) {
+	downloaded, served, _, _ = idx.TransferStats()
 	return downloaded, served
+}
+
+// RecordDemotionDiskToS3 increments the persisted count of Disk -> S3 tier demotions.
+func (idx *CacheIndex) RecordDemotionDiskToS3(count int64) {
+	if idx == nil || count <= 0 {
+		return
+	}
+	idx.mu.Lock()
+	idx.lifecycle.DemotedDiskToS3 += count
+	idx.statsDirty = true
+	idx.mu.Unlock()
+}
+
+// RecordCapacityEviction increments the persisted count of capacity/pressure cache evictions.
+func (idx *CacheIndex) RecordCapacityEviction(count int64) {
+	if idx == nil || count <= 0 {
+		return
+	}
+	idx.mu.Lock()
+	idx.lifecycle.EvictedCapacity += count
+	idx.statsDirty = true
+	idx.mu.Unlock()
+}
+
+// RecordTTLEviction increments the persisted count of idle-age TTL cache evictions.
+func (idx *CacheIndex) RecordTTLEviction(count int64) {
+	if idx == nil || count <= 0 {
+		return
+	}
+	idx.mu.Lock()
+	idx.lifecycle.EvictedTTL += count
+	idx.statsDirty = true
+	idx.mu.Unlock()
+}
+
+// LifecycleStats returns a snapshot of the persisted cache lifecycle transition and eviction counters.
+func (idx *CacheIndex) LifecycleStats() CacheLifecycleStats {
+	if idx == nil {
+		return CacheLifecycleStats{}
+	}
+	idx.mu.Lock()
+	stats := idx.lifecycle
+	idx.mu.Unlock()
+	return stats
 }
 
 // Get returns a copy of the CacheIndexEntry for key if present.
@@ -1011,6 +1160,8 @@ func (idx *CacheIndex) SweepExpired(ctx context.Context, storage StorageBackend,
 		idx.mu.Lock()
 		delete(idx.entries, cand.Key)
 		idx.dirty = true
+		idx.lifecycle.EvictedTTL++
+		idx.statsDirty = true
 		idx.mu.Unlock()
 
 		idle := idx.now().Sub(time.Unix(cand.LastAccessed, 0)).Round(time.Second)
@@ -1120,6 +1271,8 @@ func (idx *CacheIndex) SweepS3OverCapacity(ctx context.Context, storage StorageB
 				cur.PendingRecompose = false
 			} else {
 				delete(idx.entries, cand.Key)
+				idx.lifecycle.EvictedCapacity++
+				idx.statsDirty = true
 			}
 			idx.dirty = true
 		}

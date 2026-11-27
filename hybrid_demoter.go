@@ -375,6 +375,7 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 		if d.index != nil {
 			d.index.MarkAddedToTier(cand.Key, IndexTierS3)
 			d.index.MarkRemovedFromTier(cand.Key, IndexTierDisk)
+			d.index.RecordDemotionDiskToS3(1)
 		}
 
 		localTotalBytes -= cand.Size
@@ -383,6 +384,9 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 	}
 
 	if demoted > 0 {
+		if d.index != nil {
+			_ = d.index.Flush()
+		}
 		log.Printf("[HybridDemoter] Demoted %d asset(s) (%d bytes) from L1 to L2 S3 (remaining L1: %d bytes, target <= %d bytes)", demoted, freed, localTotalBytes, lowBytes)
 	}
 	return demoted, freed, nil

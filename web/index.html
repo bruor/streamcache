@@ -88,8 +88,21 @@
             background-color: var(--accent-secondary);
             border-radius: 50%;
             display: inline-block;
+            flex-shrink: 0;
             box-shadow: 0 0 10px var(--accent-secondary);
+            transition: background-color 0.25s ease, box-shadow 0.25s ease;
+        }
+
+        .logo-dot.connected {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 10px var(--accent-green);
             animation: pulse 2s ease-in-out infinite;
+        }
+
+        .logo-dot.disconnected {
+            background-color: #ff3333;
+            box-shadow: 0 0 10px #ff3333;
+            animation: none;
         }
 
         @keyframes pulse {
@@ -975,8 +988,8 @@
         }
 
         .storage-tier.hit {
-            min-width: 145px;
-            max-width: 190px;
+            min-width: 175px;
+            max-width: 240px;
         }
 
         .storage-tier-label.hit { color: #38bdf8; }
@@ -1032,6 +1045,12 @@
             white-space: nowrap;
         }
 
+        .storage-tier-pct.good {
+            background: rgba(57, 255, 20, 0.12);
+            color: var(--accent-green);
+            border-color: rgba(57, 255, 20, 0.35);
+        }
+
         .storage-tier-pct.warn {
             background: rgba(255, 159, 28, 0.14);
             color: var(--accent-orange);
@@ -1045,11 +1064,26 @@
         }
 
         .storage-tier-main {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 8px;
             font-family: var(--font-mono);
             font-size: 0.76rem;
             font-weight: 700;
             color: var(--text-main);
             white-space: nowrap;
+        }
+
+        .storage-tier-res {
+            font-size: 0.65rem;
+            font-weight: 600;
+            color: rgba(255, 180, 70, 0.85);
+            white-space: nowrap;
+        }
+
+        .storage-tier-res.danger {
+            color: #ff6b6b;
         }
 
         .storage-bar-track {
@@ -1069,6 +1103,28 @@
             border-radius: 999px;
             flex-shrink: 0;
             transition: width 0.25s ease, background-color 0.25s ease;
+        }
+
+        .storage-bar-seg {
+            height: 100%;
+            width: 0%;
+            flex-shrink: 0;
+            transition: width 0.25s ease;
+        }
+
+        .storage-bar-seg.disk { background: var(--accent-green); }
+        .storage-bar-seg.s3 { background: #c084fc; }
+        .storage-bar-seg.other { background: #38bdf8; }
+
+        .storage-bar-breakeven {
+            position: absolute;
+            left: 50%;
+            top: 0;
+            bottom: 0;
+            width: 1px;
+            background: rgba(255, 255, 255, 0.55);
+            pointer-events: none;
+            z-index: 2;
         }
 
         .storage-bar-reserve {
@@ -1452,7 +1508,7 @@
 <body>
 
     <header>
-        <h1><span class="logo-dot"></span> Streamcache VOD Proxy</h1>
+        <h1><span id="connection-status-dot" class="logo-dot disconnected" title="SSE Connecting..."></span> Streamcache</h1>
         <div class="system-status">
             <div class="status-pill capacity-widget-pill" id="provider-capacity-pill" style="display: none;">
                 <div class="capacity-split-section">
@@ -1506,39 +1562,25 @@
                     <div class="storage-tier-header">
                         <span class="storage-tier-label hit" id="storage-hit-label">
                             <span class="storage-tier-dot"></span>
-                            <span>HIT RATIO</span>
+                            <span>CACHE RATIO</span>
                         </span>
                         <span class="storage-tier-pct" id="storage-hit-mult">--</span>
                     </div>
-                    <div class="storage-tier-main" id="storage-hit-main">--</div>
-                    <div class="storage-bar-track"><div class="storage-bar-fill hit" id="storage-hit-bar"></div></div>
-                    <div class="storage-tier-sub" id="storage-hit-sub">No client traffic</div>
-                    <div class="storage-tier-loc" id="storage-hit-loc">In 0 B • Out 0 B</div>
-                </div>
-                <div class="storage-divider" id="storage-div-tmp"></div>
-                <div class="storage-tier" id="storage-tier-tmp">
-                    <div class="storage-tier-header">
-                        <span class="storage-tier-label tmp" id="storage-tmp-label">
-                            <span class="storage-tier-dot"></span>
-                            <span>TMP</span>
-                        </span>
-                        <span class="storage-tier-pct" id="storage-tmp-pct">-- avail</span>
-                    </div>
-                    <div class="storage-tier-main" id="storage-tmp-main">0 B / Unlimited</div>
-                    <div class="storage-bar-track"><div class="storage-bar-fill tmp" id="storage-tmp-bar"></div><div class="storage-bar-reserve" id="storage-tmp-reserve"></div></div>
-                    <div class="storage-tier-sub" id="storage-tmp-sub">0 files</div>
-                    <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
+                    <div class="storage-tier-main" id="storage-hit-main">0 / 0 B</div>
+                    <div class="storage-bar-track"><div class="storage-bar-seg disk" id="storage-hit-bar-disk"></div><div class="storage-bar-seg s3" id="storage-hit-bar-s3"></div><div class="storage-bar-seg other" id="storage-hit-bar-other"></div><div class="storage-bar-breakeven" title="1x Break-Even (50%)"></div></div>
+                    <div class="storage-tier-sub" id="storage-hit-sub">Disk 0% • S3 0%</div>
+                    <div class="storage-tier-loc" id="storage-hit-loc">Cap 0 • TTL 0</div>
                 </div>
                 <div class="storage-divider" id="storage-div-cache" style="display: none;"></div>
                 <div class="storage-tier" id="storage-tier-cache" style="display: none;">
                     <div class="storage-tier-header">
                         <span class="storage-tier-label cache" id="storage-cache-label">
                             <span class="storage-tier-dot"></span>
-                            <span>CACHE</span>
+                            <span>DISK</span>
                         </span>
                         <span class="storage-tier-pct" id="storage-cache-pct">-- avail</span>
                     </div>
-                    <div class="storage-tier-main" id="storage-cache-main">0 B / Unlimited</div>
+                    <div class="storage-tier-main"><span id="storage-cache-main">0 B / Unlimited</span><span class="storage-tier-res" id="storage-cache-res" style="display: none;"></span></div>
                     <div class="storage-bar-track"><div class="storage-bar-fill cache" id="storage-cache-bar"></div><div class="storage-bar-reserve" id="storage-cache-reserve"></div></div>
                     <div class="storage-tier-sub" id="storage-cache-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-cache-loc">--</div>
@@ -1557,10 +1599,20 @@
                     <div class="storage-tier-sub" id="storage-s3-sub">0 files</div>
                     <div class="storage-tier-loc" id="storage-s3-loc">--</div>
                 </div>
-            </div>
-            <div class="status-pill" style="padding: 6px 14px; border-radius: 12px;">
-                <span id="connection-status-dot" class="status-indicator disconnected"></span>
-                <span id="connection-status-text">Connecting SSE...</span>
+                <div class="storage-divider" id="storage-div-tmp"></div>
+                <div class="storage-tier" id="storage-tier-tmp">
+                    <div class="storage-tier-header">
+                        <span class="storage-tier-label tmp" id="storage-tmp-label">
+                            <span class="storage-tier-dot"></span>
+                            <span>TMP</span>
+                        </span>
+                        <span class="storage-tier-pct" id="storage-tmp-pct">-- avail</span>
+                    </div>
+                    <div class="storage-tier-main"><span id="storage-tmp-main">0 B / Unlimited</span><span class="storage-tier-res" id="storage-tmp-res" style="display: none;"></span></div>
+                    <div class="storage-bar-track"><div class="storage-bar-fill tmp" id="storage-tmp-bar"></div><div class="storage-bar-reserve" id="storage-tmp-reserve"></div></div>
+                    <div class="storage-tier-sub" id="storage-tmp-sub">0 files</div>
+                    <div class="storage-tier-loc" id="storage-tmp-loc">--</div>
+                </div>
             </div>
         </div>
     </header>
@@ -1722,7 +1774,6 @@
         const downloadsContainer = document.getElementById('downloads-container');
         const activeCountEl = document.getElementById('active-count');
         const connectionDot = document.getElementById('connection-status-dot');
-        const connectionText = document.getElementById('connection-status-text');
         const connectionsContainer = document.getElementById('connections-container');
         const connectionsCountEl = document.getElementById('connections-count');
         const probesContainer = document.getElementById('probes-container');
@@ -2604,22 +2655,30 @@
 
         function connectSSE() {
             closeSSE();
+            if (connectionDot) {
+                connectionDot.className = "logo-dot disconnected";
+                connectionDot.title = "SSE Connecting...";
+            }
             appendLog("\nConnecting to SSE Event Stream...");
             const es = new EventSource('/dashboard/sse');
             activeEventSource = es;
 
             es.onopen = function() {
                 if (es !== activeEventSource) return;
-                connectionDot.className = "status-indicator connected";
-                connectionText.innerText = "Connected";
+                if (connectionDot) {
+                    connectionDot.className = "logo-dot connected";
+                    connectionDot.title = "SSE Connected";
+                }
                 appendLog("\n[SSE] Connected to event stream.");
                 checkServerVersion();
             };
 
             es.onerror = function() {
                 if (es !== activeEventSource) return;
-                connectionDot.className = "status-indicator disconnected";
-                connectionText.innerText = "Reconnecting...";
+                if (connectionDot) {
+                    connectionDot.className = "logo-dot disconnected";
+                    connectionDot.title = "SSE Reconnecting...";
+                }
                 es.close();
                 activeEventSource = null;
                 if (document.visibilityState === 'hidden') {
@@ -2716,6 +2775,7 @@
                     let cls = 'storage-tier-pct';
                     if (level === 'danger') cls = 'storage-tier-pct danger';
                     else if (level === 'warn') cls = 'storage-tier-pct warn';
+                    else if (level === 'good') cls = 'storage-tier-pct good';
                     setClassIfChanged(badgeEl, cls);
                     if (titleText !== undefined && badgeEl.title !== titleText) {
                         badgeEl.title = titleText;
@@ -2748,96 +2808,87 @@
                     cache_max_idle_age_seconds: data.cache_max_idle_age_seconds || 0,
                     cache_bytes_downloaded: 0,
                     cache_bytes_served: 0,
+                    cache_bytes_served_disk: 0,
+                    cache_bytes_served_s3: 0,
+                    cache_ratio: 0,
                     cache_hit_ratio_pct: 0,
+                    demoted_disk_to_s3: 0,
+                    evicted_capacity: 0,
+                    evicted_ttl: 0,
                 };
                 const ttlShort = formatTTLShort(st.cache_max_idle_age_seconds);
 
-                // 0. HIT RATIO section (lifetime upstream downloaded vs client served)
+                // 0. CACHE RATIO section (lifetime client served Out / upstream In, serve-source split, lifecycle transitions)
                 const hitMultEl = document.getElementById('storage-hit-mult');
                 const hitMainEl = document.getElementById('storage-hit-main');
-                const hitBarEl = document.getElementById('storage-hit-bar');
+                const hitBarDiskEl = document.getElementById('storage-hit-bar-disk');
+                const hitBarS3El = document.getElementById('storage-hit-bar-s3');
+                const hitBarOtherEl = document.getElementById('storage-hit-bar-other');
                 const hitSubEl = document.getElementById('storage-hit-sub');
                 const hitLocEl = document.getElementById('storage-hit-loc');
                 if (hitMainEl && hitSubEl && hitLocEl) {
                     const dl = st.cache_bytes_downloaded || 0;
                     const sv = st.cache_bytes_served || 0;
-                    const ratioPct = st.cache_hit_ratio_pct || 0;
-                    if (sv > 0) {
-                        const pctStr = `${Number(ratioPct.toFixed(1))}%`;
-                        setTextIfChanged(hitMainEl, pctStr);
-                        let barCls = 'storage-bar-fill warn';
-                        if (ratioPct >= 50) barCls = 'storage-bar-fill cache';
-                        else if (ratioPct >= 20) barCls = 'storage-bar-fill tmp';
-                        if (hitBarEl) {
-                            hitBarEl.style.width = `${Math.max(0, Math.min(100, ratioPct)).toFixed(1)}%`;
-                            setClassIfChanged(hitBarEl, barCls);
-                        }
-                        if (dl > 0) {
-                            const mult = sv / dl;
-                            setFreeBadge(hitMultEl, `${Number(mult.toFixed(1))}x`, mult >= 1 ? '' : 'warn', 'Client Bytes Served / Upstream Bytes Downloaded');
-                        } else {
-                            setFreeBadge(hitMultEl, '∞x', '', 'Pre-warmed (served without upstream download)');
-                        }
-                        if (sv > dl) {
-                            setTextIfChanged(hitSubEl, `Saved ${formatCleanBytes(sv - dl)}`);
-                        } else {
-                            setTextIfChanged(hitSubEl, 'Pre-warmed');
-                        }
+                    const servedDisk = st.cache_bytes_served_disk || 0;
+                    const servedS3 = st.cache_bytes_served_s3 || 0;
+                    const ratio = dl > 0 ? (sv / dl) : (st.cache_ratio || 0);
+                    const demoted = st.demoted_disk_to_s3 || 0;
+                    const evCap = st.evicted_capacity || 0;
+                    const evTTL = st.evicted_ttl || 0;
+                    const isHybrid = Boolean(st.cache_enabled && st.s3_enabled);
+
+                    if (dl > 0 || sv > 0) {
+                        const u = pickUnit(Math.max(sv, dl));
+                        setTextIfChanged(hitMainEl, `${formatDenom(sv, u.div)} / ${formatDenom(dl, u.div)} ${u.unit}`);
                     } else {
-                        setTextIfChanged(hitMainEl, '--');
-                        if (hitBarEl) {
-                            hitBarEl.style.width = '0%';
-                            setClassIfChanged(hitBarEl, 'storage-bar-fill hit');
-                        }
-                        setFreeBadge(hitMultEl, '--', '', 'Waiting for client traffic');
-                        setTextIfChanged(hitSubEl, 'No client traffic');
+                        setTextIfChanged(hitMainEl, '0 / 0 B');
                     }
-                    const locText = `In ${formatCleanBytes(dl)} • Out ${formatCleanBytes(sv)}`;
-                    setTextIfChanged(hitLocEl, locText);
-                    const savedBytes = Math.max(0, sv - dl);
-                    const hitTitle = `Downloaded: ${formatCleanBytes(dl)} | Served: ${formatCleanBytes(sv)} | Saved: ${formatCleanBytes(savedBytes)} (${Number(ratioPct.toFixed(1))}%)`;
-                    if (hitLocEl.title !== hitTitle) hitLocEl.title = hitTitle;
+
+                    const ratioLabel = dl > 0 ? `${Number(ratio.toFixed(1))}x` : (sv > 0 ? '∞x' : '--');
+                    const ratioLevel = dl > 0
+                        ? (ratio >= 1 ? 'good' : (sv > 0 ? 'warn' : ''))
+                        : (sv > 0 ? 'good' : '');
+                    const summaryTitle = `Served (Out): ${formatCleanBytes(sv)} | Downloaded (In): ${formatCleanBytes(dl)} | Ratio: ${ratioLabel} | Disk hits: ${formatCleanBytes(servedDisk)} | S3 hits: ${formatCleanBytes(servedS3)} | Disk→S3: ${demoted} | Cap: ${evCap} | TTL: ${evTTL}`;
+                    setFreeBadge(hitMultEl, ratioLabel, ratioLevel, summaryTitle);
+
+                    const totalFillPct = dl > 0 ? Math.max(0, Math.min(100, ratio * 50)) : (sv > 0 ? 100 : 0);
+                    const cacheHits = servedDisk + servedS3;
+                    let diskW = 0;
+                    let s3W = 0;
+                    let otherW = 0;
+                    if (cacheHits > 0) {
+                        diskW = totalFillPct * (servedDisk / cacheHits);
+                        s3W = totalFillPct * (servedS3 / cacheHits);
+                    } else {
+                        otherW = totalFillPct;
+                    }
+                    if (hitBarDiskEl) hitBarDiskEl.style.width = `${diskW.toFixed(1)}%`;
+                    if (hitBarS3El) hitBarS3El.style.width = `${s3W.toFixed(1)}%`;
+                    if (hitBarOtherEl) hitBarOtherEl.style.width = `${otherW.toFixed(1)}%`;
+
+                    if (isHybrid) {
+                        if (cacheHits > 0) {
+                            const diskPct = Math.round((servedDisk / cacheHits) * 100);
+                            const s3Pct = 100 - diskPct;
+                            setTextIfChanged(hitSubEl, `Disk ${diskPct}% • S3 ${s3Pct}%`);
+                        } else {
+                            setTextIfChanged(hitSubEl, 'Disk 0% • S3 0%');
+                        }
+                        setTextIfChanged(hitLocEl, `Disk→S3 ${demoted} • Cap ${evCap} • TTL ${evTTL}`);
+                    } else if (st.cache_enabled) {
+                        setTextIfChanged(hitSubEl, `Disk ${formatCleanBytes(servedDisk)} hits`);
+                        setTextIfChanged(hitLocEl, `Cap ${evCap} • TTL ${evTTL}`);
+                    } else if (st.s3_enabled) {
+                        setTextIfChanged(hitSubEl, `S3 ${formatCleanBytes(servedS3)} hits`);
+                        setTextIfChanged(hitLocEl, `Cap ${evCap} • TTL ${evTTL}`);
+                    } else {
+                        setTextIfChanged(hitSubEl, `Out ${formatCleanBytes(sv)} • In ${formatCleanBytes(dl)}`);
+                        setTextIfChanged(hitLocEl, `Cap ${evCap} • TTL ${evTTL}`);
+                    }
+                    if (hitLocEl.title !== summaryTitle) hitLocEl.title = summaryTitle;
                 }
 
-                // 1. TMP tier (always visible)
-                const tmpLabel = document.getElementById('storage-tmp-label');
-                const tmpPct = document.getElementById('storage-tmp-pct');
-                const tmpMain = document.getElementById('storage-tmp-main');
-                const tmpBar = document.getElementById('storage-tmp-bar');
-                const tmpReserveBar = document.getElementById('storage-tmp-reserve');
-                const tmpSub = document.getElementById('storage-tmp-sub');
-                const tmpLoc = document.getElementById('storage-tmp-loc');
-                if (tmpMain && tmpSub && tmpLoc) {
-                    const tmpUsed = st.tmp_used_bytes || 0;
-                    const tmpFree = st.tmp_free_bytes || 0;
-                    const tmpMin = st.tmp_min_free_bytes || 0;
-                    const tmpFileMax = st.tmp_file_max_bytes || 0;
-                    const tmpObjects = st.tmp_objects || 0;
-                    const tmpAvail = Math.max(0, tmpFree - tmpMin);
-                    const tmpPool = tmpUsed + tmpAvail;
-                    const tmpLow = tmpMin > 0 && tmpFree <= tmpMin;
-                    const tmpHeadroomTight = !tmpLow && tmpMin > 0 && tmpAvail < tmpMin;
-                    const tmpScratchPressure = !tmpLow && tmpFileMax > 0 && tmpObjects > 0 && tmpUsed >= tmpFileMax * tmpObjects * 0.85;
-                    setClassIfChanged(tmpLabel, tmpLow ? 'storage-tier-label unhealthy' : 'storage-tier-label tmp');
-                    const tmpFrac = formatFractionSameUnit(tmpUsed, tmpPool);
-                    setTextIfChanged(tmpMain, tmpFrac.text);
-                    const tmpTotalDisk = tmpUsed + tmpFree;
-                    const tmpFillPct = tmpTotalDisk > 0 ? (tmpUsed / tmpTotalDisk) * 100 : 0;
-                    const tmpResPct = tmpMin > 0 && tmpTotalDisk > 0 ? Math.max(4, Math.min(45, (tmpMin / tmpTotalDisk) * 100)) : 0;
-                    setBarWidthAndClass(tmpBar, 'tmp', tmpFillPct, 75, 90);
-                    setReserveBar(tmpReserveBar, tmpResPct, tmpLow);
-                    const tmpTitle = `Disk Free: ${formatCleanBytes(tmpFree)} − ${formatCleanBytes(tmpMin)} res = ${formatCleanBytes(tmpAvail)} avail`;
-                    setFreeBadge(tmpPct, `${formatCleanBytes(tmpAvail, tmpFrac)} avail`, tmpLow ? 'danger' : ((tmpHeadroomTight || tmpScratchPressure) ? 'warn' : ''), tmpTitle);
-                    const tmpParts = [formatFileCount(tmpObjects)];
-                    if (tmpMin > 0) tmpParts.push(`${formatCleanBytes(tmpMin)} res`);
-                    if (tmpFileMax > 0) tmpParts.push(`${formatCleanBytes(tmpFileMax)}/file`);
-                    setTextIfChanged(tmpSub, tmpParts.join(' • '));
-                    const tmpDirStr = st.tmp_dir || '--';
-                    setTextIfChanged(tmpLoc, tmpDirStr);
-                    if (tmpLoc.title !== tmpDirStr) tmpLoc.title = tmpDirStr;
-                }
-
-                // 2. CACHE tier (disk / hybrid)
+                // 1. DISK tier (disk / hybrid)
                 const cacheDiv = document.getElementById('storage-div-cache');
                 const cacheTierEl = document.getElementById('storage-tier-cache');
                 if (cacheDiv && cacheTierEl) {
@@ -2847,6 +2898,7 @@
                         const cacheLabel = document.getElementById('storage-cache-label');
                         const cachePct = document.getElementById('storage-cache-pct');
                         const cacheMain = document.getElementById('storage-cache-main');
+                        const cacheResEl = document.getElementById('storage-cache-res');
                         const cacheBar = document.getElementById('storage-cache-bar');
                         const cacheReserveBar = document.getElementById('storage-cache-reserve');
                         const cacheSub = document.getElementById('storage-cache-sub');
@@ -2864,6 +2916,15 @@
                         setClassIfChanged(cacheLabel, st.cache_healthy === false ? 'storage-tier-label unhealthy' : 'storage-tier-label cache');
                         const cacheFrac = formatFractionSameUnit(cacheUsed, cacheMax > 0 ? cacheMax : effectiveCap);
                         setTextIfChanged(cacheMain, cacheFrac.text);
+                        if (cacheResEl) {
+                            if (cacheMin > 0) {
+                                cacheResEl.style.display = '';
+                                setTextIfChanged(cacheResEl, `${formatCleanBytes(cacheMin)} res`);
+                                setClassIfChanged(cacheResEl, cacheDanger ? 'storage-tier-res danger' : 'storage-tier-res');
+                            } else {
+                                cacheResEl.style.display = 'none';
+                            }
+                        }
                         let cacheFillPct = 0;
                         let cacheResPct = 0;
                         if (cacheMax > 0) {
@@ -2889,7 +2950,6 @@
                         }
                         setFreeBadge(cachePct, `${formatCleanBytes(cacheHeadroom, cacheFrac)} avail`, cacheDanger ? 'danger' : (cacheWarn ? 'warn' : ''), cacheBadgeTitle);
                         const cacheParts = [formatFileCount(st.cache_objects)];
-                        if (cacheMin > 0) cacheParts.push(`${formatCleanBytes(cacheMin)} res`);
                         if (ttlShort) cacheParts.push(ttlShort);
                         setTextIfChanged(cacheSub, cacheParts.join(' • '));
                         const cacheDirStr = st.cache_dir || '--';
@@ -2901,7 +2961,7 @@
                     }
                 }
 
-                // 3. S3 tier (s3 / hybrid)
+                // 2. S3 tier (s3 / hybrid)
                 const s3Div = document.getElementById('storage-div-s3');
                 const s3TierEl = document.getElementById('storage-tier-s3');
                 if (s3Div && s3TierEl) {
@@ -2937,6 +2997,53 @@
                         s3Div.style.display = 'none';
                         s3TierEl.style.display = 'none';
                     }
+                }
+
+                // 3. TMP tier (always visible)
+                const tmpLabel = document.getElementById('storage-tmp-label');
+                const tmpPct = document.getElementById('storage-tmp-pct');
+                const tmpMain = document.getElementById('storage-tmp-main');
+                const tmpResEl = document.getElementById('storage-tmp-res');
+                const tmpBar = document.getElementById('storage-tmp-bar');
+                const tmpReserveBar = document.getElementById('storage-tmp-reserve');
+                const tmpSub = document.getElementById('storage-tmp-sub');
+                const tmpLoc = document.getElementById('storage-tmp-loc');
+                if (tmpMain && tmpSub && tmpLoc) {
+                    const tmpUsed = st.tmp_used_bytes || 0;
+                    const tmpFree = st.tmp_free_bytes || 0;
+                    const tmpMin = st.tmp_min_free_bytes || 0;
+                    const tmpFileMax = st.tmp_file_max_bytes || 0;
+                    const tmpObjects = st.tmp_objects || 0;
+                    const tmpAvail = Math.max(0, tmpFree - tmpMin);
+                    const tmpPool = tmpUsed + tmpAvail;
+                    const tmpLow = tmpMin > 0 && tmpFree <= tmpMin;
+                    const tmpHeadroomTight = !tmpLow && tmpMin > 0 && tmpAvail < tmpMin;
+                    const tmpScratchPressure = !tmpLow && tmpFileMax > 0 && tmpObjects > 0 && tmpUsed >= tmpFileMax * tmpObjects * 0.85;
+                    setClassIfChanged(tmpLabel, tmpLow ? 'storage-tier-label unhealthy' : 'storage-tier-label tmp');
+                    const tmpFrac = formatFractionSameUnit(tmpUsed, tmpPool);
+                    setTextIfChanged(tmpMain, tmpFrac.text);
+                    if (tmpResEl) {
+                        if (tmpMin > 0) {
+                            tmpResEl.style.display = '';
+                            setTextIfChanged(tmpResEl, `${formatCleanBytes(tmpMin)} res`);
+                            setClassIfChanged(tmpResEl, tmpLow ? 'storage-tier-res danger' : 'storage-tier-res');
+                        } else {
+                            tmpResEl.style.display = 'none';
+                        }
+                    }
+                    const tmpTotalDisk = tmpUsed + tmpFree;
+                    const tmpFillPct = tmpTotalDisk > 0 ? (tmpUsed / tmpTotalDisk) * 100 : 0;
+                    const tmpResPct = tmpMin > 0 && tmpTotalDisk > 0 ? Math.max(4, Math.min(45, (tmpMin / tmpTotalDisk) * 100)) : 0;
+                    setBarWidthAndClass(tmpBar, 'tmp', tmpFillPct, 75, 90);
+                    setReserveBar(tmpReserveBar, tmpResPct, tmpLow);
+                    const tmpTitle = `Disk Free: ${formatCleanBytes(tmpFree)} − ${formatCleanBytes(tmpMin)} res = ${formatCleanBytes(tmpAvail)} avail`;
+                    setFreeBadge(tmpPct, `${formatCleanBytes(tmpAvail, tmpFrac)} avail`, tmpLow ? 'danger' : ((tmpHeadroomTight || tmpScratchPressure) ? 'warn' : ''), tmpTitle);
+                    const tmpParts = [formatFileCount(tmpObjects)];
+                    if (tmpFileMax > 0) tmpParts.push(`${formatCleanBytes(tmpFileMax)}/file`);
+                    setTextIfChanged(tmpSub, tmpParts.join(' • '));
+                    const tmpDirStr = st.tmp_dir || '--';
+                    setTextIfChanged(tmpLoc, tmpDirStr);
+                    if (tmpLoc.title !== tmpDirStr) tmpLoc.title = tmpDirStr;
                 }
 
                 // Update VOD / LIVE Split View & Provider Capacity Pill

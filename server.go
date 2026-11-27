@@ -303,7 +303,7 @@ func handleMediaStream(w http.ResponseWriter, r *http.Request) {
 						GlobalRegistry.UpdateConnectionOffset(connID, off+int64(n))
 						if r.Method != http.MethodHead && n > 0 {
 							if idx := getGlobalCacheIndex(); idx != nil {
-								idx.RecordTransferBytes(cacheFileName, 0, int64(n))
+								idx.RecordCacheHitServeBytes(cacheFileName, cacheSource, int64(n))
 							}
 							newRead := atomic.AddInt64(&hitTotalRead, int64(n))
 							if newRead >= minThreshold || (fileSize > 0 && newRead >= fileSize) {

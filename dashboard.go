@@ -249,7 +249,13 @@ type dashboardStorageInfo struct {
 	CacheMaxIdleAgeSec   int64   `json:"cache_max_idle_age_seconds"`
 	CacheBytesDownloaded int64   `json:"cache_bytes_downloaded"`
 	CacheBytesServed     int64   `json:"cache_bytes_served"`
+	CacheBytesServedDisk int64   `json:"cache_bytes_served_disk"`
+	CacheBytesServedS3   int64   `json:"cache_bytes_served_s3"`
+	CacheRatio           float64 `json:"cache_ratio"`
 	CacheHitRatioPct     float64 `json:"cache_hit_ratio_pct"`
+	DemotedDiskToS3      int64   `json:"demoted_disk_to_s3"`
+	EvictedCapacity      int64   `json:"evicted_capacity"`
+	EvictedTTL           int64   `json:"evicted_ttl"`
 }
 
 type dashboardSnapshot struct {
@@ -541,13 +547,19 @@ func collectDashboardSnapshot() dashboardSnapshot {
 
 	var diskObjects, s3Objects int
 	var diskIdxBytes, s3UsedBytes int64
-	var totalDL, totalSV int64
+	var totalDL, totalSV, servedDisk, servedS3 int64
+	var lifecycleStats CacheLifecycleStats
 	if idx := getGlobalCacheIndex(); idx != nil {
 		diskObjects, diskIdxBytes, s3Objects, s3UsedBytes, _ = idx.StatsByTier()
-		totalDL, totalSV = idx.TransferTotals()
+		totalDL, totalSV, servedDisk, servedS3 = idx.TransferStats()
+		lifecycleStats = idx.LifecycleStats()
 	}
 	totalDL += unsyncedDL
 	totalSV += unsyncedSV
+	var cacheRatio float64
+	if totalDL > 0 {
+		cacheRatio = float64(totalSV) / float64(totalDL)
+	}
 	var hitRatioPct float64
 	if totalSV > 0 && totalSV > totalDL {
 		hitRatioPct = float64(totalSV-totalDL) / float64(totalSV) * 100.0
@@ -600,7 +612,13 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		CacheMaxIdleAgeSec:   int64(GlobalConfig.GetCacheMaxIdleAge().Seconds()),
 		CacheBytesDownloaded: totalDL,
 		CacheBytesServed:     totalSV,
+		CacheBytesServedDisk: servedDisk,
+		CacheBytesServedS3:   servedS3,
+		CacheRatio:           cacheRatio,
 		CacheHitRatioPct:     hitRatioPct,
+		DemotedDiskToS3:      lifecycleStats.DemotedDiskToS3,
+		EvictedCapacity:      lifecycleStats.EvictedCapacity,
+		EvictedTTL:           lifecycleStats.EvictedTTL,
 	}
 
 	snap := dashboardSnapshot{
