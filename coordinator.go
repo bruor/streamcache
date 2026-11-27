@@ -1031,7 +1031,21 @@ func findLargestGapMidpoint(state *FileCacheState) (mid int64, gapStart int64, g
 	if bestLen < minSplit {
 		return 0, 0, 0, false
 	}
-	return bestStart + bestLen/2, bestStart, bestEnd, true
+	mid = bestStart + bestLen/2
+	if cm := state.GetChunkManager(); cm != nil {
+		if chunkSize := cm.ChunkSize(); chunkSize > 0 {
+			aligned := ((mid + chunkSize/2) / chunkSize) * chunkSize
+			if aligned <= bestStart {
+				aligned = ((bestStart / chunkSize) + 1) * chunkSize
+			} else if aligned >= bestEnd {
+				aligned = ((bestEnd - 1) / chunkSize) * chunkSize
+			}
+			if aligned > bestStart && aligned < bestEnd {
+				mid = aligned
+			}
+		}
+	}
+	return mid, bestStart, bestEnd, true
 }
 
 func runDownloadWorker(

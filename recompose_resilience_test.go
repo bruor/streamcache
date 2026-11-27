@@ -758,3 +758,67 @@ func TestDashboardHeadersAndPendingRecomposeVisibility(t *testing.T) {
 		t.Fatalf("Expected completed file in 'Pending Recompose' state to appear in dashboard ActiveFiles")
 	}
 }
+
+func TestFindLargestGapMidpointAlignsToChunkBoundary(t *testing.T) {
+	saveAndRestoreResilienceGlobals(t)
+	GlobalConfig = &Config{
+		TmpFileMaxBytes: 512 * 1024,
+	}
+
+	const chunkSize = int64(64 * 1024)
+	const totalSize = int64(512 * 1024)
+
+	// 1. With ScratchChunkManager: gap [20 KiB, 512 KiB) snaps midpoint (266 KiB) to nearest 64 KiB multiple (256 KiB).
+	state := &FileCacheState{
+		Key:       "align_test.mkv",
+		TotalSize: totalSize,
+		RangeSet:  NewRangeSet(),
+	}
+	state.RangeSet.Add(0, 20*1024)
+	cm := NewScratchChunkManagerWithTarget(state, nil, chunkSize)
+	defer cm.Close()
+	state.ChunkManager = cm
+
+	mid, gs, ge, ok := findLargestGapMidpoint(state)
+	if !ok {
+		t.Fatalf("Expected ok=true for [20 KiB, 512 KiB) gap")
+	}
+	if gs != 20*1024 || ge != totalSize {
+		t.Fatalf("Unexpected gap [%d, %d), want [%d, %d)", gs, ge, 20*1024, totalSize)
+	}
+	if mid%chunkSize != 0 || mid <= gs || mid >= ge {
+		t.Fatalf("Expected chunk-aligned midpoint multiple of %d inside (%d, %d), got %d", chunkSize, gs, ge, mid)
+	}
+	if mid != 256*1024 {
+		t.Fatalf("Expected nearest chunk boundary 262144 (256 KiB), got %d", mid)
+	}
+
+	// 2. Sub-chunk gap [10 KiB, 50 KiB) with chunkSize=64 KiB has no interior chunk boundary: falls back to raw midpoint 30 KiB.
+	subState := &FileCacheState{
+		Key:       "subchunk_align_test.mkv",
+		TotalSize: 60 * 1024,
+		RangeSet:  NewRangeSet(),
+	}
+	subState.RangeSet.Add(0, 10*1024)
+	subState.RangeSet.Add(50*1024, 60*1024)
+	subCM := NewScratchChunkManagerWithTarget(subState, nil, chunkSize)
+	defer subCM.Close()
+	subState.ChunkManager = subCM
+
+	subMid, sgs, sge, sok := findLargestGapMidpoint(subState)
+	if !sok || sgs != 10*1024 || sge != 50*1024 || subMid != 30*1024 {
+		t.Fatalf("Expected raw midpoint fallback 30720 for [10240, 51200), got mid=%d gap=[%d,%d) ok=%v", subMid, sgs, sge, sok)
+	}
+
+	// 3. Without ScratchChunkManager (cm == nil): returns raw midpoint (266 KiB).
+	noCMState := &FileCacheState{
+		Key:       "nocm_align_test.mkv",
+		TotalSize: totalSize,
+		RangeSet:  NewRangeSet(),
+	}
+	noCMState.RangeSet.Add(0, 20*1024)
+	rawMid, _, _, rawOK := findLargestGapMidpoint(noCMState)
+	if !rawOK || rawMid != (20*1024+totalSize)/2 {
+		t.Fatalf("Expected raw midpoint %d without ChunkManager, got %d (ok=%v)", (20*1024+totalSize)/2, rawMid, rawOK)
+	}
+}
