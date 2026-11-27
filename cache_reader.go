@@ -864,68 +864,95 @@ func (r *CacheReader) readAtAttempt(p []byte, off int64) (n int, retry bool, err
 		return 0, false, err
 	}
 
+	var needRingRetry bool
+	var needFlushRetry bool
+	var startChunk int
+	var anyUploaded bool
+	if fromPart && r.state != nil {
+		r.state.partIOMu.RLock()
+	}
 	n, err = file.ReadAt(p[:toRead], off)
 	if cm != nil && fromPart && cm.IsRingBufferMode() && n > 0 && !r.state.RangeSet.HasAvailable(off, int64(n)) {
-		return 0, true, nil
+		needRingRetry = true
 	}
-	if cm != nil && fromPart && cm.ChunkSize() > 0 {
+	if !needRingRetry && cm != nil && fromPart && cm.ChunkSize() > 0 {
 		chunkSize := cm.ChunkSize()
-		startChunk := int(off / chunkSize)
+		startChunk = int(off / chunkSize)
 		endChunk := startChunk
 		if n > 0 {
 			endChunk = int((off + int64(n) - 1) / chunkSize)
 		}
-		anyUploaded := false
 		for c := startChunk; c <= endChunk; c++ {
 			if cm.IsChunkUploaded(c) {
 				anyUploaded = true
 				break
 			}
 		}
-		if anyUploaded {
-			chunkStart := int64(startChunk) * chunkSize
-			offsetInChunk := off - chunkStart
-			readLen := toRead
-			if rem := chunkSize - offsetInChunk; readLen > rem {
-				readLen = rem
-			}
-			if rc, cerr := cm.ReadCommittedChunk(r.ctx, startChunk, offsetInChunk, readLen); cerr == nil {
-				readN, rerr := io.ReadFull(rc, p[:readLen])
-				_ = rc.Close()
-				if (rerr == nil || rerr == io.EOF || rerr == io.ErrUnexpectedEOF) && readN > 0 {
-					n, err = readN, nil
-				} else if rerr != nil {
-					if r.ctx.Err() == nil {
-						if tier == TierS3 {
-							RecordS3Failure(rerr)
-						} else {
-							RecordNASFailure(rerr)
-						}
-						cm.InvalidateUploadedChunk(startChunk)
-						return 0, true, nil
+	}
+	if !needRingRetry && !anyUploaded && fromPart && n > 0 && r.state != nil && r.state.DiskRangeSet != nil {
+		diskTracked := r.state.DiskRangeSet.TotalBytes() > 0 || (cm != nil && cm.IsRingBufferMode())
+		if diskTracked && !r.state.DiskRangeSet.HasAvailable(off, int64(n)) {
+			needFlushRetry = true
+		}
+	}
+	if fromPart && r.state != nil {
+		r.state.partIOMu.RUnlock()
+	}
+	if needRingRetry {
+		return 0, true, nil
+	}
+	if needFlushRetry {
+		select {
+		case <-time.After(1 * time.Millisecond):
+			return 0, true, nil
+		case <-r.ctx.Done():
+			return 0, false, r.ctx.Err()
+		}
+	}
+	if cm != nil && fromPart && cm.ChunkSize() > 0 && anyUploaded {
+		chunkSize := cm.ChunkSize()
+		chunkStart := int64(startChunk) * chunkSize
+		offsetInChunk := off - chunkStart
+		readLen := toRead
+		if rem := chunkSize - offsetInChunk; readLen > rem {
+			readLen = rem
+		}
+		if rc, cerr := cm.ReadCommittedChunk(r.ctx, startChunk, offsetInChunk, readLen); cerr == nil {
+			readN, rerr := io.ReadFull(rc, p[:readLen])
+			_ = rc.Close()
+			if (rerr == nil || rerr == io.EOF || rerr == io.ErrUnexpectedEOF) && readN > 0 {
+				n, err = readN, nil
+			} else if rerr != nil {
+				if r.ctx.Err() == nil {
+					if tier == TierS3 {
+						RecordS3Failure(rerr)
+					} else {
+						RecordNASFailure(rerr)
 					}
-					n, err = 0, rerr
-				}
-			} else if r.state.GetTargetTier() == TierS3 {
-				if s3Reader, s3Err := r.getS3Reader(); s3Err == nil {
-					n, err = s3Reader.ReadAt(p[:readLen], off)
-				} else if r.ctx.Err() == nil {
-					RecordS3Failure(cerr)
-					RecordS3Failure(s3Err)
 					cm.InvalidateUploadedChunk(startChunk)
 					return 0, true, nil
-				} else {
-					n, err = 0, cerr
 				}
-			} else if f2, stillFromPart, fErr := r.getFileWithOrigin(); fErr == nil && !stillFromPart {
-				n, err = f2.ReadAt(p[:readLen], off)
+				n, err = 0, rerr
+			}
+		} else if r.state.GetTargetTier() == TierS3 {
+			if s3Reader, s3Err := r.getS3Reader(); s3Err == nil {
+				n, err = s3Reader.ReadAt(p[:readLen], off)
 			} else if r.ctx.Err() == nil {
-				RecordNASFailure(cerr)
+				RecordS3Failure(cerr)
+				RecordS3Failure(s3Err)
 				cm.InvalidateUploadedChunk(startChunk)
 				return 0, true, nil
 			} else {
 				n, err = 0, cerr
 			}
+		} else if f2, stillFromPart, fErr := r.getFileWithOrigin(); fErr == nil && !stillFromPart {
+			n, err = f2.ReadAt(p[:readLen], off)
+		} else if r.ctx.Err() == nil {
+			RecordNASFailure(cerr)
+			cm.InvalidateUploadedChunk(startChunk)
+			return 0, true, nil
+		} else {
+			n, err = 0, cerr
 		}
 	}
 	if n > 0 {

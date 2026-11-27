@@ -667,12 +667,19 @@ func TestManualAddWorkerSplitsLargestGapAndRespectsGuards(t *testing.T) {
 		t.Fatalf("Expected manual Worker 2 to start near midpoint of remaining gap (>32KB, <%d), got %d (starts=%v)", totalSize, worker2Start, requestedStarts)
 	}
 
-	// Release Worker 1 and wait for full file commit.
+	// Release Worker 1 and wait for full file commit and registry cleanup.
 	gateOnce.Do(func() { close(gateWorker1) })
 	waitDone := time.Now().Add(5 * time.Second)
-	for !FileExists(finalPath) && time.Now().Before(waitDone) {
+	for time.Now().Before(waitDone) {
+		GlobalRegistry.Lock.RLock()
+		_, stillActive := GlobalRegistry.Files[key]
+		GlobalRegistry.Lock.RUnlock()
+		if !stillActive && FileExists(finalPath) {
+			break
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	time.Sleep(25 * time.Millisecond)
 	if !FileExists(finalPath) {
 		t.Fatalf("Timed out waiting for dual-worker hydration to commit %s", finalPath)
 	}
@@ -682,5 +689,72 @@ func TestManualAddWorkerSplitsLargestGapAndRespectsGuards(t *testing.T) {
 	}
 	if !bytes.Equal(gotBytes, payload) {
 		t.Fatalf("Committed payload mismatch after manual +Worker (%d vs %d bytes)", len(gotBytes), len(payload))
+	}
+}
+
+func TestDashboardHeadersAndPendingRecomposeVisibility(t *testing.T) {
+	saveAndRestoreResilienceGlobals(t)
+
+	tempDir := t.TempDir()
+	GlobalConfig = &Config{
+		CacheDir:       filepath.Join(tempDir, "cache"),
+		TmpDir:         filepath.Join(tempDir, "tmp"),
+		StateDir:       filepath.Join(tempDir, "state"),
+		StorageBackend: "disk",
+	}
+	InitRegistry()
+	GlobalLogBroker = nil
+
+	// 1. Verify handleDashboardUI omits Clear-Site-Data while preserving no-store headers.
+	uiReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	uiRec := httptest.NewRecorder()
+	handleDashboardUI(uiRec, uiReq)
+	if uiRec.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK from handleDashboardUI, got %d", uiRec.Code)
+	}
+	if got := uiRec.Header().Get("Clear-Site-Data"); got != "" {
+		t.Errorf("Expected empty Clear-Site-Data header, got %q", got)
+	}
+	if !strings.Contains(uiRec.Header().Get("Cache-Control"), "no-store") {
+		t.Errorf("Expected Cache-Control to include no-store, got %q", uiRec.Header().Get("Cache-Control"))
+	}
+
+	// 2. Verify handleSSE emits X-Accel-Buffering: no and omits hop-by-hop Connection: keep-alive.
+	sseCtx, cancelSSE := context.WithCancel(context.Background())
+	cancelSSE() // Allows handleSSE to set headers, send initial state, and exit immediately.
+	sseReq := httptest.NewRequest(http.MethodGet, "/dashboard/sse", nil).WithContext(sseCtx)
+	sseRec := httptest.NewRecorder()
+	handleSSE(sseRec, sseReq)
+	if got := sseRec.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("Expected X-Accel-Buffering=no, got %q", got)
+	}
+	if got := sseRec.Header().Get("Connection"); got != "" {
+		t.Errorf("Expected no Connection header on SSE response, got %q", got)
+	}
+
+	// 3. Verify collectDashboardSnapshot includes completed files in "Pending Recompose".
+	key := "pending_recompose_visible.mkv"
+	state := NewFileCacheState(key, "http://example.com/vid.mkv", "", "", "", "video/x-matroska", "", "", 1024)
+	state.DiskMaterialized = true
+	state.RangeSet.Add(0, 1024)
+	state.SetUpstreamStatus("Pending Recompose")
+
+	GlobalRegistry.Lock.Lock()
+	GlobalRegistry.Files[key] = state
+	GlobalRegistry.Lock.Unlock()
+
+	snap := collectDashboardSnapshot()
+	found := false
+	for _, af := range snap.ActiveFiles {
+		if af.Key == key {
+			found = true
+			if af.UpstreamStatus != "Pending Recompose" {
+				t.Errorf("Expected UpstreamStatus='Pending Recompose', got %q", af.UpstreamStatus)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Expected completed file in 'Pending Recompose' state to appear in dashboard ActiveFiles")
 	}
 }

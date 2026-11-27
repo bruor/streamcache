@@ -696,6 +696,9 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 	}
 
 	// 1. Deallocate physical disk blocks (Linux hole punching)
+	if m.state != nil {
+		m.state.partIOMu.Lock()
+	}
 	if punchErr := PunchHole(f.Fd(), chunkStart, chunkLen); punchErr != nil {
 		log.Printf("[ScratchChunkManager] WARNING: PunchHole failed for %s chunk %d [%d, %d): %v",
 			m.key, chunkIndex, chunkStart, chunkStart+chunkLen, punchErr)
@@ -703,6 +706,9 @@ func (m *ScratchChunkManager) uploadWorker(chunkIndex int) {
 
 	// 2. Evict clean pages from host OS cache for this uploaded chunk
 	FadviseDontNeed(f.Fd(), chunkStart, chunkLen)
+	if m.state != nil {
+		m.state.partIOMu.Unlock()
+	}
 
 	// 3. Release scratch budget and signal download workers
 	m.SubInFlightBytes(chunkLen)
@@ -937,10 +943,29 @@ func (m *ScratchChunkManager) tryPunchBackRingBuffer() bool {
 		return false
 	}
 
-	removed := m.clearStateRange(chosen.start, chosen.end)
-	if advanceFloor {
-		m.state.AdvanceRingFloorOffset(chosen.end)
+	m.state.partIOMu.Lock()
+	curMinOff, curMaxOff, curProtected, curHasReaders := m.state.GetReaderOffsetBounds()
+	if !curHasReaders {
+		m.state.partIOMu.Unlock()
+		return false
 	}
+	chosenIdx := int(chosen.start / m.chunkSize)
+	readerProtected := false
+	for _, off := range curProtected {
+		if off < 0 {
+			off = 0
+		}
+		if int(off/m.chunkSize) == chosenIdx {
+			readerProtected = true
+			break
+		}
+	}
+	if readerProtected || (advanceFloor && chosen.end > curMinOff) || (!advanceFloor && (!m.IsRingBufferMode() || chosen.start < curMaxOff+m.chunkSize)) {
+		m.state.partIOMu.Unlock()
+		return false
+	}
+
+	removed := m.clearStateRange(chosen.start, chosen.end)
 
 	if m.state.PartPath != "" && FileExists(m.state.PartPath) {
 		if f, err := os.OpenFile(m.state.PartPath, os.O_RDWR, 0644); err == nil {
@@ -948,6 +973,11 @@ func (m *ScratchChunkManager) tryPunchBackRingBuffer() bool {
 			FadviseDontNeed(f.Fd(), chosen.start, chosen.end-chosen.start)
 			_ = f.Close()
 		}
+	}
+	m.state.partIOMu.Unlock()
+
+	if advanceFloor {
+		m.state.AdvanceRingFloorOffset(chosen.end)
 	}
 
 	m.ringPunchedCount.Add(1)

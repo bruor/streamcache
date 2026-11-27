@@ -375,6 +375,12 @@ func recreateMetadata(filePath, metaPath, url string) error {
 
 // probeUpstream attempts to determine the file's size, Content-Type, ETag, and Last-Modified headers.
 func probeUpstream(ctx context.Context, targetURL string, playerHeader http.Header, meta *FileMeta) (int64, string, string, string, bool, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+	}
+
 	GlobalInFlightProbes.Add(1)
 	if GlobalLogBroker != nil {
 		go GlobalLogBroker.BroadcastStateUpdate()

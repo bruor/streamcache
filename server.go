@@ -103,7 +103,13 @@ func StartServer() {
 
 	port := GlobalConfig.GetPort()
 	log.Printf("[Server] Starting HTTP Proxy Server on port %s", port)
-	if err := http.ListenAndServe(port, mux); err != nil {
+	srv := &http.Server{
+		Addr:              port,
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("[Server] Failed to start server: %v", err)
 	}
 }
@@ -521,10 +527,45 @@ func handleAPISessions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var (
+	dashboardHTMLCacheMu      sync.RWMutex
+	dashboardHTMLCacheBytes   []byte
+	dashboardHTMLCacheModTime time.Time
+	dashboardHTMLCacheSize    int64
+)
+
+func loadDashboardHTML() ([]byte, error) {
+	const path = "./web/index.html"
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	dashboardHTMLCacheMu.RLock()
+	if dashboardHTMLCacheBytes != nil && info.ModTime().Equal(dashboardHTMLCacheModTime) && info.Size() == dashboardHTMLCacheSize {
+		cached := dashboardHTMLCacheBytes
+		dashboardHTMLCacheMu.RUnlock()
+		return cached, nil
+	}
+	dashboardHTMLCacheMu.RUnlock()
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	dashboardHTMLCacheMu.Lock()
+	dashboardHTMLCacheBytes = content
+	dashboardHTMLCacheModTime = info.ModTime()
+	dashboardHTMLCacheSize = info.Size()
+	dashboardHTMLCacheMu.Unlock()
+	return content, nil
+}
+
 func handleDashboardUI(w http.ResponseWriter, r *http.Request) {
 	// Root endpoint serves index.html dashboard
 	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-		content, err := os.ReadFile("./web/index.html")
+		content, err := loadDashboardHTML()
 		if err != nil {
 			http.Error(w, "Dashboard HTML not found", http.StatusInternalServerError)
 			return
@@ -533,7 +574,6 @@ func handleDashboardUI(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, private, s-maxage=0")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
-		w.Header().Set("Clear-Site-Data", "\"cache\"")
 		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", ServerInstanceID))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(content)

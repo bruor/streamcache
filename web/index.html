@@ -7,10 +7,12 @@
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
     <title>Streamcache VOD Status Page</title>
-    <!-- Google Fonts Inter -->
+    <!-- Google Fonts Inter (non-blocking) -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+    <noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"></noscript>
     <style>
         :root {
             --bg-color: #080710;
@@ -22,8 +24,8 @@
             --accent-orange: #ff9f1c;
             --text-main: #ffffff;
             --text-sub: #b0b3b8;
-            --font-family: 'Inter', sans-serif;
-            --font-mono: 'JetBrains Mono', monospace;
+            --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            --font-mono: 'JetBrains Mono', ui-monospace, monospace;
         }
 
         * {
@@ -1420,6 +1422,10 @@
     </div>
 
     <script>
+        const escapeHtmlStr = (str) => String(str || '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+
         const consoleEl = document.getElementById('console');
         const scrollBtn = document.getElementById('console-scroll-btn');
         const focusBadge = document.getElementById('console-focus-badge');
@@ -1994,7 +2000,7 @@
                     card.id = `download-card-${file.key}`;
                     card.innerHTML = `
                         <div class="download-header">
-                            <div class="download-url" title="${file.url}">${file.url}</div>
+                            <div class="download-url" title="${escapeHtmlStr(file.url)}">${escapeHtmlStr(file.url)}</div>
                             <div class="download-controls">
                                 <div class="download-badge" id="badge-${file.key}">0.0%</div>
                                 <div class="download-speed-badge" id="speed-badge-${file.key}">0 B/s</div>
@@ -2357,12 +2363,29 @@
             }
         }
 
-        // Establish Server-Sent Events (SSE) connection
+        // Establish Server-Sent Events (SSE) connection with mobile lifecycle cleanup
+        let activeEventSource = null;
+        let sseReconnectTimer = null;
+
+        function closeSSE() {
+            if (sseReconnectTimer) {
+                clearTimeout(sseReconnectTimer);
+                sseReconnectTimer = null;
+            }
+            if (activeEventSource) {
+                activeEventSource.close();
+                activeEventSource = null;
+            }
+        }
+
         function connectSSE() {
+            closeSSE();
             appendLog("\nConnecting to SSE Event Stream...");
             const es = new EventSource('/dashboard/sse');
+            activeEventSource = es;
 
             es.onopen = function() {
+                if (es !== activeEventSource) return;
                 connectionDot.className = "status-indicator connected";
                 connectionText.innerText = "Connected";
                 appendLog("\n[SSE] Connected to event stream.");
@@ -2370,11 +2393,21 @@
             };
 
             es.onerror = function() {
+                if (es !== activeEventSource) return;
                 connectionDot.className = "status-indicator disconnected";
                 connectionText.innerText = "Reconnecting...";
-                appendLog("\n[SSE] Connection lost. Reconnecting in 3s...");
                 es.close();
-                setTimeout(connectSSE, 3000);
+                activeEventSource = null;
+                if (document.visibilityState === 'hidden') {
+                    return;
+                }
+                appendLog("\n[SSE] Connection lost. Reconnecting in 3s...");
+                sseReconnectTimer = setTimeout(() => {
+                    sseReconnectTimer = null;
+                    if (document.visibilityState !== 'hidden') {
+                        connectSSE();
+                    }
+                }, 3000);
             };
 
             // 1. Live log stream
@@ -2429,10 +2462,6 @@
                     let liveUpstreamText = '--';
                     let liveDownstreamText = '--';
                     let tooltipLines = [];
-
-                    const escapeHtmlStr = (str) => String(str || '').replace(/[&<>"']/g, ch => ({
-                        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-                    }[ch]));
 
                     if (data.provider_capacity && data.provider_capacity.status === 'ok') {
                         const cap = data.provider_capacity;
@@ -2569,6 +2598,16 @@
                     }
                 });
             }, 100);
+        });
+
+        window.addEventListener('pagehide', closeSSE);
+        window.addEventListener('beforeunload', closeSSE);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') {
+                closeSSE();
+            } else if (activeEventSource === null) {
+                connectSSE();
+            }
         });
 
         connectSSE();

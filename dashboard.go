@@ -74,7 +74,7 @@ func (lb *LogBroker) Unregister(ch chan SSEEvent) {
 func handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	// Ensure the connection is closeable / check if flusher is supported
@@ -327,7 +327,7 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		}
 
 		isDiskMat := fileState.DiskMaterialized
-		isProbeFile := !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing"
+		isProbeFile := !isDiskMat && !fileState.IsPrehydrating && !fileState.IsYielding && fileState.UpstreamStatus != "Committing" && fileState.UpstreamStatus != "Pending Recompose"
 		fileActiveConns := 0
 		for _, conn := range fileState.RecentConnections {
 			if conn.Closed.IsZero() {
@@ -346,7 +346,7 @@ func collectDashboardSnapshot() dashboardSnapshot {
 		downloaded := fileState.RangeSet.TotalBytes()
 		isCompleted := fileState.RangeSet.IsComplete(fileState.TotalSize)
 
-		if isCompleted && fileState.UpstreamStatus != "Committing" {
+		if isCompleted && fileState.UpstreamStatus != "Committing" && fileState.UpstreamStatus != "Pending Recompose" {
 			fileState.Lock.Unlock()
 			continue
 		}

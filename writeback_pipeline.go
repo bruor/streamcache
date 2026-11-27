@@ -547,6 +547,9 @@ func (wp *WritebackPipeline) storageConsumer() {
 
 		length := bufEnd - bufStart
 		if file != nil && bufPtr != nil && length > 0 {
+			if wp.state != nil {
+				wp.state.partIOMu.RLock()
+			}
 			_, err := file.WriteAt((*bufPtr)[bufStart:bufEnd], writeOffset)
 			if err != nil {
 				log.Printf("[WritebackPipeline] WriteAt error at offset %d: %v", writeOffset, err)
@@ -557,6 +560,11 @@ func (wp *WritebackPipeline) storageConsumer() {
 				wp.errMu.Unlock()
 			} else if wp.state != nil && wp.state.DiskRangeSet != nil {
 				wp.state.DiskRangeSet.Add(writeOffset, writeOffset+int64(length))
+			}
+			if wp.state != nil {
+				wp.state.partIOMu.RUnlock()
+			}
+			if err == nil && wp.state != nil && wp.state.DiskRangeSet != nil {
 				if cm := wp.state.GetChunkManager(); cm != nil {
 					cm.CheckAndTriggerUploads()
 					if cm.IsRingBufferMode() {

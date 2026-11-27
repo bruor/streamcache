@@ -125,6 +125,11 @@ type FileCacheState struct {
 	ClientOffsets        map[string]int64 // Per-client current/requested byte offsets guarded by Lock
 	coordMu              sync.Mutex
 	coordGen             uint64
+	// partIOMu coordinates PartPath disk I/O with range state/hole-punching.
+	// Lock ordering: MUST always be acquired outermost with no other locks held
+	// (above Lock, WorkersLock, RangeSet, DiskRangeSet, LiveBuffer, cm.mu, and GlobalRegistry.Lock),
+	// and never held across network I/O or blocking waits.
+	partIOMu             sync.RWMutex
 }
 
 // NewFileCacheState constructs a FileCacheState and evaluates L1 disk admission via GlobalRegistry.
@@ -1336,7 +1341,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		matchedSession.LastActive = time.Now()
 		matchedSession.Username = conn.Username
 
-		isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-10*1024*1024
+		isNearEOF := conn.TotalSize > 15*1024*1024 && conn.Offset >= conn.TotalSize-10*1024*1024
 		wasNotPreceded := matchedSession.MaxOffset < conn.TotalSize-15*1024*1024
 		readLimitNotExceeded := (conn.Offset - conn.StartOffset) <= 2*1024*1024
 		isProbe := isNearEOF && wasNotPreceded && readLimitNotExceeded
@@ -1359,7 +1364,7 @@ func (r *CacheRegistry) RegisterConnection(connID string, conn *ClientConnection
 		if r.Sessions == nil {
 			r.Sessions = make(map[string]*ClientSession)
 		}
-		isNearEOF := conn.TotalSize > 0 && conn.Offset >= conn.TotalSize-10*1024*1024
+		isNearEOF := conn.TotalSize > 15*1024*1024 && conn.Offset >= conn.TotalSize-10*1024*1024
 		isProbe := isNearEOF && (conn.Offset-conn.StartOffset) <= 2*1024*1024
 
 		var initialMaxOffset int64
@@ -1407,10 +1412,13 @@ func (r *CacheRegistry) UnregisterConnection(connID string) {
 		for _, session := range r.Sessions {
 			if _, exists := session.Conns[connID]; exists {
 				if finalOffset >= 0 {
-					isNearEOF := connTotalSize > 0 && finalOffset >= connTotalSize-10*1024*1024
-					sessionIsNearEOF := session.TotalSize > 0 && session.Offset >= session.TotalSize-10*1024*1024
+					isNearEOF := connTotalSize > 15*1024*1024 && finalOffset >= connTotalSize-10*1024*1024
+					sessionIsNearEOF := session.TotalSize > 15*1024*1024 && session.Offset >= session.TotalSize-10*1024*1024
 					if len(session.Conns) <= 1 || !isNearEOF || sessionIsNearEOF {
 						session.Offset = finalOffset
+						if !isNearEOF && finalOffset > session.MaxOffset {
+							session.MaxOffset = finalOffset
+						}
 					}
 				}
 				delete(session.Conns, connID)
@@ -1579,7 +1587,7 @@ func (r *CacheRegistry) GetActiveSessions() []ClientSession {
 					continue
 				}
 				ccOffset := atomic.LoadInt64(&cc.Offset)
-				isNearEOF := cc.TotalSize > 0 && ccOffset >= cc.TotalSize-10*1024*1024
+				isNearEOF := cc.TotalSize > 15*1024*1024 && ccOffset >= cc.TotalSize-10*1024*1024
 				wasNotPreceded := session.MaxOffset < cc.TotalSize-15*1024*1024
 				readLimitNotExceeded := (ccOffset - cc.StartOffset) <= 2*1024*1024
 				isProbe := isNearEOF && wasNotPreceded && readLimitNotExceeded

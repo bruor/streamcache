@@ -1351,14 +1351,35 @@ func runDownloadWorker(
 		readStartTime := time.Now()
 		n, err := activeRespBody.Read(buf)
 		if n > 0 {
+			// Materialize to disk BEFORE WriteChunk if buffered bytes or LiveBuffer capacity exceed threshold
+			// so LiveBuffer eviction never discards unpersisted chunks while wp.file == nil.
+			matThreshold := int64(32 * 1024 * 1024)
+			if cm != nil && cm.maxInFlightBytes > 0 && cm.maxInFlightBytes/2 < matThreshold {
+				matThreshold = cm.maxInFlightBytes / 2
+			}
+			liveBufFull := state.LiveBuffer != nil && state.LiveBuffer.maxBytes > 0 && state.LiveBuffer.GetCurBytes()+int64(n) > state.LiveBuffer.maxBytes
+			if !state.IsDiskMaterialized() && (state.RangeSet.TotalBytes()+int64(n) >= matThreshold || liveBufFull) {
+				if GlobalRegistry != nil && state.TotalSize > 0 && state.GetTargetTier() == TierDisk {
+					GlobalRegistry.PreEvict(state.TotalSize)
+				}
+				_ = state.MaterializeDiskFile()
+				state.Lock.Lock()
+				if state.File != nil {
+					file = state.File
+				}
+				state.Lock.Unlock()
+			}
+
 			var werr error
 			if pipeline != nil {
 				werr = pipeline.WriteChunk(currentOffset, buf[:n])
 			} else if file != nil {
+				state.partIOMu.RLock()
 				_, werr = file.WriteAt(buf[:n], currentOffset)
 				if werr == nil && state.DiskRangeSet != nil {
 					state.DiskRangeSet.Add(currentOffset, currentOffset+int64(n))
 				}
+				state.partIOMu.RUnlock()
 			}
 			if werr != nil {
 				log.Printf("[Worker-%d] File write error at %d: %v", w.id, currentOffset, werr)
@@ -1391,18 +1412,6 @@ func runDownloadWorker(
 
 			if !sniffed {
 				sniffAndSchedulePrefetch(state, file)
-			}
-
-			// Materialize to disk once buffered bytes cross threshold (scaled down for small TMP_FILE_MAX_BYTES rings)
-			matThreshold := int64(32 * 1024 * 1024)
-			if cm != nil && cm.maxInFlightBytes > 0 && cm.maxInFlightBytes/2 < matThreshold {
-				matThreshold = cm.maxInFlightBytes / 2
-			}
-			if !state.IsDiskMaterialized() && state.RangeSet.TotalBytes() >= matThreshold {
-				if GlobalRegistry != nil && state.TotalSize > 0 && state.GetTargetTier() == TierDisk {
-					GlobalRegistry.PreEvict(state.TotalSize)
-				}
-				_ = state.MaterializeDiskFile()
 			}
 
 			currentOffset += int64(n)
@@ -1640,14 +1649,28 @@ func runInlineTailPrefetch(
 
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
+			if !state.IsDiskMaterialized() && state.LiveBuffer != nil && state.LiveBuffer.maxBytes > 0 && state.LiveBuffer.GetCurBytes()+int64(n) > state.LiveBuffer.maxBytes {
+				if GlobalRegistry != nil && state.TotalSize > 0 && state.GetTargetTier() == TierDisk {
+					GlobalRegistry.PreEvict(state.TotalSize)
+				}
+				_ = state.MaterializeDiskFile()
+				state.Lock.Lock()
+				if state.File != nil {
+					file = state.File
+				}
+				state.Lock.Unlock()
+			}
+
 			var werr error
 			if pipeline != nil {
 				werr = pipeline.WriteChunk(currentOffset, buf[:n])
 			} else if file != nil {
+				state.partIOMu.RLock()
 				_, werr = file.WriteAt(buf[:n], currentOffset)
 				if werr == nil && state.DiskRangeSet != nil {
 					state.DiskRangeSet.Add(currentOffset, currentOffset+int64(n))
 				}
+				state.partIOMu.RUnlock()
 			}
 			if werr != nil {
 				log.Printf("[Worker-%d] Inline tail pre-fetch write error at %d: %v", w.id, currentOffset, werr)
@@ -2028,13 +2051,23 @@ func commitCompletedFile(state *FileCacheState, fileToClose *os.File, pipeline S
 
 	// Cross-FS NAS staging path (TierDisk + ScratchChunkManager)
 	if cm := state.GetChunkManager(); cm != nil {
-		commitErr := cm.WaitAndRecompose(context.Background())
+		recomposeTimeout := 30 * time.Minute
+		if GlobalConfig != nil {
+			if rt := GlobalConfig.GetS3Config().RecomposeTimeout; rt > 0 {
+				recomposeTimeout = rt
+			}
+		}
+		recomposeCtx, cancelRecompose := context.WithTimeout(context.Background(), recomposeTimeout)
+		commitErr := cm.WaitAndRecompose(recomposeCtx)
+		cancelRecompose()
 		cm.Close()
 		_ = os.Remove(state.PartPath)
 
 		if commitErr != nil {
 			log.Printf("%s NAS staging commit FAILED for %s: %v", logPrefix, state.Key, commitErr)
-			_ = cm.Cleanup(context.Background())
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = cm.Cleanup(cleanupCtx)
+			cancelCleanup()
 			releaseAccountedCacheBytes(state)
 			state.SetUpstreamStatus("Error")
 		} else {
