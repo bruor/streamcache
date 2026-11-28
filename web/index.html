@@ -3125,8 +3125,8 @@
                         const demotePct = isHybridDisk ? (st.hybrid_demote_threshold_pct || 0) : 0;
                         let demoteBytes = 0;
                         if (cacheDemoteEl) {
-                            if (demotePct > 0 && cacheMax > 0 && cacheTotalSpan > 0) {
-                                demoteBytes = cacheMax * (demotePct / 100);
+                            if (demotePct > 0 && cacheAllocBytes > 0 && cacheTotalSpan > 0) {
+                                demoteBytes = cacheAllocBytes * (demotePct / 100);
                                 const demotePosPct = Math.min(100, (demoteBytes / cacheTotalSpan) * 100);
                                 cacheDemoteEl.style.display = 'block';
                                 cacheDemoteEl.style.left = demotePosPct >= 99.5 ? 'calc(100% - 1.5px)' : `${demotePosPct.toFixed(1)}%`;

@@ -1232,11 +1232,15 @@ func (r *CacheRegistry) startDiskFreeMonitor(cfg *Config) {
 			if usesCacheDir {
 				diskDir = cfg.GetCacheDir()
 			}
+			var cacheSpace uint64
+			hasCacheSpace := false
 			if !(usesCacheDir && !IsNASHealthy()) {
-				space, err := GetDiskFreeSpace(diskDir)
+				space, err := queryDiskFreeSpace(diskDir)
 				if err == nil {
 					atomic.StoreUint64(&GlobalDiskFreeBytes, space)
 					if usesCacheDir {
+						cacheSpace = space
+						hasCacheSpace = true
 						minFree := EffectiveCacheMinDiskFreeBytes(cfg, GetStorageTopology())
 						if minFree > 0 && space < uint64(minFree) {
 							r.PreEvict(0)
@@ -1246,10 +1250,12 @@ func (r *CacheRegistry) startDiskFreeMonitor(cfg *Config) {
 			}
 			if cfg.EffectiveStorageBackend() == "hybrid" {
 				if demoter := getGlobalHybridDemoter(); demoter != nil && demoter.registry == r {
-					if maxBytes := cfg.GetCacheMaxBytes(); maxBytes > 0 {
-						if thresholdPct := cfg.GetHybridDemoteThreshold(); thresholdPct > 0 {
-							thresholdBytes := int64(float64(maxBytes) * float64(thresholdPct) / 100.0)
-							if r.GetTotalCacheSize() > thresholdBytes {
+					if thresholdPct := cfg.GetHybridDemoteThreshold(); thresholdPct > 0 {
+						totalCache := r.GetTotalCacheSize()
+						minFree := EffectiveCacheMinDiskFreeBytes(cfg, GetStorageTopology())
+						if effectiveCap, hasCap := computeEffectiveL1CapBytes(cfg.GetCacheMaxBytes(), minFree, totalCache, cacheSpace, hasCacheSpace); hasCap {
+							thresholdBytes := int64(float64(effectiveCap) * float64(thresholdPct) / 100.0)
+							if totalCache > thresholdBytes {
 								demoter.TriggerWatermarkDemotion()
 							}
 						}
@@ -1876,18 +1882,22 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 		return true, ""
 	}
 
-	maxBytes := GlobalConfig.GetCacheMaxBytes()
-	maxItemPct := GlobalConfig.GetCacheMaxItemPct()
-	if maxBytes > 0 && maxItemPct > 0 {
-		maxItemBytes := int64(math.Round(float64(maxBytes) * float64(maxItemPct) / 100.0))
-		if totalSize > maxItemBytes {
-			return false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_ITEM_PCT limit (%d%% of %d = %d bytes)",
-				totalSize, maxItemPct, maxBytes, maxItemBytes)
-		}
-	}
-
 	cacheDir := GlobalConfig.GetCacheDir()
 	snap := r.snapshotL1DiskState(cacheDir, nil)
+	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
+	freeSpace, spaceErr := queryDiskFreeSpace(cacheDir)
+	hasSpaceInfo := spaceErr == nil
+
+	maxBytes := GlobalConfig.GetCacheMaxBytes()
+	maxItemPct := GlobalConfig.GetCacheMaxItemPct()
+	effectiveCap, hasCap := computeEffectiveL1CapBytes(maxBytes, minDiskFree, snap.onDiskL1Bytes(), freeSpace, hasSpaceInfo)
+	if hasCap && effectiveCap > 0 && maxItemPct > 0 {
+		maxItemBytes := int64(math.Round(float64(effectiveCap) * float64(maxItemPct) / 100.0))
+		if totalSize > maxItemBytes {
+			return false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_ITEM_PCT limit (%d%% of %d = %d bytes)",
+				totalSize, maxItemPct, effectiveCap, maxItemBytes)
+		}
+	}
 
 	if maxBytes > 0 {
 		committedL1 := snap.PinnedL1Bytes
@@ -1900,8 +1910,7 @@ func (r *CacheRegistry) canAdmitToL1(totalSize int64, allowEviction bool) (bool,
 		}
 	}
 
-	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
-	if freeSpace, spaceErr := GetDiskFreeSpace(cacheDir); spaceErr == nil {
+	if hasSpaceInfo {
 		var required uint64
 		if totalSize > 0 {
 			required += uint64(totalSize)
@@ -1942,6 +1951,14 @@ type l1DiskSnapshot struct {
 	UnwrittenActiveL1Bytes int64
 	InactiveBackedBytes    int64
 	BackedCandidates       []backedL1Candidate
+}
+
+func (s l1DiskSnapshot) onDiskL1Bytes() int64 {
+	writtenPinned := s.PinnedL1Bytes - s.UnwrittenActiveL1Bytes
+	if writtenPinned < 0 {
+		writtenPinned = 0
+	}
+	return writtenPinned + s.InactiveEvictableBytes
 }
 
 func (r *CacheRegistry) snapshotL1DiskState(cacheDir string, idx *CacheIndex) l1DiskSnapshot {
@@ -2096,21 +2113,28 @@ func (r *CacheRegistry) tryAdmitHybridL1Locked(totalSize int64, idx *CacheIndex)
 		return false, false, false, "unknown_size_bypass"
 	}
 
-	maxBytes := GlobalConfig.GetCacheMaxBytes()
-	maxItemPct := GlobalConfig.GetCacheMaxItemPct()
-	if maxBytes > 0 && maxItemPct > 0 {
-		maxItemBytes := int64(math.Round(float64(maxBytes) * float64(maxItemPct) / 100.0))
-		if totalSize > maxItemBytes {
-			return false, false, false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_ITEM_PCT limit (%d%% of %d = %d bytes)",
-				totalSize, maxItemPct, maxBytes, maxItemBytes)
-		}
-	}
-	if maxBytes > 0 && totalSize > maxBytes {
-		return false, false, false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_BYTES (%d)", totalSize, maxBytes)
-	}
-
 	cacheDir := GlobalConfig.GetCacheDir()
 	snap := r.snapshotL1DiskState(cacheDir, idx)
+	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
+	freeSpace, spaceErr := queryDiskFreeSpace(cacheDir)
+	hasSpaceInfo := spaceErr == nil
+
+	maxBytes := GlobalConfig.GetCacheMaxBytes()
+	maxItemPct := GlobalConfig.GetCacheMaxItemPct()
+	effectiveCap, hasCap := computeEffectiveL1CapBytes(maxBytes, minDiskFree, snap.onDiskL1Bytes(), freeSpace, hasSpaceInfo)
+	if hasCap && effectiveCap > 0 && maxItemPct > 0 {
+		maxItemBytes := int64(math.Round(float64(effectiveCap) * float64(maxItemPct) / 100.0))
+		if totalSize > maxItemBytes {
+			return false, false, false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_ITEM_PCT limit (%d%% of %d = %d bytes)",
+				totalSize, maxItemPct, effectiveCap, maxItemBytes)
+		}
+	}
+	if hasCap && effectiveCap > 0 && totalSize > effectiveCap {
+		if maxBytes > 0 && effectiveCap == maxBytes {
+			return false, false, false, fmt.Sprintf("item %d bytes exceeds CACHE_MAX_BYTES (%d)", totalSize, maxBytes)
+		}
+		return false, false, false, fmt.Sprintf("item %d bytes exceeds effective L1 capacity (%d)", totalSize, effectiveCap)
+	}
 
 	var needForMaxBytes int64
 	if maxBytes > 0 {
@@ -2121,13 +2145,8 @@ func (r *CacheRegistry) tryAdmitHybridL1Locked(totalSize int64, idx *CacheIndex)
 	}
 
 	var needForDiskFree int64
-	var freeSpace uint64
 	var required uint64
-	hasSpaceInfo := false
-	minDiskFree := EffectiveCacheMinDiskFreeBytes(GlobalConfig, GetStorageTopology())
-	if fsSpace, spaceErr := GetDiskFreeSpace(cacheDir); spaceErr == nil {
-		hasSpaceInfo = true
-		freeSpace = fsSpace
+	if hasSpaceInfo {
 		if totalSize > 0 {
 			required += uint64(totalSize)
 		}
@@ -2193,7 +2212,7 @@ func (r *CacheRegistry) tryAdmitHybridL1Locked(totalSize int64, idx *CacheIndex)
 		if reclaimed >= bytesNeeded {
 			diskOK := true
 			if needForDiskFree > 0 {
-				if fsSpace, spaceErr := GetDiskFreeSpace(cacheDir); spaceErr == nil && fsSpace < required {
+				if fsSpace, spaceErr := queryDiskFreeSpace(cacheDir); spaceErr == nil && fsSpace < required {
 					diskOK = false
 					freeSpace = fsSpace
 				}
@@ -2221,7 +2240,7 @@ func (r *CacheRegistry) tryAdmitHybridL1Locked(totalSize int64, idx *CacheIndex)
 		reason = "L1 capacity unavailable"
 	}
 
-	shouldNudge = maxBytes > 0 && remainingInactive > 0
+	shouldNudge = hasCap && remainingInactive > 0
 	return false, shouldNudge, reclaimedCount > 0, reason
 }
 

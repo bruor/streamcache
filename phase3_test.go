@@ -1070,3 +1070,373 @@ func TestPhase3HybridInstantTierBothReclaimAndBoundedHeadroomNudge(t *testing.T)
 		}
 	})
 }
+
+func TestComputeEffectiveL1CapBytes(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+
+	t.Run("UnlimitedCacheMaxBytes_UsesDynamicDiskPool", func(t *testing.T) {
+		onDisk := int64(35962867558)
+		free := uint64(11441053696)
+		minFree := 10 * gb
+		got, ok := computeEffectiveL1CapBytes(0, minFree, onDisk, free, true)
+		want := onDisk + int64(free-uint64(minFree))
+		if !ok || got != want {
+			t.Fatalf("computeEffectiveL1CapBytes = (%d, %v), want (%d, true)", got, ok, want)
+		}
+	})
+
+	t.Run("UnlimitedCacheMaxBytes_PartialReserveBreachShrinksPool", func(t *testing.T) {
+		got, ok := computeEffectiveL1CapBytes(0, 5000, 4000, 3000, true)
+		if !ok || got != 2000 {
+			t.Fatalf("computeEffectiveL1CapBytes = (%d, %v), want (2000, true)", got, ok)
+		}
+	})
+
+	t.Run("UnlimitedCacheMaxBytes_SevereReserveBreachClampsToZero", func(t *testing.T) {
+		got, ok := computeEffectiveL1CapBytes(0, 5000, 2000, 1000, true)
+		if !ok || got != 0 {
+			t.Fatalf("computeEffectiveL1CapBytes = (%d, %v), want (0, true)", got, ok)
+		}
+	})
+
+	t.Run("ConfiguredCapSmallerThanDiskPoolWins", func(t *testing.T) {
+		got, ok := computeEffectiveL1CapBytes(3000, 1000, 1000, 5000, true)
+		if !ok || got != 3000 {
+			t.Fatalf("computeEffectiveL1CapBytes = (%d, %v), want (3000, true)", got, ok)
+		}
+	})
+
+	t.Run("DiskPoolTighterThanConfiguredCapWins", func(t *testing.T) {
+		got, ok := computeEffectiveL1CapBytes(10000, 1000, 2800, 2200, true)
+		if !ok || got != 4000 {
+			t.Fatalf("computeEffectiveL1CapBytes = (%d, %v), want (4000, true)", got, ok)
+		}
+	})
+
+	t.Run("UnavailableFreeSpaceFallback", func(t *testing.T) {
+		if got, ok := computeEffectiveL1CapBytes(0, 1000, 2000, 0, false); ok || got != 0 {
+			t.Fatalf("expected (0, false) when free space unavailable and CacheMaxBytes=0, got (%d, %v)", got, ok)
+		}
+		if got, ok := computeEffectiveL1CapBytes(5000, 1000, 2000, 0, false); !ok || got != 5000 {
+			t.Fatalf("expected (5000, true) when free space unavailable and CacheMaxBytes=5000, got (%d, %v)", got, ok)
+		}
+	})
+}
+
+func TestPhase3DynamicDiskPoolHybridDemotionAndAdmission(t *testing.T) {
+	withMockDiskFreeSpace := func(t *testing.T, fn func(path string) (uint64, error)) {
+		t.Helper()
+		diskFreeSpaceMu.Lock()
+		orig := diskFreeSpaceProvider
+		diskFreeSpaceProvider = fn
+		diskFreeSpaceMu.Unlock()
+		t.Cleanup(func() {
+			diskFreeSpaceMu.Lock()
+			diskFreeSpaceProvider = orig
+			diskFreeSpaceMu.Unlock()
+		})
+	}
+
+	dirRegularBytes := func(dir string) int64 {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return 0
+		}
+		var total int64
+		for _, entry := range entries {
+			if entry.IsDir() || isAuxiliaryCacheFile(entry.Name()) {
+				continue
+			}
+			if info, err := entry.Info(); err == nil {
+				total += info.Size()
+			}
+		}
+		return total
+	}
+
+	setupDynamicHybridEnv := func(t *testing.T, bucket string, maxBytes int64, maxItemPct, demoteThreshold int, minFree int64, preSeed func(tiered *TieredStorageBackend)) (*MockS3Server, *TieredStorageBackend, *CacheIndex, *HybridDemoter, string, string) {
+		t.Helper()
+		saveAndRestorePhase1Globals(t)
+		clearPhase0ConfigEnv(t)
+
+		mockS3 := NewMockS3Server(bucket)
+		t.Cleanup(mockS3.Close)
+
+		base := t.TempDir()
+		cacheDir := filepath.Join(base, "cache")
+		tmpDir := filepath.Join(base, "tmp")
+		stateDir := filepath.Join(base, "state")
+		for _, dir := range []string{cacheDir, tmpDir, stateDir} {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatalf("MkdirAll %s: %v", dir, err)
+			}
+		}
+
+		GlobalConfig = &Config{
+			StorageBackend:          "hybrid",
+			CacheDir:                cacheDir,
+			TmpDir:                  tmpDir,
+			StateDir:                stateDir,
+			CacheMaxBytes:           maxBytes,
+			CacheMaxItemPct:         maxItemPct,
+			HybridDemoteThreshold:   demoteThreshold,
+			CacheMinDiskFreeBytes:   minFree,
+			TmpFileMaxBytes:         512,
+			CacheRevalidateInterval: 1 * time.Hour,
+			S3Config: S3Config{
+				Endpoint:     mockS3.URL(),
+				Bucket:       bucket,
+				Region:       "us-east-1",
+				AccessKey:    "test",
+				SecretKey:    "test",
+				UsePathStyle: true,
+				DisableSSL:   true,
+				ChunkSize:    64 * 1024,
+			},
+		}
+
+		GlobalStorage = nil
+		if err := InitStorage(); err != nil {
+			t.Fatalf("InitStorage hybrid error: %v", err)
+		}
+		tiered := GlobalStorage.(*TieredStorageBackend)
+		if preSeed != nil {
+			preSeed(tiered)
+		}
+		InitRegistry()
+
+		idx := getGlobalCacheIndex()
+		demoter := getGlobalHybridDemoter()
+		if idx == nil || demoter == nil {
+			t.Fatalf("Expected initialized CacheIndex and HybridDemoter")
+		}
+		return mockS3, tiered, idx, demoter, cacheDir, tmpDir
+	}
+
+	seedLocalDiskFiles := func(t *testing.T, tiered *TieredStorageBackend, key string, size int, accessTime time.Time) {
+		t.Helper()
+		p := tiered.Local().FilePath(key)
+		payload := bytes.Repeat([]byte("D"), size)
+		if err := os.WriteFile(p, payload, 0644); err != nil {
+			t.Fatalf("WriteFile %s: %v", key, err)
+		}
+		meta := FileMeta{
+			URL:           "http://origin/" + key,
+			TotalSize:     int64(size),
+			ContentType:   "video/mp4",
+			LastValidated: accessTime.Unix(),
+			Completed:     true,
+		}
+		metaBytes, _ := json.Marshal(meta)
+		if err := os.WriteFile(p+".json", metaBytes, 0644); err != nil {
+			t.Fatalf("WriteFile meta %s: %v", key, err)
+		}
+		_ = os.Chtimes(p, accessTime, accessTime)
+	}
+
+	cleanupState := func(s *FileCacheState) {
+		if cm := s.GetChunkManager(); cm != nil {
+			cm.Close()
+		}
+	}
+
+	t.Run("UnlimitedCacheMaxBytes_WatermarkDemotesToDynamicPool", func(t *testing.T) {
+		now := time.Now()
+		// Register mock provider cleanup before setupDynamicHybridEnv so GlobalRegistry stops first in LIFO cleanup.
+		withMockDiskFreeSpace(t, func(path string) (uint64, error) {
+			return 1200, nil
+		})
+
+		mockS3, tiered, idx, demoter, _, _ := setupDynamicHybridEnv(t, "dyn-watermark-bucket", 0, 25, 0, 1000, func(tb *TieredStorageBackend) {
+			seedLocalDiskFiles(t, tb, "f1.mp4", 950, now.Add(-4*time.Hour))
+			seedLocalDiskFiles(t, tb, "f2.mp4", 950, now.Add(-3*time.Hour))
+			seedLocalDiskFiles(t, tb, "f3.mp4", 950, now.Add(-2*time.Hour))
+			seedLocalDiskFiles(t, tb, "f4.mp4", 950, now.Add(-1*time.Hour))
+		})
+
+		if got := GlobalConfig.GetHybridDemoteThreshold(); got != 75 {
+			t.Fatalf("Expected default HybridDemoteThreshold=75 for CACHE_MAX_ITEM_PCT=25, got %d", got)
+		}
+		if !waitForPhase1Condition(3*time.Second, func() bool {
+			return idx.GetTier("f1.mp4") == IndexTierDisk && idx.GetTier("f4.mp4") == IndexTierDisk
+		}) {
+			t.Fatalf("Timed out waiting for startup reconcile")
+		}
+		idx.mu.Lock()
+		for i, k := range []string{"f1.mp4", "f2.mp4", "f3.mp4", "f4.mp4"} {
+			if e := idx.entries[k]; e != nil {
+				e.LastAccessed = now.Add(-time.Duration(4-i) * time.Hour).Unix()
+			}
+		}
+		idx.mu.Unlock()
+
+		// localTotal = 3800, freeSpace = 1200, minFree = 1000 -> effectiveCap = 4000, 75% target = 3000.
+		demoted, freed, err := demoter.RunDemotionPass(context.Background())
+		if err != nil {
+			t.Fatalf("RunDemotionPass error: %v", err)
+		}
+		if demoted != 1 || freed != 950 {
+			t.Fatalf("Expected 1 file (950B) demoted to reach <= 3000B target, got demoted=%d freed=%d", demoted, freed)
+		}
+		if FileExists(tiered.Local().FilePath("f1.mp4")) {
+			t.Errorf("Expected oldest file f1.mp4 removed from L1")
+		}
+		if !mockS3.HasObject("dyn-watermark-bucket", tiered.S3().monolithicKey("f1.mp4")) {
+			t.Errorf("Expected f1.mp4 uploaded to S3")
+		}
+		for _, k := range []string{"f2.mp4", "f3.mp4", "f4.mp4"} {
+			if !FileExists(tiered.Local().FilePath(k)) {
+				t.Errorf("Expected %s to remain warm on L1", k)
+			}
+		}
+	})
+
+	t.Run("UnlimitedCacheMaxBytes_MaxItemPctAndReactiveHeadroomNudge", func(t *testing.T) {
+		now := time.Now()
+		var cacheDirRef string
+		var cacheDirMu sync.RWMutex
+		withMockDiskFreeSpace(t, func(path string) (uint64, error) {
+			cacheDirMu.RLock()
+			dir := cacheDirRef
+			cacheDirMu.RUnlock()
+			used := int64(0)
+			if dir != "" {
+				used = dirRegularBytes(dir)
+			}
+			// Simulate a 5000B filesystem where freeSpace = 5000 - used (and minFree = 1000 => diskPool = 4000).
+			if used >= 5000 {
+				return 0, nil
+			}
+			return uint64(5000 - used), nil
+		})
+
+		mockS3, tiered, idx, demoter, cacheDir, tmpDir := setupDynamicHybridEnv(t, "dyn-nudge-bucket", 0, 25, 100, 1000, func(tb *TieredStorageBackend) {
+			seedLocalDiskFiles(t, tb, "f1.mp4", 950, now.Add(-4*time.Hour))
+			seedLocalDiskFiles(t, tb, "f2.mp4", 950, now.Add(-3*time.Hour))
+			seedLocalDiskFiles(t, tb, "f3.mp4", 950, now.Add(-2*time.Hour))
+			seedLocalDiskFiles(t, tb, "f4.mp4", 950, now.Add(-1*time.Hour))
+		})
+		cacheDirMu.Lock()
+		cacheDirRef = cacheDir
+		cacheDirMu.Unlock()
+
+		if !waitForPhase1Condition(3*time.Second, func() bool {
+			return idx.GetTier("f1.mp4") == IndexTierDisk && idx.GetTier("f4.mp4") == IndexTierDisk
+		}) {
+			t.Fatalf("Timed out waiting for startup reconcile")
+		}
+		idx.mu.Lock()
+		for i, k := range []string{"f1.mp4", "f2.mp4", "f3.mp4", "f4.mp4"} {
+			if e := idx.entries[k]; e != nil {
+				e.LastAccessed = now.Add(-time.Duration(4-i) * time.Hour).Unix()
+			}
+		}
+		idx.mu.Unlock()
+
+		// 1. Oversized item (1200B > 25% of 4000B = 1000B) bypasses to S3 without nudging demotion.
+		sOversize := NewFileCacheState("oversize_dyn.mp4", "http://origin/oversize_dyn.mp4",
+			filepath.Join(cacheDir, "oversize_dyn.mp4"), filepath.Join(tmpDir, "oversize_dyn.part"), "", "video/mp4", "", "", 1200)
+		defer cleanupState(sOversize)
+		if sOversize.GetTargetTier() != TierS3 {
+			t.Fatalf("Expected oversized 1200B item to route to TierS3, got %s", sOversize.GetTargetTier())
+		}
+		if demoted, _, err := demoter.RunDemotionPass(context.Background()); err != nil || demoted != 0 {
+			t.Fatalf("Expected zero demotions after oversized bypass at 100%% threshold, got demoted=%d err=%v", demoted, err)
+		}
+
+		// 2. Eligible item (800B <= 1000B, avail=200B < 800B) bypasses to S3 and nudges demotion (target = 3200B).
+		sEligible1 := NewFileCacheState("eligible_dyn1.mp4", "http://origin/eligible_dyn1.mp4",
+			filepath.Join(cacheDir, "eligible_dyn1.mp4"), filepath.Join(tmpDir, "eligible_dyn1.part"), "", "video/mp4", "", "", 800)
+		defer cleanupState(sEligible1)
+		if sEligible1.GetTargetTier() != TierS3 {
+			t.Fatalf("Expected 800B item with 200B avail to bypass to TierS3, got %s", sEligible1.GetTargetTier())
+		}
+		if !waitForPhase1Condition(5*time.Second, func() bool {
+			return !FileExists(tiered.Local().FilePath("f1.mp4")) && idx.GetTier("f1.mp4") == IndexTierS3
+		}) {
+			t.Fatalf("Timed out waiting for nudged demotion of f1.mp4")
+		}
+		if !mockS3.HasObject("dyn-nudge-bucket", tiered.S3().monolithicKey("f1.mp4")) {
+			t.Errorf("Expected f1.mp4 uploaded to S3")
+		}
+		for _, k := range []string{"f2.mp4", "f3.mp4", "f4.mp4"} {
+			if !FileExists(tiered.Local().FilePath(k)) {
+				t.Errorf("Expected %s (remaining 2850B <= 3200B target) to remain warm on L1", k)
+			}
+		}
+
+		// 3. Next 800B item now fits directly on L1 Disk (avail = 1150B >= 800B).
+		sEligible2 := NewFileCacheState("eligible_dyn2.mp4", "http://origin/eligible_dyn2.mp4",
+			filepath.Join(cacheDir, "eligible_dyn2.mp4"), filepath.Join(tmpDir, "eligible_dyn2.part"), "", "video/mp4", "", "", 800)
+		defer cleanupState(sEligible2)
+		if sEligible2.GetTargetTier() != TierDisk {
+			t.Fatalf("Expected subsequent 800B item to admit to TierDisk, got %s", sEligible2.GetTargetTier())
+		}
+	})
+
+	t.Run("DiskBoundCacheMaxBytes_DemotesAgainstTighterDiskPool", func(t *testing.T) {
+		now := time.Now()
+		withMockDiskFreeSpace(t, func(path string) (uint64, error) {
+			return 1200, nil
+		})
+
+		mockS3, tiered, idx, demoter, _, _ := setupDynamicHybridEnv(t, "dyn-diskbound-bucket", 10000, 25, 0, 1000, func(tb *TieredStorageBackend) {
+			seedLocalDiskFiles(t, tb, "f1.mp4", 950, now.Add(-4*time.Hour))
+			seedLocalDiskFiles(t, tb, "f2.mp4", 950, now.Add(-3*time.Hour))
+			seedLocalDiskFiles(t, tb, "f3.mp4", 950, now.Add(-2*time.Hour))
+			seedLocalDiskFiles(t, tb, "f4.mp4", 950, now.Add(-1*time.Hour))
+		})
+
+		if !waitForPhase1Condition(3*time.Second, func() bool {
+			return idx.GetTier("f1.mp4") == IndexTierDisk
+		}) {
+			t.Fatalf("Timed out waiting for startup reconcile")
+		}
+
+		// CacheMaxBytes=10000, but diskPool = 3800 + (1200 - 1000) = 4000 -> effectiveCap=4000, 75% target = 3000.
+		demoted, freed, err := demoter.RunDemotionPass(context.Background())
+		if err != nil {
+			t.Fatalf("RunDemotionPass error: %v", err)
+		}
+		if demoted != 1 || freed != 950 {
+			t.Fatalf("Expected 1 file (950B) demoted under tighter diskPool, got demoted=%d freed=%d", demoted, freed)
+		}
+		if !mockS3.HasObject("dyn-diskbound-bucket", tiered.S3().monolithicKey("f1.mp4")) {
+			t.Errorf("Expected f1.mp4 uploaded to S3")
+		}
+	})
+
+	t.Run("SevereReserveBreach_DemotesDownToZero", func(t *testing.T) {
+		now := time.Now()
+		withMockDiskFreeSpace(t, func(path string) (uint64, error) {
+			return 1000, nil
+		})
+
+		mockS3, tiered, idx, demoter, _, _ := setupDynamicHybridEnv(t, "dyn-breach-bucket", 0, 25, 100, 5000, func(tb *TieredStorageBackend) {
+			seedLocalDiskFiles(t, tb, "f1.mp4", 1000, now.Add(-2*time.Hour))
+			seedLocalDiskFiles(t, tb, "f2.mp4", 1000, now.Add(-1*time.Hour))
+		})
+
+		if !waitForPhase1Condition(3*time.Second, func() bool {
+			return idx.GetTier("f1.mp4") == IndexTierDisk && idx.GetTier("f2.mp4") == IndexTierDisk
+		}) {
+			t.Fatalf("Timed out waiting for startup reconcile")
+		}
+
+		// freeSpace=1000 < minFree=5000 (deficit=4000 >= onDisk=2000) -> effectiveCap=0, demotes all inactive L1.
+		demoted, freed, err := demoter.RunDemotionPass(context.Background())
+		if err != nil {
+			t.Fatalf("RunDemotionPass error: %v", err)
+		}
+		if demoted != 2 || freed != 2000 {
+			t.Fatalf("Expected both files (2000B) demoted on severe reserve breach, got demoted=%d freed=%d", demoted, freed)
+		}
+		if FileExists(tiered.Local().FilePath("f1.mp4")) || FileExists(tiered.Local().FilePath("f2.mp4")) {
+			t.Errorf("Expected all inactive local L1 files demoted on severe reserve breach")
+		}
+		if !mockS3.HasObject("dyn-breach-bucket", tiered.S3().monolithicKey("f1.mp4")) ||
+			!mockS3.HasObject("dyn-breach-bucket", tiered.S3().monolithicKey("f2.mp4")) {
+			t.Errorf("Expected f1.mp4 and f2.mp4 uploaded to S3")
+		}
+	})
+}

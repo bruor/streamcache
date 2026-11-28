@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,7 +30,61 @@ type StorageTopology struct {
 var (
 	globalTopologyMu sync.RWMutex
 	globalTopology   *StorageTopology
+
+	diskFreeSpaceMu       sync.RWMutex
+	diskFreeSpaceProvider = GetDiskFreeSpace
 )
+
+func queryDiskFreeSpace(path string) (uint64, error) {
+	diskFreeSpaceMu.RLock()
+	fn := diskFreeSpaceProvider
+	diskFreeSpaceMu.RUnlock()
+	if fn == nil {
+		return GetDiskFreeSpace(path)
+	}
+	return fn(path)
+}
+
+// computeEffectiveL1CapBytes returns the active L1 capacity ceiling as min(CACHE_MAX_BYTES, diskPool),
+// where diskPool = max(0, onDiskL1Bytes + freeSpace - minDiskFree). When CACHE_MAX_BYTES == 0 and
+// filesystem free space is unavailable, it returns (0, false).
+func computeEffectiveL1CapBytes(configuredMaxBytes, minDiskFree, onDiskL1Bytes int64, freeSpace uint64, hasFreeSpace bool) (int64, bool) {
+	if !hasFreeSpace {
+		if configuredMaxBytes > 0 {
+			return configuredMaxBytes, true
+		}
+		return 0, false
+	}
+
+	if onDiskL1Bytes < 0 {
+		onDiskL1Bytes = 0
+	}
+	if minDiskFree < 0 {
+		minDiskFree = 0
+	}
+
+	var diskPool int64
+	if freeSpace >= uint64(minDiskFree) {
+		avail := freeSpace - uint64(minDiskFree)
+		if avail > uint64(math.MaxInt64-onDiskL1Bytes) {
+			diskPool = math.MaxInt64
+		} else {
+			diskPool = onDiskL1Bytes + int64(avail)
+		}
+	} else {
+		deficit := uint64(minDiskFree) - freeSpace
+		if deficit >= uint64(onDiskL1Bytes) {
+			diskPool = 0
+		} else {
+			diskPool = onDiskL1Bytes - int64(deficit)
+		}
+	}
+
+	if configuredMaxBytes > 0 && configuredMaxBytes < diskPool {
+		return configuredMaxBytes, true
+	}
+	return diskPool, true
+}
 
 // GetStorageTopology returns the most recently initialized StorageTopology (or nil before startup).
 func GetStorageTopology() *StorageTopology {

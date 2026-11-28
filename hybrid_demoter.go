@@ -258,43 +258,9 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 	d.passMu.Lock()
 	defer d.passMu.Unlock()
 
-	maxBytes := d.cfg.GetCacheMaxBytes()
 	thresholdPct := d.cfg.GetHybridDemoteThreshold()
-	if maxBytes <= 0 || thresholdPct <= 0 {
+	if thresholdPct <= 0 {
 		return 0, 0, nil
-	}
-
-	thresholdBytes := int64(float64(maxBytes) * float64(thresholdPct) / 100.0)
-
-	d.mu.Lock()
-	reqHeadroom := d.pendingHeadroomBytes
-	d.pendingHeadroomBytes = 0
-	d.mu.Unlock()
-
-	if reqHeadroom > 0 {
-		if maxItemPct := d.cfg.GetCacheMaxItemPct(); maxItemPct > 0 {
-			maxItemBytes := int64(math.Round(float64(maxBytes) * float64(maxItemPct) / 100.0))
-			if reqHeadroom > maxItemBytes {
-				reqHeadroom = maxItemBytes
-			}
-		}
-		if maxNudgeBytes := maxBytes / 2; maxNudgeBytes > 0 && reqHeadroom > maxNudgeBytes {
-			reqHeadroom = maxNudgeBytes
-		}
-		if reqHeadroom > maxBytes {
-			reqHeadroom = maxBytes
-		}
-	}
-
-	targetBytes := thresholdBytes
-	if reqHeadroom > 0 {
-		headroomTarget := maxBytes - reqHeadroom
-		if headroomTarget < 0 {
-			headroomTarget = 0
-		}
-		if headroomTarget < targetBytes {
-			targetBytes = headroomTarget
-		}
 	}
 
 	localObjs, err := d.storage.Local().List(ctx)
@@ -306,6 +272,54 @@ func (d *HybridDemoter) RunDemotionPass(ctx context.Context) (int, int64, error)
 	for _, obj := range localObjs {
 		localTotalBytes += obj.Size
 	}
+
+	var freeSpace uint64
+	hasFreeSpace := false
+	if cacheDir := d.cfg.GetCacheDir(); cacheDir != "" {
+		if fsSpace, fsErr := queryDiskFreeSpace(cacheDir); fsErr == nil {
+			freeSpace = fsSpace
+			hasFreeSpace = true
+		}
+	}
+	minDiskFree := EffectiveCacheMinDiskFreeBytes(d.cfg, GetStorageTopology())
+	effectiveCap, hasCap := computeEffectiveL1CapBytes(d.cfg.GetCacheMaxBytes(), minDiskFree, localTotalBytes, freeSpace, hasFreeSpace)
+	if !hasCap {
+		return 0, 0, nil
+	}
+
+	thresholdBytes := int64(float64(effectiveCap) * float64(thresholdPct) / 100.0)
+
+	d.mu.Lock()
+	reqHeadroom := d.pendingHeadroomBytes
+	d.pendingHeadroomBytes = 0
+	d.mu.Unlock()
+
+	if reqHeadroom > 0 {
+		if maxItemPct := d.cfg.GetCacheMaxItemPct(); maxItemPct > 0 {
+			maxItemBytes := int64(math.Round(float64(effectiveCap) * float64(maxItemPct) / 100.0))
+			if reqHeadroom > maxItemBytes {
+				reqHeadroom = maxItemBytes
+			}
+		}
+		if maxNudgeBytes := effectiveCap / 2; maxNudgeBytes > 0 && reqHeadroom > maxNudgeBytes {
+			reqHeadroom = maxNudgeBytes
+		}
+		if reqHeadroom > effectiveCap {
+			reqHeadroom = effectiveCap
+		}
+	}
+
+	targetBytes := thresholdBytes
+	if reqHeadroom > 0 {
+		headroomTarget := effectiveCap - reqHeadroom
+		if headroomTarget < 0 {
+			headroomTarget = 0
+		}
+		if headroomTarget < targetBytes {
+			targetBytes = headroomTarget
+		}
+	}
+
 	if localTotalBytes <= targetBytes {
 		return 0, 0, nil
 	}
